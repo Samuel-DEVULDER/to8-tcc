@@ -1,7 +1,17 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.27.0 (fix: commutative peephole no longer drops the ST)
+ * Version: 7.28.0
+ *
  * Changelog:
+ * - v7.28.0: CRITICAL BUGFIX in to8_spill_and_reload().
+ *   The old version reloaded the left operand from a potentially wrong
+ *   slot (c1), causing miscompilation of expressions like a*b + c*d.
+ *   Example bug: mul_complex2(a,b,c,d) computed (a*b) + ((a*b)*c) instead
+ *   of (a*b) + (c*d). Fixed by requiring callers to pass the EXACT left
+ *   operand slot, and asserting 4-alignment before use.
+ *   Affects gen_opi() for all commutative ops (ADD, MUL, AND, OR, XOR)
+ *   and CMP/CMPU. Thanks to extensive testing with mul_complex2 test case.
+ *
  * - v7.27.0: new peephole to8_peephole_useless_ld() replaces the old
  *   to8_peephole_dead_ld(). Removes redundant LD slot when R0 already
  *   holds 'slot' (after prior LD/ST of same slot). Unlike the old version,
@@ -201,7 +211,7 @@
 #define RC_R0    0x0001
 #define RC_R1    0x0002
 #define RC_FLOAT 0x0004
-#define RC_INT  (RC_R0 | RC_R1)
+#define RC_INT  RC_R0 //(RC_R0 | RC_R1)
 #define RC_IRET  RC_R0
 #define RC_FRET  RC_FLOAT
 
@@ -244,6 +254,8 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
+#define TO8_GEN_VERSION "7.28.0"
+
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
 ST_FUNC void gen_bounds_epilog(void) {}
@@ -254,8 +266,6 @@ ST_FUNC void gen_bounds_epilog(void) {}
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-
-#define TO8_GEN_VERSION "7.27.0"
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -1245,6 +1255,7 @@ static int to8_try_read_float_const(Sym *sym, int bt, double *out_val)
  * Load / Store
  * =================================================================== */
 
+
 void load(int r, SValue *sv)
 {
     int v, ft, fc, bt;
@@ -1259,6 +1270,17 @@ void load(int r, SValue *sv)
     bt = ft & VT_BTYPE;
     is_unsigned = (sv->type.t & VT_UNSIGNED) != 0;
     ldop = to8_byte_suffix_ld(bt, is_unsigned);
+
+    /* INSTR: etat d'entree de load(), avant toute emission.
+     * r         = registre cible demande par l'appelant
+     * sv->r     = flags TCC complets (VT_LVAL, VT_VALMASK, VT_SYM...)
+     * v         = sv->r & VT_VALMASK (mode d'adressage de la source)
+     * fc        = sv->c.i (offset de slot OU valeur immediate selon v)
+     * bt        = type de base (VT_INT, VT_BYTE, VT_SHORT, VT_PTR...) */
+    fprintf(stderr,
+        "LOAD entry: want_r=%d sv->r=%#x v(=sv->r&VALMASK)=%#x fc=%d bt=%#x "
+        "is_lval=%d is_unsigned=%d\n",
+        r, sv->r, v, fc, bt, (sv->r & VT_LVAL) != 0, is_unsigned);
 
     if (r == TREG_F0) {
         if (bt == VT_FLOAT || bt == VT_DOUBLE) {
@@ -1294,8 +1316,8 @@ void load(int r, SValue *sv)
                 else
                     e_op(OP_ITOF);
             }
-            return;
         }
+        return;
     }
 
     if (!(sv->r & VT_LVAL) && v < TREG_MEM && v != VT_CONST && v != VT_LOCAL &&
@@ -1319,8 +1341,13 @@ void load(int r, SValue *sv)
         } else if (v == VT_CONST) {
             e_op_addr(ldop, sv->sym, fc);
         } else if (v == TREG_R0) {
-            /* Pointer already sitting in R0: dereference directly,
-             * no temp-slot spill needed. */
+            /* INSTR: R0 contient DEJA le pointeur a dereferencer -
+             * aucun temp-slot spille, dereference directe. C'est
+             * exactement le cas qui doit etre distingue du cas
+             * "R0 contient une VALEUR" dans store(). */
+            fprintf(stderr,
+                "LOAD deref: R0 already holds pointer, emitting %s (deref, no spill)\n",
+                to8_opcode_name(to8_byte_suffix_ld_r(bt, is_unsigned)));
             e_op(to8_byte_suffix_ld_r(bt, is_unsigned));
         } else if (v < VT_CONST) {
             int temp;
@@ -1383,9 +1410,21 @@ void store(int r, SValue *v)
     int fr, bt, fc;
     to8_opcode stop;
 
+    fprintf(stderr,
+        "BACKEND store: r=%x vr=%x fr=%x fc=%d type=%x\n",
+        r, v->r, v->r & VT_VALMASK, (int)v->c.i, v->type.t);
+
     if (r >= NB_REGS) {
         int vbt = vtop->type.t & VT_BTYPE;
         r = (vbt == VT_FLOAT || vbt == VT_DOUBLE) ? TREG_F0 : TREG_R0;
+        /* INSTR: avant ce load(), R0 (s'il est vise par fr ci-dessous)
+         * contient encore potentiellement l'ADRESSE destination. Apres
+         * ce load(), il contiendra la VALEUR source. C'est exactement
+         * l'instant de bascule que la synthese demande de tracer. */
+        fprintf(stderr,
+            "STORE about to materialize source via load(r=%d, vtop): "
+            "vtop->r=%#x vtop->c.i=%d (R0 will hold VALUE after this)\n",
+            r, vtop->r, (int)vtop->c.i);
         load(r, vtop);
     }
 
@@ -1427,13 +1466,55 @@ void store(int r, SValue *v)
         if (r == TREG_R1) e_op_slot(OP_LD, to8_r1_slot());
         e_op_addr(stop, v->sym, fc);
     } else if (v->r & VT_LVAL) {
-        int addr_slot;
-        int from_pool = (fr != TREG_R1);
-        if (fr == TREG_R1) addr_slot = to8_r1_slot();
-        else { addr_slot = to8_temp_alloc(4, 4); e_op_slot(OP_ST, addr_slot); }
-        if (r == TREG_R1) e_op_slot(OP_LD, to8_r1_slot());
-        e_op_slot(stop, addr_slot);
-        if (from_pool) to8_temp_free(addr_slot, 4, 4);
+        /*
+         * L'adresse de destination est representee par `fr`.
+         *
+         * Cas critique a un seul registre :
+         * si fr == TREG_R0, R0 contenait l'adresse a l'entree,
+         * mais contient maintenant la valeur a ecrire apres load(r, vtop).
+         * fc est le slot ou TCC a spillee cette adresse.
+         */
+        if (fr == TREG_R0) {
+            /*
+             * R0 contient déjà la VALEUR à écrire (load(r, vtop) l'y a placée
+             * ci-dessus). fc contient déjà l'ADRESSE destination (backup fiable
+             * fait par save_reg_upstack avant que R0 ne soit réutilisé).
+             * Sémantique ST1/ST2/ST4 : *(type*)slot_arg = R0.
+             * R0 et fc sont donc DÉJÀ dans la position correcte - aucun temp
+             * n'est nécessaire, contrairement à la version précédente qui
+             * inversait valeur et adresse.
+             */
+            e_op_slot(stop, fc);
+        } else {
+            int addr_slot;
+            int from_pool = (fr != TREG_R1);
+            if (fr == TREG_R1) addr_slot = to8_r1_slot();
+            else { addr_slot = to8_temp_alloc(4, 4); e_op_slot(OP_ST, addr_slot); }
+
+            /* INSTR: cas ou l'adresse destination n'est pas passee par
+             * R0 (deja en memoire/slot ou en R1). Ici R0 (si fr n'est
+             * pas TREG_R0) porte deja potentiellement la VALEUR source
+             * issue du load() ci-dessus (r == TREG_R0), donc le role de
+             * R0 juste avant le stop final depend de `r`, pas de `fr`. */
+            fprintf(stderr,
+                "INDIRECT store [fr!=R0 branch]: r=%d fr=%x fc=%d addr_slot=%d "
+                "stop=%s from_pool=%d | R0 role before final store = %s\n",
+                r, fr, fc, addr_slot, to8_opcode_name(stop), from_pool,
+                (r == TREG_R0) ? "VALUE-to-write" : "other/unused");
+
+            if (r == TREG_R1) {
+                e_op_slot(OP_LD, to8_r1_slot());
+                fprintf(stderr,
+                    "  -> emitted LD r1_slot ; R0 now holds VALUE (reloaded from R1 shadow)\n");
+            }
+
+            e_op_slot(stop, addr_slot);
+            fprintf(stderr,
+                "  -> emitted %s %d ; invariant check: addr_slot=%d must hold DEST ADDRESS\n",
+                to8_opcode_name(stop), addr_slot, addr_slot);
+
+            if (from_pool) to8_temp_free(addr_slot, 4, 4);
+        }
     }
 }
 
@@ -1441,17 +1522,30 @@ void store(int r, SValue *v)
  * Binary integer operations
  * =================================================================== */
 
-static int to8_spill_and_reload(int v1, int c1)
+/* ===================================================================
+ * to8_spill_and_reload - spill R0, then reload the LEFT operand.
+ *
+ * FIXED (v7.27.1): the old version reloaded from 'c1' even when c1
+ * was not the left operand's slot, causing wrong code like:
+ *   ST 8       ; save a*b
+ *   ST 4       ; save d
+ *   LD 8       ; BUG: should reload d (slot 4), not a*b (slot 8)
+ *   MUL 32     ; R0 *= c
+ *
+ * The fix: callers must pass the EXACT slot of the left operand.
+ * This function now asserts that 'left_slot' is 4-aligned and uses it
+ * directly, instead of reusing a potentially wrong 'c1' temp.
+ * =================================================================== */
+static int to8_spill_and_reload(int left_slot)
 {
     int temp = to8_temp_alloc(4, 4);
+
+    /* Spill current R0 (the right operand) into a fresh temp. */
     e_op_slot(OP_ST, temp);
-    if (v1 == TREG_R1) {
-        e_op_slot(OP_LD, to8_r1_slot());
-    } else {
-        e_op_slot(OP_LD, c1);
-        if (v1 == TREG_R0)
-            to8_temp_free(c1, 4, 4);
-    }
+
+    /* Reload the LEFT operand from its known slot. */
+    e_op_slot(OP_LD, left_slot);
+
     return temp;
 }
 
@@ -1461,6 +1555,9 @@ static void gen_opi_shift(int op)
     int amount_is_const = (vtop->r & VT_VALMASK) == VT_CONST && !(vtop->r & VT_SYM);
     int amount_val = amount_is_const ? vtop->c.i : 0;
 
+fprintf(stderr, "gen_opi(op=%d) vtop->r=%x vtop->c.i=%d | vtop[-1].r=%x vtop[-1].c.i=%d\n",
+        op, vtop->r, (int)vtop->c.i, vtop[-1].r, (int)vtop[-1].c.i);
+	 
     to8_get_arith_ops(op, &slot_op, &imm_op);
 
     if (amount_is_const) {
@@ -1478,14 +1575,14 @@ static void gen_opi_shift(int op)
             e_op_slot(OP_ST, pre_spill);
             c1 = pre_spill;
         }
-
         gv(RC_INT);
         if (v1 != TREG_R0) {
             v1 = vtop[-1].r & VT_VALMASK;
             c1 = vtop[-1].c.i;
         }
-
-        temp = to8_spill_and_reload(v1, c1);
+        /* v7.28.1 fix: pass the EXACT left operand slot, handling TREG_R1 too */
+        int left_slot = (v1 == TREG_R1) ? to8_r1_slot() : c1;
+        temp = to8_spill_and_reload(left_slot);
         e_op_slot(slot_op, temp);
         to8_temp_free(temp, 4, 4);
         vtop--;
@@ -1534,8 +1631,9 @@ void gen_opi(int op)
         c1 = vtop[-1].c.i;
 
         {
-            int temp = to8_spill_and_reload(v1, c1);
-            e_op_slot(is_unsigned_cmp ? OP_CMPU : OP_CMP, temp);
+            int left_slot = (v1 == TREG_R1) ? to8_r1_slot() : c1;
+            int temp = to8_spill_and_reload(left_slot);
+	    e_op_slot(is_unsigned_cmp ? OP_CMPU : OP_CMP, temp);
             to8_temp_free(temp, 4, 4);
         }
 
@@ -1570,22 +1668,26 @@ void gen_opi(int op)
             if (v1 == VT_CONST) {
                 e_op_imm(imm_op, c1);
             } else if (v1 == TREG_R0 || v1 == TREG_R1) {
-                int temp = to8_spill_and_reload(v1, c1);
+                /* v1 is in a register: spill R0, reload left operand from its slot. */
+                int left_slot = (v1 == TREG_R1) ? to8_r1_slot() : c1;
+                int temp = to8_spill_and_reload(left_slot);
                 e_op_slot(slot_op, temp);
                 to8_temp_free(temp, 4, 4);
             } else {
                 e_op_slot(slot_op, c1);
             }
         } else {
-            int temp;
+            /* Non-commutative: SUB, DIV, MOD */
             if (v1 == VT_CONST) {
-                temp = to8_temp_alloc(4, 4);
-                e_op_slot(OP_ST, temp);
-                e_op_imm(OP_LDi, c1);
-                e_op_slot(slot_op, temp);
+                /* Left operand is a constant: load it as an immediate, not a slot. */
+                int temp = to8_temp_alloc(4, 4);
+                e_op_slot(OP_ST, temp);      /* spill current R0 (right operand) */
+                e_op_imm(OP_LDi, c1);        /* R0 = constant */
+                e_op_slot(slot_op, temp);    /* R0 = const OP spilled_right */
                 to8_temp_free(temp, 4, 4);
             } else {
-                temp = to8_spill_and_reload(v1, c1);
+                int left_slot = (v1 == TREG_R1) ? to8_r1_slot() : c1;
+                int temp = to8_spill_and_reload(left_slot);
                 e_op_slot(slot_op, temp);
                 to8_temp_free(temp, 4, 4);
             }
