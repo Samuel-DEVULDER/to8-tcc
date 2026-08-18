@@ -1,5 +1,16 @@
 /* TO8 stubs — only symbols NOT defined in to8-gen.c
  * Included after to8-gen.c from libtcc.c
+ *
+ * v7.18.0: removed the "static void *last_file" dedup guard in
+ * asm_opcode() - it caused every asm() statement AFTER THE FIRST ONE
+ * in a whole compilation unit to be silently dropped, as soon as a
+ * later :asm: pseudo-file's BufferedFile allocation happened to reuse
+ * the exact heap address of an earlier one (very common once a few
+ * asm() statements have been opened/closed). The trailing
+ * "while (tok != ';' ...) next();" loop already fully consumes every
+ * token of the CURRENT statement before returning, so asm_opcode()
+ * can never legitimately re-fire for the same asm(); the extra guard
+ * was not just unnecessary, it was actively wrong.
  */
 #ifndef TO8_STUBS_INCLUDED
 #define TO8_STUBS_INCLUDED
@@ -36,16 +47,20 @@ ST_FUNC void gen_le32(int v)
  * into the pseudo-ASM output. No operands (":"), no constraints, no
  * clobbers, no GAS-style opcode parsing - just raw text passthrough.
  *
- * v7.14.4 fix: CH_EOB (tcc.h) is '\\' (backslash), NOT '\0'. Never
- * scan file->buffer for a terminator of any kind (no strlen(),
- * pstrcpy(), or "while(*s)" loops). Instead, compute the EXACT length
- * TCC itself already tracks: buf_end - buffer, set directly from
- * 'initlen' by tcc_open_bf() at open time - always exactly right,
- * with zero guessing.
+ * Technique: tcc_assemble_inline() (tccasm.c) opens a virtual ":asm:"
+ * pseudo-file and memcpy()s the exact literal text (unmodified, as
+ * long as there is no ":" operand list) into file->buffer BEFORE
+ * tokenizing it. By the time asm_opcode() is first called for that
+ * file, the lexer has already had to peek one char past the text to
+ * find the first token's boundary, which triggers handle_eob()
+ * (tccpp.c) and writes CH_EOB ('\\', NOT '\0' - see tcc.h) right
+ * after the valid content.
  *
- * Works identically for asm() inside a function AND at global/file
- * scope - to8_emit_raw_asm_n() (in to8-gen.c) picks the right
- * strategy based on g_in_function.
+ * IMPORTANT: 'file->buffer' is therefore NOT a NUL-terminated C
+ * string, and must never be scanned for a terminator of any kind.
+ * The exact length is computed here as
+ * (file->buf_end - file->buffer) and passed to to8_emit_raw_asm_n(),
+ * which memcpy()s exactly that many bytes - no scanning whatsoever.
  * =================================================================== */
 ST_FUNC void asm_opcode(TCCState *s1, int opcode)
 {
@@ -57,6 +72,8 @@ ST_FUNC void asm_opcode(TCCState *s1, int opcode)
         to8_emit_raw_asm_n((const char *)file->buffer, len);
     }
 
+    /* consume the rest of this statement so tcc_assemble_internal's
+     * "expect end of line" check right after this call succeeds */
     while (tok != ';' && tok != TOK_LINEFEED && tok != CH_EOF)
         next();
 }
@@ -73,19 +90,19 @@ ST_FUNC int asm_parse_regvar(int t)
 }
 
 ST_FUNC void asm_compute_constraints(ASMOperand *operands, int nb_operands,
-                                     int nb_outputs, const uint8_t *clobber_regs,
-                                     int *pout_reg)
+                                      int nb_outputs, const uint8_t *clobber_regs,
+                                      int *pout_reg)
 {
     (void)operands;
     (void)nb_operands;
     (void)nb_outputs;
     (void)clobber_regs;
     (void)pout_reg;
-    /* pas d'operandes geres : rien a calculer */
+    /* no operands handled: nothing to compute */
 }
 
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
-                          int is_output, uint8_t *clobber_regs, int out_reg)
+                           int is_output, uint8_t *clobber_regs, int out_reg)
 {
     (void)operands;
     (void)nb_operands;
@@ -93,7 +110,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
     (void)is_output;
     (void)clobber_regs;
     (void)out_reg;
-    /* le texte a deja ete emis dans asm_opcode() */
+    /* the text was already emitted in asm_opcode() */
 }
 
 ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
