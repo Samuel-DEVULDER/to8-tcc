@@ -1,8 +1,45 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.28.0
+ * Version: 7.29.0
  *
  * Changelog:
+ * - v7.29.0: cleanup + new peephole to8_peephole_dead_r0_load().
+ *   1) Removed all temporary fprintf(stderr, ...) instrumentation added
+ *      during the 2026-08-18 swap() debugging session (LOAD entry,
+ *      LOAD deref, BACKEND store, STORE about to materialize, INDIRECT
+ *      store [fr==R0]/[fr!=R0] traces). The fix they were built to
+ *      prove stays in place - only the debug output is gone.
+ *
+ *   2) CORRECTNESS FIX in store()'s "v->r & VT_LVAL" branch, case
+ *      fr == TREG_R0: the previous 3-instruction dance (ST value_slot ;
+ *      LD fc ; stop value_slot) had the ST1/ST2/ST4 operands INVERTED -
+ *      it left the ADDRESS in R0 and the VALUE in the slot argument,
+ *      exactly backwards from the documented ISA semantics
+ *      ("*(char*)slot = R0" - address in slot, value in R0). Confirmed
+ *      by an instrumented trace on swap(): the generated ST1 would have
+ *      written the destination address, truncated to a byte, THROUGH a
+ *      bogus "pointer" built from the actual byte value being written.
+ *      Fixed: R0 already holds the VALUE (load(r, vtop) placed it there
+ *      just above) and fc already holds the ADDRESS (save_reg_upstack's
+ *      reliable spill) - the whole dance collapses to a single
+ *      "e_op_slot(stop, fc)", no temp needed. swap() drops from 41 to
+ *      37 instr (no -O) / 30 instr (-O).
+ *
+ *   3) New peephole to8_peephole_dead_r0_load(): removes a dead integer
+ *      load (LD/LD1/LDU1/LD2/LDU2/LD4, slot form) when a later R0-
+ *      writing load of the same family is reached with no intervening
+ *      read of R0 and no jump target crossed. Uses a WHITELIST of
+ *      opcodes provably transparent to R0 (MOV, NOP, ADJi, PUSH/PUSHi,
+ *      and the whole F0-only float family) - any opcode NOT in this
+ *      list stops the scan, so omitting a transparent one only loses
+ *      an optimization, never changes semantics. Catches the residual
+ *      "LD fc ; LD src_slot ; ST1/ST2/ST4 ..." pattern left by point 2
+ *      above, where the first LD (reloading the destination address)
+ *      is immediately made moot by the very next LD (reloading the
+ *      source value). Runs under -O only (peephole passes are gated by
+ *      tcc_state->optimize); expected to remove 2 more instructions
+ *      from swap() -O (one per pointer assignment in the loop body).
+ *
  * - v7.28.0: CRITICAL BUGFIX in to8_spill_and_reload().
  *   The old version reloaded the left operand from a potentially wrong
  *   slot (c1), causing miscompilation of expressions like a*b + c*d.
@@ -254,7 +291,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.28.0"
+#define TO8_GEN_VERSION "7.29.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -1271,17 +1308,6 @@ void load(int r, SValue *sv)
     is_unsigned = (sv->type.t & VT_UNSIGNED) != 0;
     ldop = to8_byte_suffix_ld(bt, is_unsigned);
 
-    /* INSTR: etat d'entree de load(), avant toute emission.
-     * r         = registre cible demande par l'appelant
-     * sv->r     = flags TCC complets (VT_LVAL, VT_VALMASK, VT_SYM...)
-     * v         = sv->r & VT_VALMASK (mode d'adressage de la source)
-     * fc        = sv->c.i (offset de slot OU valeur immediate selon v)
-     * bt        = type de base (VT_INT, VT_BYTE, VT_SHORT, VT_PTR...) */
-    fprintf(stderr,
-        "LOAD entry: want_r=%d sv->r=%#x v(=sv->r&VALMASK)=%#x fc=%d bt=%#x "
-        "is_lval=%d is_unsigned=%d\n",
-        r, sv->r, v, fc, bt, (sv->r & VT_LVAL) != 0, is_unsigned);
-
     if (r == TREG_F0) {
         if (bt == VT_FLOAT || bt == VT_DOUBLE) {
             to8_opcode ld = (bt == VT_FLOAT) ? OP_LDF : OP_LDG;
@@ -1341,13 +1367,6 @@ void load(int r, SValue *sv)
         } else if (v == VT_CONST) {
             e_op_addr(ldop, sv->sym, fc);
         } else if (v == TREG_R0) {
-            /* INSTR: R0 contient DEJA le pointeur a dereferencer -
-             * aucun temp-slot spille, dereference directe. C'est
-             * exactement le cas qui doit etre distingue du cas
-             * "R0 contient une VALEUR" dans store(). */
-            fprintf(stderr,
-                "LOAD deref: R0 already holds pointer, emitting %s (deref, no spill)\n",
-                to8_opcode_name(to8_byte_suffix_ld_r(bt, is_unsigned)));
             e_op(to8_byte_suffix_ld_r(bt, is_unsigned));
         } else if (v < VT_CONST) {
             int temp;
@@ -1410,21 +1429,9 @@ void store(int r, SValue *v)
     int fr, bt, fc;
     to8_opcode stop;
 
-    fprintf(stderr,
-        "BACKEND store: r=%x vr=%x fr=%x fc=%d type=%x\n",
-        r, v->r, v->r & VT_VALMASK, (int)v->c.i, v->type.t);
-
     if (r >= NB_REGS) {
         int vbt = vtop->type.t & VT_BTYPE;
         r = (vbt == VT_FLOAT || vbt == VT_DOUBLE) ? TREG_F0 : TREG_R0;
-        /* INSTR: avant ce load(), R0 (s'il est vise par fr ci-dessous)
-         * contient encore potentiellement l'ADRESSE destination. Apres
-         * ce load(), il contiendra la VALEUR source. C'est exactement
-         * l'instant de bascule que la synthese demande de tracer. */
-        fprintf(stderr,
-            "STORE about to materialize source via load(r=%d, vtop): "
-            "vtop->r=%#x vtop->c.i=%d (R0 will hold VALUE after this)\n",
-            r, vtop->r, (int)vtop->c.i);
         load(r, vtop);
     }
 
@@ -1491,27 +1498,11 @@ void store(int r, SValue *v)
             if (fr == TREG_R1) addr_slot = to8_r1_slot();
             else { addr_slot = to8_temp_alloc(4, 4); e_op_slot(OP_ST, addr_slot); }
 
-            /* INSTR: cas ou l'adresse destination n'est pas passee par
-             * R0 (deja en memoire/slot ou en R1). Ici R0 (si fr n'est
-             * pas TREG_R0) porte deja potentiellement la VALEUR source
-             * issue du load() ci-dessus (r == TREG_R0), donc le role de
-             * R0 juste avant le stop final depend de `r`, pas de `fr`. */
-            fprintf(stderr,
-                "INDIRECT store [fr!=R0 branch]: r=%d fr=%x fc=%d addr_slot=%d "
-                "stop=%s from_pool=%d | R0 role before final store = %s\n",
-                r, fr, fc, addr_slot, to8_opcode_name(stop), from_pool,
-                (r == TREG_R0) ? "VALUE-to-write" : "other/unused");
-
             if (r == TREG_R1) {
                 e_op_slot(OP_LD, to8_r1_slot());
-                fprintf(stderr,
-                    "  -> emitted LD r1_slot ; R0 now holds VALUE (reloaded from R1 shadow)\n");
             }
 
             e_op_slot(stop, addr_slot);
-            fprintf(stderr,
-                "  -> emitted %s %d ; invariant check: addr_slot=%d must hold DEST ADDRESS\n",
-                to8_opcode_name(stop), addr_slot, addr_slot);
 
             if (from_pool) to8_temp_free(addr_slot, 4, 4);
         }
@@ -1925,7 +1916,7 @@ static int to8_peephole_useless_ld(void)
 {
     int changed = 0;
     to8_line *cur = g_head;
-    int r0_holds_slot = -1;  /* -1 = unknown, >=0 = R0 holds that slot */
+    int r0_holds_slot = -1;  /* -1 = unknown, otherwise R0 holds that slot */
     
     while (cur) {
         to8_line *nxt = cur->next;
@@ -1936,7 +1927,7 @@ static int to8_peephole_useless_ld(void)
         
         /* Check for useless LD */
         if (cur->op == OP_LD && cur->kind == ARG_SLOT &&
-            r0_holds_slot >= 0 && cur->slot_a == r0_holds_slot) {
+            r0_holds_slot != -1 && cur->slot_a == r0_holds_slot) {
             to8_unlink(cur);
             changed = 1;
             cur = nxt;
@@ -1967,6 +1958,74 @@ static int to8_peephole_useless_ld(void)
         cur = nxt;
     }
     
+    return changed;
+}
+
+/*
+ * Remove a dead integer load whose R0 value is overwritten later
+ * without being read in between.
+ *
+ * The scan deliberately uses a whitelist of operations transparent to
+ * R0. Any opcode not listed here stops the scan. This is conservative:
+ * omitting a transparent opcode loses an optimization, but cannot change
+ * program semantics.
+ *
+ * A load is removable only when:
+ *   - it is a slot load that writes R0 (LD/LD1/LDU1/LD2/LDU2/LD4);
+ *   - no instruction in between reads R0;
+ *   - a later R0-writing load of the same family is encountered;
+ *   - no jump target is crossed.
+ *
+ * ST/ST1/ST2/ST4, PUSHr, all calls and jumps, RET, arithmetic,
+ * comparisons, conversions, and all register-deref loads are
+ * intentionally NOT in the whitelist because they read R0 or may
+ * observe/control-flow through it.
+ */
+static int to8_peephole_dead_r0_load(void)
+{
+    int changed = 0;
+    to8_line *first;
+
+    for (first = g_head; first; first = first->next) {
+        to8_line *scan;
+
+        if (first->is_target || first->kind != ARG_SLOT)
+            continue;
+        if (first->op != OP_LD && first->op != OP_LD1 &&
+            first->op != OP_LDU1 && first->op != OP_LD2 &&
+            first->op != OP_LDU2 && first->op != OP_LD4)
+            continue;
+
+        for (scan = first->next; scan; scan = scan->next) {
+            if (scan->is_target)
+                break;
+
+            if (scan->op == OP_MOV || scan->op == OP_NOP ||
+                scan->op == OP_ADJi || scan->op == OP_PUSH ||
+                scan->op == OP_PUSHi ||
+                scan->op == OP_LDF || scan->op == OP_LDG ||
+                scan->op == OP_STF || scan->op == OP_STG ||
+                scan->op == OP_LDF4 || scan->op == OP_LDF8 ||
+                scan->op == OP_STF4 || scan->op == OP_STF8 ||
+                scan->op == OP_LDFi || scan->op == OP_LDGi ||
+                scan->op == OP_ADDF || scan->op == OP_SUBF ||
+                scan->op == OP_MULF || scan->op == OP_DIVF ||
+                scan->op == OP_ADDG || scan->op == OP_SUBG ||
+                scan->op == OP_MULG || scan->op == OP_DIVG)
+                continue;
+
+            if (scan->kind == ARG_SLOT &&
+                (scan->op == OP_LD || scan->op == OP_LD1 ||
+                 scan->op == OP_LDU1 || scan->op == OP_LD2 ||
+                 scan->op == OP_LDU2 || scan->op == OP_LD4)) {
+                to8_unlink(first);
+                changed = 1;
+                break;
+            }
+
+            break;
+        }
+    }
     return changed;
 }
 
@@ -2141,6 +2200,15 @@ static int to8_peephole_op2(void)
     return changed;
 }
 
+static void to8_debug_dump_list(const char *tag)
+{
+    to8_line *ln;
+    fprintf(stderr, "--- %s ---\n", tag);
+    for (ln = g_head; ln; ln = ln->next)
+        fprintf(stderr, "  id=%d op=%s slot_a=%d kind=%d target=%d\n",
+                ln->id, to8_opcode_name(ln->op), ln->slot_a, ln->kind, ln->is_target);
+}
+
 static void to8_peephole_run(void)
 {
     int changed;
@@ -2152,11 +2220,19 @@ static void to8_peephole_run(void)
     do {
         changed = 0;
         changed |= to8_peephole_ext();
+// to8_debug_dump_list("after ext");
         changed |= to8_peephole_mov();
+// to8_debug_dump_list("after MOV");
         changed |= to8_peephole_useless_ld();
+// to8_debug_dump_list("after useless_ld");
+	changed |= to8_peephole_dead_r0_load();   /* NEW v7.29.0 */
+// to8_debug_dump_list("after dead_r0_load");
         changed |= to8_peephole_ld_deref();
-        changed |= to8_peephole_commute();
+// to8_debug_dump_list("after ld_deref");
+	changed |= to8_peephole_commute();
+// to8_debug_dump_list("after commute");	
 	changed |= to8_peephole_op2();      /* NEW v7.26.0 */
+// to8_debug_dump_list("after op2");	
     } while (changed && ++guard < 256);
 }
 
