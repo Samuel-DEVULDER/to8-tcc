@@ -441,6 +441,13 @@ static int g_count_before, g_count_after;
 static int g_banner_done;
 static int g_last_end_ind = -1;
 
+/* Tracks whether we are currently between a gfunc_prolog()/gfunc_epilog()
+ * pair. g_head/g_tail/to8_func_start_ind are ONLY valid while this is
+ * set - a global/file-scope asm() statement executes OUTSIDE any such
+ * pair, so to8_emit_raw_asm_n() must never touch g_head/g_tail when
+ * this is 0. */
+static int g_in_function = 0;
+
 static void to8_by_id_set(int id, to8_line *ln)
 {
     if (id > g_by_id_cap) {
@@ -522,18 +529,98 @@ static int to8_count_lines(void)
     return n;
 }
 
+static int g_col;
+static void out_char(int c) { g((unsigned char)c); if (c == '\n') g_col = 0; else g_col++; }
+static void out_str(const char *s) { while (*s) out_char((unsigned char)*s++); }
+static void out_int(int v) { char buf[16]; snprintf(buf, sizeof buf, "%d", v); out_str(buf); }
+static void out_double(double v) { char buf[32]; snprintf(buf, sizeof buf, "%g", v); out_str(buf); }
+static void out_tab(void)
+{
+    int next = ((g_col / 8) + 1) * 8;
+    while (g_col < next) out_char(' ');
+}
+
+/* Pad with spaces up to a FIXED column, instead of always advancing
+ * by one full tab stop the way out_tab() does. Used just before the
+ * comment, so every line's comment starts at the same place whether
+ * or not it printed an argument. */
+static void out_pad_to(int col)
+{
+    while (g_col < col) out_char(' ');
+}
+
+#define TO8_COMMENT_COL 24
+
+static void to8_print_banner(void)
+{
+    g_col = 0;
+    out_str("; TO8 backend "); out_str(TO8_GEN_VERSION); out_char('\n');
+
+    out_str("; out: ");
+    out_str((tcc_state && tcc_state->outfile) ? tcc_state->outfile : "(unknown)");
+    out_str(" src: ");
+    out_str((file && file->filename[0]) ? file->filename : "(unknown)");
+    out_char('\n');
+
+    if (tcc_state && tcc_state->argc > 0 && tcc_state->argv) {
+        int i;
+        out_str("; cmd:");
+        for (i = 0; i < tcc_state->argc; i++) {
+            if (!tcc_state->argv[i]) continue;
+            out_char(' ');
+            out_str(tcc_state->argv[i]);
+        }
+        out_char('\n');
+    }
+}
+
 /* ===================================================================
  * Raw inline-asm passthrough: emit a NOP-carrier line whose text is
  * dumped verbatim by to8_render_line(), bypassing normal opcode/arg
  * rendering entirely. Called from asm_opcode() in to8-stubs.c.
+ *
+ * IMPORTANT (v7.14.4): 'text' is NOT a NUL-terminated C string, and
+ * must never be scanned for a terminator of any kind. CH_EOB (the
+ * sentinel tcc_open_bf() writes right after the valid content) is
+ * '\\' (backslash, see tcc.h), NOT '\0' - the caller MUST pass the
+ * exact length (file->buf_end - file->buffer in asm_opcode()), and
+ * this function copies EXACTLY that many bytes, with no scanning
+ * whatsoever, into a manually NUL-terminated local buffer.
+ *
+ * See the v7.14.3 changelog entry for g_in_function: inside a
+ * function, append normally to the function's own line list
+ * (rendered later by gfunc_epilog()). At global/file scope, write
+ * directly to the output stream instead, bypassing to8_append().
  * =================================================================== */
 
-ST_FUNC void to8_emit_raw_asm(const char *text)
+ST_FUNC void to8_emit_raw_asm_n(const char *text, size_t len)
 {
-    to8_line *ln = to8_append(OP_NOP);
-    ln->kind = ARG_NONE;
-    ln->is_raw_text = 1;
-    pstrcpy(ln->rawtext, sizeof(ln->rawtext), text);
+    size_t cap = sizeof(((to8_line *)0)->rawtext) - 1;
+    if (len > cap) len = cap;
+
+    if (g_in_function) {
+        to8_line *ln = to8_append(OP_NOP);
+        ln->kind = ARG_NONE;
+        ln->is_raw_text = 1;
+        memcpy(ln->rawtext, text, len);
+        ln->rawtext[len] = '\0';
+        return;
+    }
+
+    /* global/file-scope asm(): write directly, no g_head/g_tail,
+       no NUL-scanning - byte-count loop only. */
+    if (!g_banner_done) {
+        to8_print_banner();
+        g_banner_done = 1;
+    }
+    g_col = 0;
+    {
+        size_t i;
+        for (i = 0; i < len; i++)
+            out_char((unsigned char)text[i]);
+    }
+    out_char('\n');
+    g_last_end_ind = ind;
 }
 
 /* ===================================================================
@@ -1588,54 +1675,9 @@ static void to8_peephole_run(void)
 static to8_line *to8_func_adj_line;
 static char to8_func_name[256];
 
-static int g_col;
-static void out_char(int c) { g((unsigned char)c); if (c == '\n') g_col = 0; else g_col++; }
-static void out_str(const char *s) { while (*s) out_char((unsigned char)*s++); }
-static void out_int(int v) { char buf[16]; snprintf(buf, sizeof buf, "%d", v); out_str(buf); }
-static void out_double(double v) { char buf[32]; snprintf(buf, sizeof buf, "%g", v); out_str(buf); }
-static void out_tab(void)
-{
-    int next = ((g_col / 8) + 1) * 8;
-    while (g_col < next) out_char(' ');
-}
-
-/* Pad with spaces up to a FIXED column, instead of always advancing
- * by one full tab stop the way out_tab() does. Used just before the
- * comment, so every line's comment starts at the same place whether
- * or not it printed an argument. */
-static void out_pad_to(int col)
-{
-    while (g_col < col) out_char(' ');
-}
-
-#define TO8_COMMENT_COL 24
-
 static int to8_final_slot(int raw_slot, int push_depth)
 {
     return g_frame_size + raw_slot + push_depth;
-}
-
-static void to8_print_banner(void)
-{
-    g_col = 0;
-    out_str("; TO8 backend "); out_str(TO8_GEN_VERSION); out_char('\n');
-
-    out_str("; out: ");
-    out_str((tcc_state && tcc_state->outfile) ? tcc_state->outfile : "(unknown)");
-    out_str(" src: ");
-    out_str((file && file->filename[0]) ? file->filename : "(unknown)");
-    out_char('\n');
-
-    if (tcc_state && tcc_state->argc > 0 && tcc_state->argv) {
-        int i;
-        out_str("; cmd:");
-        for (i = 0; i < tcc_state->argc; i++) {
-            if (!tcc_state->argv[i]) continue;
-            out_char(' ');
-            out_str(tcc_state->argv[i]);
-        }
-        out_char('\n');
-    }
 }
 
 static void to8_render_line(to8_line *ln)

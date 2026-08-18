@@ -36,29 +36,27 @@ ST_FUNC void gen_le32(int v)
  * into the pseudo-ASM output. No operands (":"), no constraints, no
  * clobbers, no GAS-style opcode parsing - just raw text passthrough.
  *
- * Technique: tcc_assemble_inline() (tccasm.c) opens a virtual ":asm:"
- * pseudo-file and memcpy()s the exact literal text (unmodified, as
- * long as there is no ":" operand list) into file->buffer BEFORE
- * tokenizing it. By the time asm_opcode() is first called for that
- * file, the lexer has already had to peek one char past the text to
- * find the first token's boundary, which triggers handle_eob()
- * (tccpp.c) and writes CH_EOB ('\0') right after the valid content -
- * making file->buffer a properly NUL-terminated C string holding the
- * ORIGINAL text, verbatim, before any tokenization or substitution.
+ * v7.14.4 fix: CH_EOB (tcc.h) is '\\' (backslash), NOT '\0'. Never
+ * scan file->buffer for a terminator of any kind (no strlen(),
+ * pstrcpy(), or "while(*s)" loops). Instead, compute the EXACT length
+ * TCC itself already tracks: buf_end - buffer, set directly from
+ * 'initlen' by tcc_open_bf() at open time - always exactly right,
+ * with zero guessing.
+ *
+ * Works identically for asm() inside a function AND at global/file
+ * scope - to8_emit_raw_asm_n() (in to8-gen.c) picks the right
+ * strategy based on g_in_function.
  * =================================================================== */
 ST_FUNC void asm_opcode(TCCState *s1, int opcode)
 {
-    static void *last_file = NULL;
     (void)s1;
     (void)opcode;
 
-    if (file && file != last_file) {
-        last_file = file;
-        to8_emit_raw_asm((const char *)file->buffer);
+    if (file) {
+        size_t len = (size_t)(file->buf_end - file->buffer);
+        to8_emit_raw_asm_n((const char *)file->buffer, len);
     }
 
-    /* consume the rest of this statement so tcc_assemble_internal's
-       "expect end of line" check right after this call succeeds */
     while (tok != ';' && tok != TOK_LINEFEED && tok != CH_EOF)
         next();
 }
