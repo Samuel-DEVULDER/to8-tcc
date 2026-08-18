@@ -1,56 +1,97 @@
 /*
  * TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 4.13.0
+ * Version: 7.13.0
  * Changelog:
- * - v4.13.0: NEW peephole: "LD a; ST b" immediately followed by an
- *   instruction that unconditionally overwrites R0 WITHOUT reading
- *   its current value (another LD/LDi/LEA/LEAm/LD1/LD2/LD4, or the
- *   return from a call JSRi/JSRs/JSR, since the callee's return value
- *   always lands in R0) is fused into a single "MOV b, a" (b := a).
+ * - v7.13.0: float opcode family restructured to close the "ms"
+ *   naming gap for good - 12 opcodes collapsed down to 6, mirroring
+ *   the LD / LD1 / LD2 / LD4 convention used for integers:
  *
- *   This is a DEFERRED, look-ahead-free design, same spirit as the
- *   EXT1S/EXT2S fusion: "LD a" and "ST b" are emitted normally and
- *   immediately (correct on their own, unconditionally). Only once
- *   the VERY NEXT instruction is seen do we decide: if it provably
- *   clobbers R0 before reading it, R0's value from "LD a" was never
- *   used for anything beyond the "ST b" that already consumed it -
- *   so the LD+ST pair is retroactively commented out (one byte each,
- *   same trick used throughout) and a fresh "MOV b, a" is emitted in
- *   their place. If the next instruction reads R0 instead (another
- *   ST, an arithmetic op, a comparison, a conditional jump, an
- *   unconditional jump/label - anything NOT in the whitelist), the
- *   candidate is silently dropped and both original lines are left
- *   exactly as they were: still correct, just not compressed.
+ *     OP_LDF32/OP_LDF64/OP_STF32/OP_STF64        (own slot, sized)
+ *     OP_LDF32m/OP_LDF64m/OP_STF32m/OP_STF64m    (symbol, sized)
+ *     OP_LDF32ms/OP_LDF64ms/OP_STF32ms/OP_STF64ms (slot-deref, sized+ms)
+ *   become:
+ *     OP_LDF / OP_STF          (own slot - NO size marker at all)
+ *     OP_LDF4 / OP_LDF8        (real memory access - slot-held
+ *     OP_STF4 / OP_STF8         pointer OR global symbol, sized by
+ *                               the actual C type)
  *
- *   The classification is a narrow WHITELIST (not a blacklist) on
- *   purpose: anything not explicitly known to overwrite R0 without
- *   reading it is treated as "unsafe to fuse", so the peephole can
- *   never silently break a program - a missed fusion just leaves
- *   the two original, already-correct lines in place.
+ *   The insight: a LOCAL float/double variable's own slot is
+ *   internal bookkeeping we fully control - F0 is already always
+ *   double-precision internally (every arithmetic/comparison op uses
+ *   8-byte STF/LDF for its temp spill slot regardless of the C-level
+ *   type), so there is no reason the OWN-SLOT form needs a size
+ *   marker either. Exactly like integers never need OP_LD1/2/4 for
+ *   reading a local's OWN value (only for dereferencing an arbitrary
+ *   pointer) - only accesses that touch REAL, externally-laid-out
+ *   memory (a global variable, or *some_float_pointer) need to
+ *   respect the true 4-or-8-byte width, because that memory's layout
+ *   isn't ours to redefine. OP_LDF4/OP_LDF8 cover BOTH the
+ *   slot-held-pointer case (ARG_SLOT) and the global-symbol case
+ *   (ARG_SYM) under one opcode identity - same pattern OP_LDi already
+ *   uses for immediate-vs-symbol.
  *
- *   Every emission entry point (emit_op, emit_op_imm, emit_op_slot,
- *   emit_op_addr, emit_label, to8_push_imm, to8_push_slot,
- *   to8_emit_jmp, gjmp_addr) now resolves any pending MOV candidate
- *   FIRST, before writing its own text, so a confirmed MOV line lands
- *   exactly where the commented-out LD+ST used to be.
+ *   No behavioral change intended beyond the renaming/merging: every
+ *   call site keeps the exact same VT_LOCAL/VT_LLOCAL/VT_CONST/
+ *   register branching it already had, just emitting the new opcode
+ *   names. (A separate question - whether gen_opf()'s VT_LLOCAL
+ *   handling should differ from VT_LOCAL's - was raised while
+ *   researching this but is NOT addressed here; it's flagged as a
+ *   distinct open item to avoid bundling an unverified behavioral
+ *   change with a pure naming cleanup.)
  *
- * - v4.12.0: renamed SEX1/SEX2/UEX1/UEX2 to EXT1S/EXT2S/EXT1U/EXT2U.
- * - v4.11.1/v4.11.0: shifts by a constant emit a single SHLi/SARi/
- *   SHRi with no memory traffic; EXT fusion comments out that one
- *   line. See prior versions for the full history.
+ * - v7.12.0: REAL BUG FIXED - segfault on any compound (&&/||)
+ *   condition. gjmp()/gjmp_cond() were calling gsym_addr(off, t)
+ *   (arguments swapped - t, an instruction id from an earlier pending
+ *   condition, was being misinterpreted as a raw address) instead of
+ *   gjmp_append(off, t) (correctly link the two chains, deferring
+ *   resolution). Confirmed via gdb: an OP_JGE in mandel()'s
+ *   "i<count && x2+y2<=4" loop condition was left with
+ *   jmp_target_id=0 forever, causing to8_by_id(0) to crash at render
+ *   time. Only manifests from the SECOND condition of a chain onward
+ *   (the first always passes t=0, which happens to skip the bug).
+ *
+ * - v7.11.2: shorter peephole comment format: "; N instr" or
+ *   "; N instr -optim-> M", on the same line as "_funcname:".
+ *
+ * - v7.11.1/7.11.0/7.10.0/7.9.x and earlier: see prior versions.
  *
  * Architecture:
- * R0 = real integer accumulator (also REG_IRET).
- * R1 = VIRTUAL integer register, memory-backed shadow slot.
- * F0 = float accumulator (also REG_FRET)
- * ADJ <signed n> is the sole stack-pointer adjustment.
- * Call targets: JSRi <sym>, JSRs <slot>, JSR (via R0).
- * SHL/SAR/SHR by a compile-time-constant amount emit a single
- * SHLi/SARi/SHRi <n>. EXT1S/EXT2S/EXT1U/EXT2U fuse the SHLi+SARi/SHRi
- * pair for narrow-to-int extension. "LD a; ST b" fuses into
- * "MOV b, a" whenever the following instruction provably clobbers R0
- * without reading it.
+ *   R0 = real integer accumulator (also REG_IRET).
+ *   R1 = VIRTUAL integer register, memory-backed shadow slot.
+ *   F0 = float accumulator (also REG_FRET) - ALWAYS holds a
+ *   double-precision value internally, regardless of whether the
+ *   C-level type is float or double; narrowing/widening only matters
+ *   when touching REAL external memory (globals, pointer dereferences).
+ *   NO status/flags register of any kind, for EITHER integers or
+ *   floats. OP_CMP/OP_CMPU/OP_CMPi/OP_CMPUi and OP_FCMP ALL write a
+ *   signed comparison result straight into R0. S../J.. just read R0's
+ *   sign from that point on - one shared family for both.
+ *
+ * Naming convention:
+ *   - "i" suffix  = opcode takes an IMMEDIATE (or a compile/link-time
+ *     resolved symbol - same category, e.g. LDi, JSRi, LDF4/LDF8 via
+ *     ARG_SYM).
+ *   - "r" suffix  = opcode takes NO ARGUMENT but reads/writes R0 as
+ *     the family's register-operand form (PUSHr, JSRr, ADJr, LD1r/
+ *     LD2r/LD4r).
+ *   - no suffix   = opcode takes a SLOT (LD, ST, ADD, CMP, FADD,
+ *     PUSH, JSR, LDF, STF...).
+ *   - a bare SIZE NUMBER (no letter suffix) on an otherwise-unsized
+ *     family member means "this touches real, externally-laid-out
+ *     memory, so the width must be explicit" - LD1/LD2/LD4 for
+ *     pointer dereferences, LDF4/LDF8 for float pointer dereferences
+ *     and global symbols.
+ *
+ * Output format (once per compiled file):
+ *   ; TO8 backend <version>
+ *   ; out: <outfile>  src: <file->filename>
+ *   ; cmd: <argv...>              (only if argc/argv are non-empty)
+ * then, per function:
+ *   _funcname: ; N instr                (peephole made no change)
+ *   _funcname: ; N instr -optim-> M     (peephole reduced N to M)
+ *   @lN:
+ *   MNEMONIC<tab>args<tab>; comment
  */
 
 #ifdef TARGET_DEFS_ONLY
@@ -85,16 +126,6 @@ enum {
 #define MAX_ALIGN 4
 #define TO8_STACK_ALIGN 4
 
-#ifndef BIG_ENDIAN
-#define BIG_ENDIAN 4321
-#endif
-#ifndef LITTLE_ENDIAN
-#define LITTLE_ENDIAN 1234
-#endif
-#ifndef BYTE_ORDER
-#define BYTE_ORDER BIG_ENDIAN
-#endif
-
 #define PROMOTE_RET
 
 #else
@@ -109,11 +140,12 @@ ST_FUNC void gen_bounds_epilog(void) {}
 #include <stdio.h>
 #include <ctype.h>
 
+#define TO8_GEN_VERSION "7.13.0"
+
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
     "__BIG_ENDIAN__\0";
 
-/* index order matches TREG_R0=0, TREG_F0=1, TREG_R1=2 */
 ST_DATA const int reg_classes[NB_REGS] = {
     RC_R0,
     RC_FLOAT,
@@ -121,13 +153,206 @@ ST_DATA const int reg_classes[NB_REGS] = {
 };
 
 /* ===================================================================
- * Private, strictly-monotonic temp-slot allocator.
+ * The entire instruction set, in one place, with its semantics.
+ * "slot" always means a stack-frame memory location (a local
+ * variable or parameter). "R0"/"F0" are the two accumulators.
+ *
+ * There is NO flags register, for integers or floats. OP_CMP/OP_CMPU/
+ * OP_CMPi/OP_CMPUi and OP_FCMP ALL write a SIGNED integer directly
+ * into R0. Every S../J.. opcode that follows just reads the sign of
+ * whatever is currently in R0.
+ * =================================================================== */
+
+typedef enum {
+    OP_NOP,   /* no-op */
+    OP_RET,   /* return from the current function */
+    OP_ADJi,  /* SP -= n if n<0 (allocate), SP += n if n>=0 (release) */
+    OP_ADJr,  /* SP -= R0 (always allocates - the VLA case). */
+
+    OP_LD,    /* R0 = slot (4-byte load) */
+    OP_ST,    /* slot = R0 (4-byte store) */
+    OP_LEA,   /* R0 = address of slot */
+    OP_LD1,   /* R0 = *(char*)slot (byte-sized memory load via pointer in slot) */
+    OP_LD2,   /* R0 = *(short*)slot (halfword-sized memory load) */
+    OP_LD4,   /* R0 = *(int*)slot (word-sized memory load) */
+    OP_LD1r,  /* R0 = *(char*)R0 - dereference the pointer ALREADY in R0 */
+    OP_LD2r,  /* R0 = *(short*)R0 */
+    OP_LD4r,  /* R0 = *(int*)R0 */
+    OP_ST1,   /* *(char*)slot = R0 (byte-sized memory store via pointer in slot) */
+    OP_ST2,   /* *(short*)slot = R0 (halfword-sized memory store) */
+    OP_ST4,   /* *(int*)slot = R0 (word-sized memory store) */
+
+    OP_LDi,   /* R0 = immediate, OR R0 = address of a global symbol
+                 (a compile/link-time-known value either way). */
+
+    OP_ADD,   /* R0 += slot */
+    OP_SUB,   /* R0 -= slot */
+    OP_AND,   /* R0 &= slot */
+    OP_OR,    /* R0 |= slot */
+    OP_XOR,   /* R0 ^= slot */
+    OP_MUL,   /* R0 *= slot */
+    OP_DIV,   /* R0 /= slot */
+    OP_MOD,   /* R0 %= slot */
+    OP_SHL,   /* R0 <<= slot */
+    OP_SHR,   /* R0 >>= slot (logical/unsigned) */
+    OP_SAR,   /* R0 >>= slot (arithmetic/signed) */
+    OP_CMP,   /* R0 = sign(R0 - slot), SIGNED subtraction. */
+    OP_CMPU,  /* R0 = sign(R0 -u slot), UNSIGNED subtraction. */
+
+    OP_ADDi,  /* R0 += immediate */
+    OP_SUBi,  /* R0 -= immediate */
+    OP_ANDi,  /* R0 &= immediate */
+    OP_ORi,   /* R0 |= immediate */
+    OP_XORi,  /* R0 ^= immediate */
+    OP_MULi,  /* R0 *= immediate */
+    OP_DIVi,  /* R0 /= immediate */
+    OP_MODi,  /* R0 %= immediate */
+    OP_SHLi,  /* R0 <<= immediate */
+    OP_SHRi,  /* R0 >>= immediate (logical/unsigned) */
+    OP_SARi,  /* R0 >>= immediate (arithmetic/signed) */
+    OP_CMPi,  /* R0 = sign(R0 - immediate), SIGNED */
+    OP_CMPUi, /* R0 = sign(R0 -u immediate), UNSIGNED */
+
+    OP_SEQ,   /* R0 = (R0 == 0) ? 1 : 0 */
+    OP_SNE,   /* R0 = (R0 != 0) ? 1 : 0 */
+    OP_SLT,   /* R0 = (R0 <  0) ? 1 : 0 */
+    OP_SGT,   /* R0 = (R0 >  0) ? 1 : 0 */
+    OP_SLE,   /* R0 = (R0 <= 0) ? 1 : 0 */
+    OP_SGE,   /* R0 = (R0 >= 0) ? 1 : 0 */
+    OP_SNZ,   /* R0 = (R0 != 0) ? 1 : 0 (used when no dedicated S.. fits) */
+
+    OP_MOV,   /* dst_slot = src_slot, WITHOUT touching R0 - fusion of LD+ST */
+
+    OP_EXT1S, /* R0 = (int)(signed char)R0 */
+    OP_EXT2S, /* R0 = (int)(signed short)R0 */
+    OP_EXT1U, /* R0 = (int)(unsigned char)R0 */
+    OP_EXT2U, /* R0 = (int)(unsigned short)R0 */
+
+    OP_ITOF,  /* F0 = (float/double)R0 */
+    OP_FTOI,  /* R0 = (int)F0 */
+
+    OP_LDF,   /* F0 = slot (own value) - ALWAYS double-precision
+                 internally, no size marker: this slot's layout is
+                 ours to control, unlike real external memory. */
+    OP_STF,   /* slot = F0 (own value), same convention. */
+    OP_LDF4,  /* F0 = *(float*)slot-or-symbol - 4-byte access to REAL
+                 memory (a slot-held pointer's pointee, ARG_SLOT, OR
+                 a global variable, ARG_SYM) - sized because that
+                 memory's true layout must be respected. */
+    OP_LDF8,  /* F0 = *(double*)slot-or-symbol - 8-byte version. */
+    OP_STF4,  /* *(float*)slot-or-symbol = F0 */
+    OP_STF8,  /* *(double*)slot-or-symbol = F0 */
+
+    OP_FCMP,  /* R0 = sign(F0 - slot), comparing as double - exactly
+                 like OP_CMP, just with F0 on the left instead of R0.
+                 Consumed by the SAME SEQ/SNE/SLT/SGT/SLE/SGE and
+                 JEQ/JNE/... families integers use. */
+    OP_FADD,  /* F0 += slot (as double) */
+    OP_FSUB,  /* F0 -= slot (as double) */
+    OP_FMUL,  /* F0 *= slot (as double) */
+    OP_FDIV,  /* F0 /= slot (as double) */
+
+    OP_PUSH,  /* push slot's value onto the call-argument stack */
+    OP_PUSHi, /* push an immediate onto the call-argument stack */
+    OP_PUSHr, /* push R0 onto the call-argument stack */
+
+    OP_JSR,   /* call the function pointer held in slot */
+    OP_JSRi,  /* call the function named by symbol */
+    OP_JSRr,  /* call the function pointer held in R0 */
+
+    OP_JMP,   /* unconditional: goto target */
+    OP_JEQ,   /* if (R0 == 0) goto target */
+    OP_JNE,   /* if (R0 != 0) goto target */
+    OP_JLT,   /* if (R0 <  0) goto target */
+    OP_JGT,   /* if (R0 >  0) goto target */
+    OP_JLE,   /* if (R0 <= 0) goto target */
+    OP_JGE,   /* if (R0 >= 0) goto target */
+} to8_opcode;
+
+static const char *to8_opcode_name(to8_opcode op)
+{
+    switch (op) {
+    case OP_NOP: return "NOP"; case OP_RET: return "RET";
+    case OP_ADJi: return "ADJi"; case OP_ADJr: return "ADJr";
+    case OP_LD: return "LD"; case OP_ST: return "ST"; case OP_LEA: return "LEA";
+    case OP_LD1: return "LD1"; case OP_LD2: return "LD2"; case OP_LD4: return "LD4";
+    case OP_LD1r: return "LD1r"; case OP_LD2r: return "LD2r"; case OP_LD4r: return "LD4r";
+    case OP_ST1: return "ST1"; case OP_ST2: return "ST2"; case OP_ST4: return "ST4";
+    case OP_LDi: return "LDi";
+    case OP_ADD: return "ADD"; case OP_SUB: return "SUB"; case OP_AND: return "AND";
+    case OP_OR: return "OR"; case OP_XOR: return "XOR"; case OP_MUL: return "MUL";
+    case OP_DIV: return "DIV"; case OP_MOD: return "MOD";
+    case OP_SHL: return "SHL"; case OP_SHR: return "SHR"; case OP_SAR: return "SAR";
+    case OP_CMP: return "CMP"; case OP_CMPU: return "CMPU";
+    case OP_ADDi: return "ADDi"; case OP_SUBi: return "SUBi"; case OP_ANDi: return "ANDi";
+    case OP_ORi: return "ORi"; case OP_XORi: return "XORi"; case OP_MULi: return "MULi";
+    case OP_DIVi: return "DIVi"; case OP_MODi: return "MODi";
+    case OP_SHLi: return "SHLi"; case OP_SHRi: return "SHRi"; case OP_SARi: return "SARi";
+    case OP_CMPi: return "CMPi"; case OP_CMPUi: return "CMPUi";
+    case OP_SEQ: return "SEQ"; case OP_SNE: return "SNE"; case OP_SLT: return "SLT"; case OP_SGT: return "SGT";
+    case OP_SLE: return "SLE"; case OP_SGE: return "SGE";
+    case OP_SNZ: return "SNZ";
+    case OP_MOV: return "MOV";
+    case OP_EXT1S: return "EXT1S"; case OP_EXT2S: return "EXT2S";
+    case OP_EXT1U: return "EXT1U"; case OP_EXT2U: return "EXT2U";
+    case OP_ITOF: return "ITOF"; case OP_FTOI: return "FTOI";
+    case OP_LDF: return "LDF"; case OP_STF: return "STF";
+    case OP_LDF4: return "LDF4"; case OP_LDF8: return "LDF8";
+    case OP_STF4: return "STF4"; case OP_STF8: return "STF8";
+    case OP_FCMP: return "FCMP"; case OP_FADD: return "FADD"; case OP_FSUB: return "FSUB";
+    case OP_FMUL: return "FMUL"; case OP_FDIV: return "FDIV";
+    case OP_PUSH: return "PUSH"; case OP_PUSHi: return "PUSHi"; case OP_PUSHr: return "PUSHr";
+    case OP_JSR: return "JSR"; case OP_JSRi: return "JSRi"; case OP_JSRr: return "JSRr";
+    case OP_JMP: return "JMP"; case OP_JEQ: return "JEQ"; case OP_JNE: return "JNE";
+    case OP_JLT: return "JLT"; case OP_JGT: return "JGT"; case OP_JLE: return "JLE"; case OP_JGE: return "JGE";
+    }
+    return "?";
+}
+
+/* ===================================================================
+ * Temp-slot management: a strictly-monotonic base allocator (used for
+ * genuinely function-lifetime slots, like r1_shadow_slot) plus a
+ * size-keyed LIFO free-list pool for ephemeral temps that this
+ * backend can PROVE are dead right after their next use.
  * =================================================================== */
 
 static int to8_new_temp(int size, int align)
 {
     loc = (loc - size) & -align;
     return loc;
+}
+
+static int *free4_stack; static int free4_n, free4_cap;
+static int *free8_stack; static int free8_n, free8_cap;
+
+static void to8_temp_pool_reset(void) { free4_n = 0; free8_n = 0; }
+
+static int to8_temp_alloc(int size, int align)
+{
+    if (size == 4 && align == 4 && free4_n > 0)
+        return free4_stack[--free4_n];
+    if (size == 8 && align == 4 && free8_n > 0)
+        return free8_stack[--free8_n];
+    return to8_new_temp(size, align);
+}
+
+static void to8_temp_free(int slot, int size, int align)
+{
+    if (size == 4 && align == 4) {
+        if (free4_n >= free4_cap) {
+            int nc = free4_cap ? free4_cap * 2 : 32;
+            free4_stack = tcc_realloc(free4_stack, nc * sizeof(int));
+            free4_cap = nc;
+        }
+        free4_stack[free4_n++] = slot;
+    } else if (size == 8 && align == 4) {
+        if (free8_n >= free8_cap) {
+            int nc = free8_cap ? free8_cap * 2 : 32;
+            free8_stack = tcc_realloc(free8_stack, nc * sizeof(int));
+            free8_cap = nc;
+        }
+        free8_stack[free8_n++] = slot;
+    }
 }
 
 static int r1_shadow_slot;
@@ -145,327 +370,126 @@ static int to8_r1_slot(void)
 static int cur_push_depth;
 
 /* ===================================================================
- * Fixed-width ASCII decimal helpers for patchable operand fields.
+ * Doubly-linked instruction list for the function being generated.
  * =================================================================== */
 
-#define TO8_FIELD_WIDTH 8
-#define TO8_LINE_WIDTH 10  /* "l" + up to 7 digits + ":" + 1 pad, or blank */
+enum { ARG_NONE = 0, ARG_SLOT, ARG_SLOT2, ARG_IMM, ARG_SYM, ARG_JMP };
 
-static void write_int_fixed(unsigned char *p, int v, int width)
-{
-    char tmp[16];
-    int len, i;
-    len = snprintf(tmp, sizeof tmp, "%d", v);
-    if (len > width) len = width;
-    for (i = 0; i < len; i++) p[i] = tmp[i];
-    for (i = len; i < width; i++) p[i] = ' ';
-}
+typedef struct to8_line {
+    to8_opcode op;
+    int kind;
+    int slot_a, slot_b, push_depth;
+    int imm_val;
+    Sym *sym; int sym_addend;
+    struct to8_line *jmp_chain;
+    int jmp_target_id;
+    const char *jump_prefix;
+    char comment[56];
+    int has_comment;
+    int is_target;
+    int id;
+    struct to8_line *redirect;
+    struct to8_line *prev, *next;
+} to8_line;
 
-static int read_int_fixed(const unsigned char *p, int width)
+static to8_line *g_head, *g_tail;
+static int g_next_id;
+static int to8_func_start_ind;
+
+static to8_line **g_by_id;
+static int g_by_id_cap;
+
+static int g_pending_target_id;
+static int g_frame_size;
+
+static int g_count_before, g_count_after;
+static int g_banner_done;
+static int g_last_end_ind = -1;
+
+static void to8_by_id_set(int id, to8_line *ln)
 {
-    int i = 0, v = 0, neg = 0;
-    if (p[0] == '-') { neg = 1; i = 1; }
-    for (; i < width; i++) {
-        if (p[i] < '0' || p[i] > '9') break;
-        v = v * 10 + (p[i] - '0');
+    if (id > g_by_id_cap) {
+        int nc = g_by_id_cap ? g_by_id_cap * 2 : 256;
+        while (nc < id) nc *= 2;
+        g_by_id = tcc_realloc(g_by_id, nc * sizeof(*g_by_id));
+        g_by_id_cap = nc;
     }
-    return neg ? -v : v;
+    g_by_id[id - 1] = ln;
 }
 
-static int emit_placeholder_field(int width)
+static to8_line *to8_by_id(int id)
 {
-    int offset = ind, i;
-    g('0');
-    for (i = 1; i < width; i++) g(' ');
-    return offset;
+    to8_line *ln;
+    if (id < 1 || id > g_next_id) {
+        tcc_error("TO8: internal error - to8_by_id() called with invalid id %d "
+                  "(valid range is 1..%d)", id, g_next_id);
+    }
+    ln = g_by_id[id - 1];
+    if (!ln) {
+        tcc_error("TO8: internal error - to8_by_id(%d) resolved to a NULL "
+                  "line (never registered or already freed)", id);
+    }
+    while (ln->redirect) ln = ln->redirect;
+    return ln;
 }
 
-/* Label DEFINITION form: "l<v>:" - used only where a line's own
- * leading label field is being revealed (this line IS the target). */
-static void write_label_def(unsigned char *p, int v, int width)
+static void to8_list_reset(void)
 {
-    char tmp[16];
-    int len, i;
-    len = snprintf(tmp, sizeof tmp, "l%d:", v);
-    if (len > width) len = width;
-    for (i = 0; i < len; i++) p[i] = tmp[i];
-    for (i = len; i < width; i++) p[i] = ' ';
+    g_head = g_tail = NULL;
+    g_next_id = 0;
+    g_pending_target_id = -1;
 }
 
-/* Label REFERENCE form: "l<v>" (no colon) - used for every jump
- * instruction's own target operand and its "goto" comment copy. */
-static void write_label_ref(unsigned char *p, int v, int width)
+static to8_line *to8_append(to8_opcode op)
 {
-    char tmp[16];
-    int len, i;
-    len = snprintf(tmp, sizeof tmp, "l%d", v);
-    if (len > width) len = width;
-    for (i = 0; i < len; i++) p[i] = tmp[i];
-    for (i = len; i < width; i++) p[i] = ' ';
+    to8_line *ln = tcc_mallocz(sizeof(to8_line));
+    ln->op = op;
+    ln->id = ++g_next_id;
+    to8_by_id_set(ln->id, ln);
+    ln->prev = g_tail;
+    if (g_tail) g_tail->next = ln; else g_head = ln;
+    g_tail = ln;
+    if (g_pending_target_id == ln->id) {
+        ln->is_target = 1;
+        g_pending_target_id = -1;
+    }
+    ind = to8_func_start_ind + ln->id + 1;
+    return ln;
 }
 
-static int pending_line_mark = -1;
-
-static void mark_or_defer_target(int a)
+static void to8_unlink(to8_line *ln)
 {
-    if (a < 0) return;
-    if (a < ind)
-        write_label_def(cur_text_section->data + a, a, TO8_LINE_WIDTH);
+    if (ln->prev) ln->prev->next = ln->next; else g_head = ln->next;
+    if (ln->next) ln->next->prev = ln->prev; else g_tail = ln->prev;
+}
+
+static void to8_insert_after(to8_line *after, to8_line *ln)
+{
+    ln->prev = after;
+    ln->next = after->next;
+    if (after->next) after->next->prev = ln; else g_tail = ln;
+    after->next = ln;
+}
+
+static void to8_mark_target(int target_id)
+{
+    if (target_id >= 1 && target_id <= g_next_id)
+        to8_by_id(target_id)->is_target = 1;
     else
-        pending_line_mark = a;
+        g_pending_target_id = target_id;
+}
+
+static int to8_count_lines(void)
+{
+    int n = 0;
+    to8_line *ln;
+    for (ln = g_head; ln; ln = ln->next) n++;
+    return n;
 }
 
 /* ===================================================================
- * Per-function patch lists.
+ * Comment templates - switch on the enum, computed eagerly.
  * =================================================================== */
-
-typedef struct { int text_offset; int raw_slot; int push_depth; } to8_slot_patch;
-static to8_slot_patch *slot_patches;
-static int slot_patches_n, slot_patches_cap;
-
-typedef struct { int op_off; int cmt_off; } to8_jmp_cmt_patch;
-static to8_jmp_cmt_patch *jmp_cmt_patches;
-static int jmp_cmt_patches_n, jmp_cmt_patches_cap;
-
-static int pend_store_valid;
-static int pend_store_slot;
-
-/* EXT fusion candidate: set right after emitting "SHLi <amount>" for
- * amount 24 or 16. */
-static int pending_sex_amount;
-static int pending_sex_line_start;
-
-/* MOV fusion candidates. last_ld_* tracks whether the IMMEDIATELY
- * preceding emission was a bare "LD <slot>" (any other instruction
- * clears it). pending_mov_* tracks a "LD a; ST b" pair awaiting a
- * verdict from whatever instruction comes next. */
-static int last_ld_valid;
-static int last_ld_slot;
-static int last_ld_start;
-
-static int pending_mov_valid;
-static int pending_mov_ld_start;
-static int pending_mov_st_start;
-static int pending_mov_src;
-static int pending_mov_dst;
-
-static void slot_patch_reset(void)
-{
-    slot_patches_n = 0;
-    jmp_cmt_patches_n = 0;
-    pend_store_valid = 0;
-    pending_line_mark = -1;
-    r1_shadow_valid = 0;
-    cur_push_depth = 0;
-    pending_sex_amount = 0;
-    last_ld_valid = 0;
-    pending_mov_valid = 0;
-}
-
-static void slot_patch_add(int text_offset, int raw_slot)
-{
-    if (slot_patches_n >= slot_patches_cap) {
-        int newcap = slot_patches_cap ? slot_patches_cap * 2 : 64;
-        slot_patches = tcc_realloc(slot_patches, newcap * sizeof(*slot_patches));
-        slot_patches_cap = newcap;
-    }
-    slot_patches[slot_patches_n].text_offset = text_offset;
-    slot_patches[slot_patches_n].raw_slot = raw_slot;
-    slot_patches[slot_patches_n].push_depth = cur_push_depth;
-    slot_patches_n++;
-}
-
-static void jmp_cmt_patch_add(int op_off, int cmt_off)
-{
-    if (jmp_cmt_patches_n >= jmp_cmt_patches_cap) {
-        int newcap = jmp_cmt_patches_cap ? jmp_cmt_patches_cap * 2 : 32;
-        jmp_cmt_patches = tcc_realloc(jmp_cmt_patches, newcap * sizeof(*jmp_cmt_patches));
-        jmp_cmt_patches_cap = newcap;
-    }
-    jmp_cmt_patches[jmp_cmt_patches_n].op_off = op_off;
-    jmp_cmt_patches[jmp_cmt_patches_n].cmt_off = cmt_off;
-    jmp_cmt_patches_n++;
-}
-
-/* ===================================================================
- * Emit helpers
- * =================================================================== */
-
-static void emit_str(const char *s) { while (*s) g((unsigned char)*s++); }
-
-static void emit_uint(unsigned int v)
-{
-    char buf[12]; int n = 0, i;
-    if (v == 0) { g('0'); return; }
-    while (v && n < 12) { buf[n++] = '0' + (v % 10); v /= 10; }
-    for (i = n - 1; i >= 0; i--) g(buf[i]);
-}
-
-static void emit_int(int v)
-{
-    if (v < 0) { g('-'); v = -v; }
-    emit_uint((unsigned)v);
-}
-
-static void begin_line(void)
-{
-    int i;
-    if (pending_line_mark == ind) {
-        char tmp[16]; int len, j;
-        len = snprintf(tmp, sizeof tmp, "l%d:", ind);
-        if (len > TO8_LINE_WIDTH) len = TO8_LINE_WIDTH;
-        for (j = 0; j < len; j++) g(tmp[j]);
-        for (j = len; j < TO8_LINE_WIDTH; j++) g(' ');
-        pending_line_mark = -1;
-    } else {
-        for (i = 0; i < TO8_LINE_WIDTH; i++) g(' ');
-    }
-}
-
-static void emit_nl(void) { g('\n'); }
-
-static void emit_comment(const char *text)
-{
-    emit_str("  ; ");
-    emit_str(text);
-}
-
-/* ===================================================================
- * C-style comment templates
- * =================================================================== */
-
-static const char *to8_type_name(char digit)
-{
-    if (digit == '1') return "char";
-    if (digit == '2') return "short";
-    return "int";
-}
-
-static void slot_comment(char *out, size_t outsz, const char *op, const char *desc)
-{
-    int n = (int)strlen(op);
-    if (!strcmp(op, "LD")) { snprintf(out, outsz, "R0 = %s", desc); return; }
-    if (!strcmp(op, "ST")) { snprintf(out, outsz, "%s = R0", desc); return; }
-    if (!strcmp(op, "LEA")) { snprintf(out, outsz, "R0 = &%s", desc); return; }
-    if (!strcmp(op, "ADD")) { snprintf(out, outsz, "R0 += %s", desc); return; }
-    if (!strcmp(op, "SUB")) { snprintf(out, outsz, "R0 -= %s", desc); return; }
-    if (!strcmp(op, "AND")) { snprintf(out, outsz, "R0 &= %s", desc); return; }
-    if (!strcmp(op, "OR"))  { snprintf(out, outsz, "R0 |= %s", desc); return; }
-    if (!strcmp(op, "XOR")) { snprintf(out, outsz, "R0 ^= %s", desc); return; }
-    if (!strcmp(op, "MUL")) { snprintf(out, outsz, "R0 *= %s", desc); return; }
-    if (!strcmp(op, "DIV")) { snprintf(out, outsz, "R0 /= %s", desc); return; }
-    if (!strcmp(op, "MOD")) { snprintf(out, outsz, "R0 %%= %s", desc); return; }
-    if (!strcmp(op, "SHL")) { snprintf(out, outsz, "R0 <<= %s", desc); return; }
-    if (!strcmp(op, "SHR")) { snprintf(out, outsz, "R0 >>= %s", desc); return; }
-    if (!strcmp(op, "SAR")) { snprintf(out, outsz, "R0 >>= %s (arith)", desc); return; }
-    if (!strcmp(op, "CMP")) { snprintf(out, outsz, "compare R0, %s", desc); return; }
-    if (!strcmp(op, "FCMP")) { snprintf(out, outsz, "compare F0, %s", desc); return; }
-    if (!strcmp(op, "STF32") || !strcmp(op, "STF64")) { snprintf(out, outsz, "%s = F0", desc); return; }
-    if (!strcmp(op, "LDF32") || !strcmp(op, "LDF64")) { snprintf(out, outsz, "F0 = %s", desc); return; }
-    if (!strcmp(op, "STF32ms") || !strcmp(op, "STF64ms")) { snprintf(out, outsz, "*%s = F0", desc); return; }
-    if (!strcmp(op, "LDF32ms") || !strcmp(op, "LDF64ms")) { snprintf(out, outsz, "F0 = *%s", desc); return; }
-    if (!strcmp(op, "PSH")) { snprintf(out, outsz, "push %s", desc); return; }
-    if (!strcmp(op, "JSRs")) { snprintf(out, outsz, "call *%s", desc); return; }
-    if (n >= 3 && op[0] == 'L' && op[1] == 'D' && isdigit((unsigned char)op[2])) {
-        snprintf(out, outsz, "R0 = *(%s*)%s", to8_type_name(op[2]), desc); return;
-    }
-    if (n >= 3 && op[0] == 'S' && op[1] == 'T' && isdigit((unsigned char)op[2])) {
-        snprintf(out, outsz, "*(%s*)%s = R0", to8_type_name(op[2]), desc); return;
-    }
-    snprintf(out, outsz, "%s", desc);
-}
-
-static void imm_comment(char *out, size_t outsz, const char *op, int v)
-{
-    char num[16];
-    snprintf(num, sizeof num, "%d", v);
-    if (!strcmp(op, "LDi")) { snprintf(out, outsz, "R0 = %s", num); return; }
-    if (!strcmp(op, "ADDi")) { snprintf(out, outsz, "R0 += %s", num); return; }
-    if (!strcmp(op, "SUBi")) { snprintf(out, outsz, "R0 -= %s", num); return; }
-    if (!strcmp(op, "ANDi")) { snprintf(out, outsz, "R0 &= %s", num); return; }
-    if (!strcmp(op, "ORi"))  { snprintf(out, outsz, "R0 |= %s", num); return; }
-    if (!strcmp(op, "XORi")) { snprintf(out, outsz, "R0 ^= %s", num); return; }
-    if (!strcmp(op, "MULi")) { snprintf(out, outsz, "R0 *= %s", num); return; }
-    if (!strcmp(op, "DIVi")) { snprintf(out, outsz, "R0 /= %s", num); return; }
-    if (!strcmp(op, "MODi")) { snprintf(out, outsz, "R0 %%= %s", num); return; }
-    if (!strcmp(op, "SHLi")) { snprintf(out, outsz, "R0 <<= %s", num); return; }
-    if (!strcmp(op, "SHRi")) { snprintf(out, outsz, "R0 >>= %s", num); return; }
-    if (!strcmp(op, "SARi")) { snprintf(out, outsz, "R0 >>= %s (arith)", num); return; }
-    if (!strcmp(op, "CMPi")) { snprintf(out, outsz, "compare R0, %s", num); return; }
-    if (!strcmp(op, "ADJ")) { snprintf(out, outsz, v < 0 ? "sp -= %s" : "sp += %s", v < 0 ? num + 1 : num); return; }
-    if (!strcmp(op, "PUSHi")) { snprintf(out, outsz, "push %s", num); return; }
-    snprintf(out, outsz, "%s", num);
-}
-
-static void addr_comment(char *out, size_t outsz, const char *op, const char *desc)
-{
-    int n = (int)strlen(op);
-    if (!strcmp(op, "LEAm")) { snprintf(out, outsz, "R0 = &%s", desc); return; }
-    if (!strcmp(op, "JSRi")) { snprintf(out, outsz, "call %s", desc); return; }
-    if (!strcmp(op, "LDF32m") || !strcmp(op, "LDF64m")) { snprintf(out, outsz, "F0 = %s", desc); return; }
-    if (!strcmp(op, "STF32m") || !strcmp(op, "STF64m")) { snprintf(out, outsz, "%s = F0", desc); return; }
-    if (n >= 2 && op[0] == 'L' && op[1] == 'D' && isdigit((unsigned char)op[2])) {
-        snprintf(out, outsz, "R0 = *(%s*)%s", to8_type_name(op[2]), desc); return;
-    }
-    if (n >= 2 && op[0] == 'S' && op[1] == 'T' && isdigit((unsigned char)op[2])) {
-        snprintf(out, outsz, "*(%s*)%s = R0", to8_type_name(op[2]), desc); return;
-    }
-    snprintf(out, outsz, "%s", desc);
-}
-
-static const char *bare_comment(const char *op)
-{
-    if (!strcmp(op, "RET")) return "return";
-    if (!strcmp(op, "PUSH")) return "push R0";
-    if (!strcmp(op, "JSR")) return "call *R0";
-    if (!strcmp(op, "ITOF")) return "R0 -> F0 (int to float)";
-    if (!strcmp(op, "FTOI")) return "F0 -> R0 (float to int)";
-    if (!strcmp(op, "TST")) return "compare R0, 0";
-    if (!strcmp(op, "SEQ")) return "R0 = (== ? 1 : 0)";
-    if (!strcmp(op, "SNE")) return "R0 = (!= ? 1 : 0)";
-    if (!strcmp(op, "SLT")) return "R0 = (< ? 1 : 0)";
-    if (!strcmp(op, "SGT")) return "R0 = (> ? 1 : 0)";
-    if (!strcmp(op, "SLE")) return "R0 = (<= ? 1 : 0)";
-    if (!strcmp(op, "SGE")) return "R0 = (>= ? 1 : 0)";
-    if (!strcmp(op, "SLTU")) return "R0 = (< unsigned ? 1 : 0)";
-    if (!strcmp(op, "SGTU")) return "R0 = (> unsigned ? 1 : 0)";
-    if (!strcmp(op, "SLEU")) return "R0 = (<= unsigned ? 1 : 0)";
-    if (!strcmp(op, "SGEU")) return "R0 = (>= unsigned ? 1 : 0)";
-    if (!strcmp(op, "SNZ")) return "R0 = (R0 != 0 ? 1 : 0)";
-    if (!strcmp(op, "FADD")) return "F0 += (top)";
-    if (!strcmp(op, "FSUB")) return "F0 -= (top)";
-    if (!strcmp(op, "FMUL")) return "F0 *= (top)";
-    if (!strcmp(op, "FDIV")) return "F0 /= (top)";
-    if (!strcmp(op, "FSEQ")) return "R0 = (F0 == ? 1 : 0)";
-    if (!strcmp(op, "FSNE")) return "R0 = (F0 != ? 1 : 0)";
-    if (!strcmp(op, "FSLT")) return "R0 = (F0 < ? 1 : 0)";
-    if (!strcmp(op, "FSGT")) return "R0 = (F0 > ? 1 : 0)";
-    if (!strcmp(op, "FSLE")) return "R0 = (F0 <= ? 1 : 0)";
-    if (!strcmp(op, "FSGE")) return "R0 = (F0 >= ? 1 : 0)";
-    if (!strcmp(op, "EXT1S")) return "R0 = (int)(char)R0";
-    if (!strcmp(op, "EXT2S")) return "R0 = (int)(short)R0";
-    if (!strcmp(op, "EXT1U")) return "R0 = (int)(unsigned char)R0";
-    if (!strcmp(op, "EXT2U")) return "R0 = (int)(unsigned short)R0";
-    if (!strcmp(op, "VLA_ALLOC")) return "alloc VLA";
-    if (!strcmp(op, "NOP")) return "no-op";
-    return NULL;
-}
-
-static const char *jump_comment(const char *op)
-{
-    if (!strcmp(op, "JMP")) return "goto";
-    if (!strcmp(op, "JEQ")) return "if (==) goto";
-    if (!strcmp(op, "JNE")) return "if (!=) goto";
-    if (!strcmp(op, "JLT")) return "if (<) goto";
-    if (!strcmp(op, "JGT")) return "if (>) goto";
-    if (!strcmp(op, "JLE")) return "if (<=) goto";
-    if (!strcmp(op, "JGE")) return "if (>=) goto";
-    if (!strcmp(op, "JLTU")) return "if (< unsigned) goto";
-    if (!strcmp(op, "JGTU")) return "if (> unsigned) goto";
-    if (!strcmp(op, "JLEU")) return "if (<= unsigned) goto";
-    if (!strcmp(op, "JGEU")) return "if (>= unsigned) goto";
-    return "goto";
-}
 
 static void slot_desc(char *out, size_t outsz, int slot)
 {
@@ -473,266 +497,231 @@ static void slot_desc(char *out, size_t outsz, int slot)
     else snprintf(out, outsz, "param[%d]", slot);
 }
 
+static const char *to8_size_name(to8_opcode op)
+{
+    switch (op) {
+    case OP_LD1: case OP_ST1: return "char";
+    case OP_LD2: case OP_ST2: return "short";
+    default: return "int";
+    }
+}
+
+static void slot_comment(char *out, size_t outsz, to8_opcode op, const char *desc)
+{
+    switch (op) {
+    case OP_LD: snprintf(out, outsz, "R0 = %s", desc); return;
+    case OP_ST: snprintf(out, outsz, "%s = R0", desc); return;
+    case OP_LEA: snprintf(out, outsz, "R0 = &%s", desc); return;
+    case OP_ADD: snprintf(out, outsz, "R0 += %s", desc); return;
+    case OP_SUB: snprintf(out, outsz, "R0 -= %s", desc); return;
+    case OP_AND: snprintf(out, outsz, "R0 &= %s", desc); return;
+    case OP_OR: snprintf(out, outsz, "R0 |= %s", desc); return;
+    case OP_XOR: snprintf(out, outsz, "R0 ^= %s", desc); return;
+    case OP_MUL: snprintf(out, outsz, "R0 *= %s", desc); return;
+    case OP_DIV: snprintf(out, outsz, "R0 /= %s", desc); return;
+    case OP_MOD: snprintf(out, outsz, "R0 %%= %s", desc); return;
+    case OP_SHL: snprintf(out, outsz, "R0 <<= %s", desc); return;
+    case OP_SHR: snprintf(out, outsz, "R0 >>= %s", desc); return;
+    case OP_SAR: snprintf(out, outsz, "R0 >>= %s (arith)", desc); return;
+    case OP_CMP: snprintf(out, outsz, "R0 = sign(R0 - %s)", desc); return;
+    case OP_CMPU: snprintf(out, outsz, "R0 = sign(R0 -u %s)", desc); return;
+    case OP_FCMP: snprintf(out, outsz, "R0 = sign(F0 - %s)", desc); return;
+    case OP_FADD: snprintf(out, outsz, "F0 += %s", desc); return;
+    case OP_FSUB: snprintf(out, outsz, "F0 -= %s", desc); return;
+    case OP_FMUL: snprintf(out, outsz, "F0 *= %s", desc); return;
+    case OP_FDIV: snprintf(out, outsz, "F0 /= %s", desc); return;
+    case OP_STF: snprintf(out, outsz, "%s = F0", desc); return;
+    case OP_LDF: snprintf(out, outsz, "F0 = %s", desc); return;
+    case OP_STF4: case OP_STF8: snprintf(out, outsz, "*%s = F0", desc); return;
+    case OP_LDF4: case OP_LDF8: snprintf(out, outsz, "F0 = *%s", desc); return;
+    case OP_PUSH: snprintf(out, outsz, "push %s", desc); return;
+    case OP_JSR: snprintf(out, outsz, "call *%s", desc); return;
+    case OP_LD1: case OP_LD2: case OP_LD4:
+        snprintf(out, outsz, "R0 = *(%s*)%s", to8_size_name(op), desc); return;
+    case OP_ST1: case OP_ST2: case OP_ST4:
+        snprintf(out, outsz, "*(%s*)%s = R0", to8_size_name(op), desc); return;
+    default: snprintf(out, outsz, "%s", desc); return;
+    }
+}
+
+static void imm_comment(char *out, size_t outsz, to8_opcode op, int v)
+{
+    char num[16];
+    snprintf(num, sizeof num, "%d", v);
+    switch (op) {
+    case OP_LDi: snprintf(out, outsz, "R0 = %s", num); return;
+    case OP_ADDi: snprintf(out, outsz, "R0 += %s", num); return;
+    case OP_SUBi: snprintf(out, outsz, "R0 -= %s", num); return;
+    case OP_ANDi: snprintf(out, outsz, "R0 &= %s", num); return;
+    case OP_ORi: snprintf(out, outsz, "R0 |= %s", num); return;
+    case OP_XORi: snprintf(out, outsz, "R0 ^= %s", num); return;
+    case OP_MULi: snprintf(out, outsz, "R0 *= %s", num); return;
+    case OP_DIVi: snprintf(out, outsz, "R0 /= %s", num); return;
+    case OP_MODi: snprintf(out, outsz, "R0 %%= %s", num); return;
+    case OP_SHLi: snprintf(out, outsz, "R0 <<= %s", num); return;
+    case OP_SHRi: snprintf(out, outsz, "R0 >>= %s", num); return;
+    case OP_SARi: snprintf(out, outsz, "R0 >>= %s (arith)", num); return;
+    case OP_CMPi: snprintf(out, outsz, "R0 = sign(R0 - %s)", num); return;
+    case OP_CMPUi: snprintf(out, outsz, "R0 = sign(R0 -u %s)", num); return;
+    case OP_ADJi: snprintf(out, outsz, v < 0 ? "sp -= %s" : "sp += %s", v < 0 ? num + 1 : num); return;
+    case OP_PUSHi: snprintf(out, outsz, "push %s", num); return;
+    default: snprintf(out, outsz, "%s", num); return;
+    }
+}
+
+static void addr_comment(char *out, size_t outsz, to8_opcode op, const char *desc)
+{
+    switch (op) {
+    case OP_LDi: snprintf(out, outsz, "R0 = &%s", desc); return;
+    case OP_JSRi: snprintf(out, outsz, "call %s", desc); return;
+    case OP_LDF4: case OP_LDF8: snprintf(out, outsz, "F0 = %s", desc); return;
+    case OP_STF4: case OP_STF8: snprintf(out, outsz, "%s = F0", desc); return;
+    default: snprintf(out, outsz, "%s", desc); return;
+    }
+}
+
+static const char *bare_comment(to8_opcode op)
+{
+    switch (op) {
+    case OP_RET: return "return";
+    case OP_ADJr: return "sp -= R0 (VLA alloc)";
+    case OP_PUSHr: return "push R0";
+    case OP_JSRr: return "call *R0";
+    case OP_LD1r: return "R0 = *(char*)R0";
+    case OP_LD2r: return "R0 = *(short*)R0";
+    case OP_LD4r: return "R0 = *(int*)R0";
+    case OP_ITOF: return "R0 -> F0 (int to float)";
+    case OP_FTOI: return "F0 -> R0 (float to int)";
+    case OP_SEQ: return "R0 = (== ? 1 : 0)";
+    case OP_SNE: return "R0 = (!= ? 1 : 0)";
+    case OP_SLT: return "R0 = (< ? 1 : 0)";
+    case OP_SGT: return "R0 = (> ? 1 : 0)";
+    case OP_SLE: return "R0 = (<= ? 1 : 0)";
+    case OP_SGE: return "R0 = (>= ? 1 : 0)";
+    case OP_SNZ: return "R0 = (R0 != 0 ? 1 : 0)";
+    case OP_EXT1S: return "R0 = (int)(char)R0";
+    case OP_EXT2S: return "R0 = (int)(short)R0";
+    case OP_EXT1U: return "R0 = (int)(unsigned char)R0";
+    case OP_EXT2U: return "R0 = (int)(unsigned short)R0";
+    case OP_NOP: return "no-op";
+    default: return NULL;
+    }
+}
+
+static const char *to8_jump_prefix(to8_opcode op)
+{
+    switch (op) {
+    case OP_JMP: return "goto";
+    case OP_JEQ: return "if (==) goto";
+    case OP_JNE: return "if (!=) goto";
+    case OP_JLT: return "if (<) goto";
+    case OP_JGT: return "if (>) goto";
+    case OP_JLE: return "if (<=) goto";
+    case OP_JGE: return "if (>=) goto";
+    default: return "goto";
+    }
+}
+
 /* ===================================================================
- * MOV fusion: whitelist of mnemonics known to overwrite R0
- * unconditionally WITHOUT reading its current value. Deliberately
- * narrow - anything not listed is treated as unsafe, so a missed
- * fusion just leaves two already-correct lines in place. */
-static int to8_clobbers_r0(const char *op)
-{
-    static const char *table[] = {
-        "LD", "LDi", "LEA", "LEAm", "LD1", "LD2", "LD4",
-        "JSRi", "JSRs", "JSR",
-        NULL
-    };
-    int i;
-    for (i = 0; table[i]; i++)
-        if (!strcmp(op, table[i])) return 1;
-    return 0;
-}
-
-static void emit_mov(int dst_slot, int src_slot)
-{
-    int patch_dst, patch_src;
-    char desc_dst[24], desc_src[24], cmt[56];
-
-    begin_line();
-    emit_str("    MOV ");
-    patch_dst = emit_placeholder_field(TO8_FIELD_WIDTH);
-    slot_patch_add(patch_dst, dst_slot);
-    emit_str(", ");
-    patch_src = emit_placeholder_field(TO8_FIELD_WIDTH);
-    slot_patch_add(patch_src, src_slot);
-
-    slot_desc(desc_dst, sizeof desc_dst, dst_slot);
-    slot_desc(desc_src, sizeof desc_src, src_slot);
-    snprintf(cmt, sizeof cmt, "%s = %s", desc_dst, desc_src);
-    emit_comment(cmt);
-    emit_nl();
-    pend_store_valid = 0;
-}
-
-/* Called at the very top of every emission entry point, before any
- * text for the upcoming instruction (mnemonic op_about_to_be_emitted)
- * is written. Resolves any outstanding "LD a; ST b" MOV candidate:
- * confirms (comments out both lines, emits "MOV b, a") if op_about_
- * to_be_emitted provably clobbers R0 first, drops it otherwise. */
-static void to8_resolve_pending_mov(const char *op_about_to_be_emitted)
-{
-    if (!pending_mov_valid) return;
-    pending_mov_valid = 0;
-    if (!to8_clobbers_r0(op_about_to_be_emitted)) return;
-
-    cur_text_section->data[pending_mov_ld_start] = ';';
-    cur_text_section->data[pending_mov_st_start] = ';';
-    emit_mov(pending_mov_dst, pending_mov_src);
-}
-
-/* ===================================================================
- * Emit primitives
+ * Append helpers - plain, no fusion bookkeeping.
  * =================================================================== */
 
-static void emit_op(const char *op)
+static void e_op(to8_opcode op)
 {
-    const char *c;
-    to8_resolve_pending_mov(op);
-    last_ld_valid = 0;
-    c = bare_comment(op);
-    begin_line();
-    emit_str("    ");
-    emit_str(op);
-    if (c) emit_comment(c);
-    emit_nl();
-    pend_store_valid = 0;
+    to8_line *ln = to8_append(op);
+    const char *c = bare_comment(op);
+    ln->kind = ARG_NONE;
+    if (c) { snprintf(ln->comment, sizeof ln->comment, "%s", c); ln->has_comment = 1; }
 }
 
-static int emit_op_imm(const char *op, int v)
+static to8_line *e_op_imm(to8_opcode op, int v)
 {
-    int line_start;
-    char cmt[48];
-    to8_resolve_pending_mov(op);
-    last_ld_valid = 0;
-    line_start = ind;
-    begin_line();
-    emit_str("    ");
-    emit_str(op);
-    g(' ');
-    emit_int(v);
-    imm_comment(cmt, sizeof cmt, op, v);
-    emit_comment(cmt);
-    emit_nl();
-    pend_store_valid = 0;
-    return line_start;
+    to8_line *ln = to8_append(op);
+    ln->kind = ARG_IMM;
+    ln->imm_val = v;
+    imm_comment(ln->comment, sizeof ln->comment, op, v);
+    ln->has_comment = 1;
+    return ln;
 }
 
-static void emit_op_slot(const char *op, int slot)
+static void e_op_slot(to8_opcode op, int slot)
 {
-    int patch_off;
-    char desc[24], cmt[48];
-    int line_start;
-
-    to8_resolve_pending_mov(op);
-
-    if (strcmp(op, "LD") == 0 && pend_store_valid && slot == pend_store_slot) {
-        last_ld_valid = 0;
-        return;
-    }
-
-    line_start = ind;
-    begin_line();
-    emit_str("    ");
-    emit_str(op);
-    g(' ');
-    patch_off = emit_placeholder_field(TO8_FIELD_WIDTH);
-    slot_patch_add(patch_off, slot);
-
+    to8_line *ln = to8_append(op);
+    char desc[24];
+    ln->kind = ARG_SLOT;
+    ln->slot_a = slot;
+    ln->push_depth = cur_push_depth;
     slot_desc(desc, sizeof desc, slot);
-    slot_comment(cmt, sizeof cmt, op, desc);
-    emit_comment(cmt);
-    emit_nl();
-
-    if (strcmp(op, "ST") == 0) {
-        pend_store_valid = 1;
-        pend_store_slot = slot;
-        if (last_ld_valid) {
-            pending_mov_valid = 1;
-            pending_mov_ld_start = last_ld_start;
-            pending_mov_st_start = line_start;
-            pending_mov_src = last_ld_slot;
-            pending_mov_dst = slot;
-        }
-        last_ld_valid = 0;
-    } else {
-        pend_store_valid = 0;
-        if (strcmp(op, "LD") == 0) {
-            last_ld_valid = 1;
-            last_ld_slot = slot;
-            last_ld_start = line_start;
-        } else {
-            last_ld_valid = 0;
-        }
-    }
+    slot_comment(ln->comment, sizeof ln->comment, op, desc);
+    ln->has_comment = 1;
 }
 
-static void emit_op_addr(const char *op, Sym *sym, int c)
+static void e_op_addr(to8_opcode op, Sym *sym, int c)
 {
-    char desc[32], cmt[48];
-
-    to8_resolve_pending_mov(op);
-    last_ld_valid = 0;
-
-    begin_line();
-    emit_str("    ");
-    emit_str(op);
-    g(' ');
+    to8_line *ln = to8_append(op);
+    char desc[32];
+    ln->kind = ARG_SYM;
+    ln->sym = sym;
+    ln->sym_addend = c;
     if (sym) {
         const char *name = get_tok_str(sym->v, NULL);
         snprintf(desc, sizeof desc, "%s", name ? name : "?");
-        greloca(cur_text_section, sym, ind, R_X86_64_PC32, c);
-        cur_text_section->data[ind]     = '0';
-        cur_text_section->data[ind + 1] = '0';
-        cur_text_section->data[ind + 2] = '0';
-        cur_text_section->data[ind + 3] = '0';
-        ind += 4;
     } else {
         snprintf(desc, sizeof desc, "%d", c);
-        emit_int(c);
     }
-    addr_comment(cmt, sizeof cmt, op, desc);
-    emit_comment(cmt);
-    emit_nl();
-    pend_store_valid = 0;
+    addr_comment(ln->comment, sizeof ln->comment, op, desc);
+    ln->has_comment = 1;
 }
 
-static void emit_label(const char *name)
-{
-    to8_resolve_pending_mov("LABEL");
-    last_ld_valid = 0;
-    begin_line();
-    emit_str(name);
-    g(':');
-    emit_nl();
-    pend_store_valid = 0;
-}
-
-static void to8_track_push(void)
-{
-    cur_push_depth += PTR_SIZE;
-}
+static void to8_track_push(void) { cur_push_depth += PTR_SIZE; }
 
 static void to8_adjust(int n)
 {
-    emit_op_imm("ADJ", n);
+    e_op_imm(OP_ADJi, n);
     cur_push_depth -= n;
 }
 
-static void to8_push_imm(int v)
+static void e_push_imm(int v)
 {
-    to8_resolve_pending_mov("PUSHi");
-    last_ld_valid = 0;
-    begin_line();
-    emit_str("    PUSHi ");
-    emit_int(v);
-    {
-        char cmt[32];
-        imm_comment(cmt, sizeof cmt, "PUSHi", v);
-        emit_comment(cmt);
-    }
-    emit_nl();
-    pend_store_valid = 0;
+    to8_line *ln = to8_append(OP_PUSHi);
+    ln->kind = ARG_IMM;
+    ln->imm_val = v;
+    imm_comment(ln->comment, sizeof ln->comment, OP_PUSHi, v);
+    ln->has_comment = 1;
     to8_track_push();
 }
 
-static void to8_push_slot(int slot)
+static void e_push_slot(int slot)
 {
-    int patch_off;
-    char desc[24], cmt[40];
-
-    to8_resolve_pending_mov("PSH");
-    last_ld_valid = 0;
-
-    begin_line();
-    emit_str("    PSH ");
-    patch_off = emit_placeholder_field(TO8_FIELD_WIDTH);
-    slot_patch_add(patch_off, slot);
+    to8_line *ln = to8_append(OP_PUSH);
+    char desc[24];
+    ln->kind = ARG_SLOT;
+    ln->slot_a = slot;
+    ln->push_depth = cur_push_depth;
     slot_desc(desc, sizeof desc, slot);
-    slot_comment(cmt, sizeof cmt, "PSH", desc);
-    emit_comment(cmt);
-    emit_nl();
-    pend_store_valid = 0;
+    slot_comment(ln->comment, sizeof ln->comment, OP_PUSH, desc);
+    ln->has_comment = 1;
     to8_track_push();
 }
 
-static void to8_push_r0(void)
-{
-    emit_op("PUSH");
-    to8_track_push();
-}
+static void e_push_r0(void) { e_op(OP_PUSHr); to8_track_push(); }
 
 /* ===================================================================
- * Jump backpatching
+ * Jump backpatching.
  * =================================================================== */
 
 ST_FUNC void gsym_addr(int t, int a)
 {
-    int target = (a < 0) ? -a : a;
+    int abs_target = (a < 0) ? -a : a;
+    int target = abs_target - to8_func_start_ind;
     while (t) {
-        unsigned char *ptr = cur_text_section->data + t;
-        int n = read_int_fixed(ptr, TO8_FIELD_WIDTH);
-        write_label_ref(ptr, target, TO8_FIELD_WIDTH);
-        {
-            int i;
-            for (i = 0; i < jmp_cmt_patches_n; i++) {
-                if (jmp_cmt_patches[i].op_off == t) {
-                    write_label_ref(cur_text_section->data + jmp_cmt_patches[i].cmt_off,
-                                     target, TO8_FIELD_WIDTH);
-                    break;
-                }
-            }
-        }
-        t = n;
+        to8_line *ln = to8_by_id(t);
+        to8_line *next = ln->jmp_chain;
+        ln->jmp_target_id = target;
+        ln->jmp_chain = NULL;
+        t = next ? next->id : 0;
     }
-    mark_or_defer_target(target);
+    to8_mark_target(target);
 }
 
 /* ===================================================================
@@ -744,92 +733,86 @@ static int to8_is_commutative(int op)
     return op == '+' || op == '*' || op == '&' || op == '|' || op == '^';
 }
 
-static int to8_get_arith_ops(int op, const char **slot_op, const char **imm_op)
+static int to8_get_arith_ops(int op, to8_opcode *slot_op, to8_opcode *imm_op)
 {
     switch (op) {
-    case '+': *slot_op = "ADD"; *imm_op = "ADDi"; return 0;
-    case '-': *slot_op = "SUB"; *imm_op = "SUBi"; return 0;
-    case '&': *slot_op = "AND"; *imm_op = "ANDi"; return 0;
-    case '|': *slot_op = "OR";  *imm_op = "ORi";  return 0;
-    case '^': *slot_op = "XOR"; *imm_op = "XORi"; return 0;
-    case '*': *slot_op = "MUL"; *imm_op = "MULi"; return 0;
-    case '/': *slot_op = "DIV"; *imm_op = "DIVi"; return 0;
-    case '%': *slot_op = "MOD"; *imm_op = "MODi"; return 0;
-    case TOK_SHL: *slot_op = "SHL"; *imm_op = "SHLi"; return 0;
-    case TOK_SHR: *slot_op = "SHR"; *imm_op = "SHRi"; return 0;
-    case TOK_SAR: *slot_op = "SAR"; *imm_op = "SARi"; return 0;
-    case TOK_UDIV: *slot_op = "DIV"; *imm_op = "DIVi"; return 0;
-    case TOK_UMOD: *slot_op = "MOD"; *imm_op = "MODi"; return 0;
-    default: *slot_op = NULL; *imm_op = NULL; return -1;
+    case '+': *slot_op = OP_ADD; *imm_op = OP_ADDi; return 0;
+    case '-': *slot_op = OP_SUB; *imm_op = OP_SUBi; return 0;
+    case '&': *slot_op = OP_AND; *imm_op = OP_ANDi; return 0;
+    case '|': *slot_op = OP_OR; *imm_op = OP_ORi; return 0;
+    case '^': *slot_op = OP_XOR; *imm_op = OP_XORi; return 0;
+    case '*': *slot_op = OP_MUL; *imm_op = OP_MULi; return 0;
+    case '/': *slot_op = OP_DIV; *imm_op = OP_DIVi; return 0;
+    case '%': *slot_op = OP_MOD; *imm_op = OP_MODi; return 0;
+    case TOK_SHL: *slot_op = OP_SHL; *imm_op = OP_SHLi; return 0;
+    case TOK_SHR: *slot_op = OP_SHR; *imm_op = OP_SHRi; return 0;
+    case TOK_SAR: *slot_op = OP_SAR; *imm_op = OP_SARi; return 0;
+    case TOK_UDIV: *slot_op = OP_DIV; *imm_op = OP_DIVi; return 0;
+    case TOK_UMOD: *slot_op = OP_MOD; *imm_op = OP_MODi; return 0;
+    default: return -1;
     }
 }
 
-static const char *to8_get_set_cond(int op)
+static to8_opcode to8_get_set_cond(int op)
 {
     switch (op) {
-    case TOK_EQ: return "SEQ";
-    case TOK_NE: return "SNE";
-    case TOK_LT: return "SLT";
-    case TOK_GT: return "SGT";
-    case TOK_LE: return "SLE";
-    case TOK_GE: return "SGE";
-    case TOK_ULT: return "SLTU";
-    case TOK_UGT: return "SGTU";
-    case TOK_ULE: return "SLEU";
-    case TOK_UGE: return "SGEU";
-    default: return NULL;
+    case TOK_EQ: return OP_SEQ;
+    case TOK_NE: return OP_SNE;
+    case TOK_LT: case TOK_ULT: return OP_SLT;
+    case TOK_GT: case TOK_UGT: return OP_SGT;
+    case TOK_LE: case TOK_ULE: return OP_SLE;
+    case TOK_GE: case TOK_UGE: return OP_SGE;
+    default: return OP_SNZ;
     }
 }
 
-static const char *to8_get_jcond(int op)
+static to8_opcode to8_get_jcond(int op)
 {
     switch (op) {
-    case TOK_EQ: return "JEQ";
-    case TOK_NE: return "JNE";
-    case TOK_LT: return "JLT";
-    case TOK_GT: return "JGT";
-    case TOK_LE: return "JLE";
-    case TOK_GE: return "JGE";
-    case TOK_ULT: return "JLTU";
-    case TOK_UGT: return "JGTU";
-    case TOK_ULE: return "JLEU";
-    case TOK_UGE: return "JGEU";
-    default: return NULL;
+    case TOK_EQ: return OP_JEQ;
+    case TOK_NE: return OP_JNE;
+    case TOK_LT: case TOK_ULT: return OP_JLT;
+    case TOK_GT: case TOK_UGT: return OP_JGT;
+    case TOK_LE: case TOK_ULE: return OP_JLE;
+    case TOK_GE: case TOK_UGE: return OP_JGE;
+    default: return OP_JNE;
     }
 }
 
-static const char *to8_byte_suffix(int bt)
+static int to8_swap_cmp_op(int op)
 {
-    if (bt == VT_BYTE || bt == VT_BOOL) return "1";
-    if (bt == VT_SHORT) return "2";
-    return "4";
+    switch (op) {
+    case TOK_LT:  return TOK_GT;
+    case TOK_GT:  return TOK_LT;
+    case TOK_LE:  return TOK_GE;
+    case TOK_GE:  return TOK_LE;
+    case TOK_ULT: return TOK_UGT;
+    case TOK_UGT: return TOK_ULT;
+    case TOK_ULE: return TOK_UGE;
+    case TOK_UGE: return TOK_ULE;
+    default:      return op;
+    }
 }
 
-/* Fuse a pending "SHLi 24/16" with an immediately-following constant
- * SAR/SHR of the same amount: comment out the single SHLi line and
- * emit EXT1S/EXT2S (signed) or EXT1U/EXT2U (unsigned) in its place.
- * Returns 1 if handled, 0 if not applicable (any stale candidate is
- * cleared). Does NOT touch the vstack - the caller is responsible. */
-static int to8_try_sex_fuse(int op, int amount_is_const, int amount_val)
+static to8_opcode to8_byte_suffix_ld(int bt)
 {
-    const char *rep;
+    if (bt == VT_BYTE || bt == VT_BOOL) return OP_LD1;
+    if (bt == VT_SHORT) return OP_LD2;
+    return OP_LD4;
+}
 
-    if (!pending_sex_amount) return 0;
-    if (!amount_is_const || amount_val != pending_sex_amount ||
-        (op != TOK_SAR && op != TOK_SHR)) {
-        pending_sex_amount = 0;
-        return 0;
-    }
+static to8_opcode to8_byte_suffix_ld_r(int bt)
+{
+    if (bt == VT_BYTE || bt == VT_BOOL) return OP_LD1r;
+    if (bt == VT_SHORT) return OP_LD2r;
+    return OP_LD4r;
+}
 
-    rep = (op == TOK_SAR)
-        ? (pending_sex_amount == 24 ? "EXT1S" : "EXT2S")
-        : (pending_sex_amount == 24 ? "EXT1U" : "EXT2U");
-
-    cur_text_section->data[pending_sex_line_start] = ';';
-    emit_op(rep);
-
-    pending_sex_amount = 0;
-    return 1;
+static to8_opcode to8_byte_suffix_st(int bt)
+{
+    if (bt == VT_BYTE || bt == VT_BOOL) return OP_ST1;
+    if (bt == VT_SHORT) return OP_ST2;
+    return OP_ST4;
 }
 
 /* ===================================================================
@@ -839,49 +822,47 @@ static int to8_try_sex_fuse(int op, int amount_is_const, int amount_val)
 void load(int r, SValue *sv)
 {
     int v, ft, fc, bt;
-    char buf[16];
-    const char *suf;
     int save_slot;
+    to8_opcode ldop;
 
     ft = sv->type.t & ~VT_DEFSIGN;
     fc = sv->c.i;
     v = sv->r & VT_VALMASK;
     ft &= ~(VT_VOLATILE | VT_CONSTANT);
     bt = ft & VT_BTYPE;
-    suf = to8_byte_suffix(bt);
+    ldop = to8_byte_suffix_ld(bt);
 
     if (r == TREG_F0) {
         if (bt == VT_FLOAT || bt == VT_DOUBLE) {
-            const char *ld = (bt == VT_FLOAT) ? "LDF32" : "LDF64";
+            /* LDF4/LDF8 are sized because they touch REAL memory
+               (a global symbol, or whatever a pointer points to).
+               LDF is unsized because a local's own slot is internal
+               bookkeeping we control - it's always kept as a double. */
+            to8_opcode ldsz = (bt == VT_FLOAT) ? OP_LDF4 : OP_LDF8;
             if (sv->r & VT_LVAL) {
                 if (v == VT_LOCAL) {
-                    emit_op_slot(ld, fc);
+                    e_op_slot(OP_LDF, fc);
                 } else if (v == VT_LLOCAL) {
-                    snprintf(buf, sizeof buf, "%sms", ld);
-                    emit_op_slot(buf, fc);
+                    e_op_slot(ldsz, fc);
                 } else if (v == VT_CONST) {
-                    snprintf(buf, sizeof buf, "%sm", ld);
-                    emit_op_addr(buf, sv->sym, fc);
+                    e_op_addr(ldsz, sv->sym, fc);
                 } else if (v < VT_CONST) {
                     int temp;
-                    if (v == TREG_R1) {
-                        temp = to8_r1_slot();
-                    } else {
-                        temp = to8_new_temp(4, 4);
-                        emit_op_slot("ST", temp);
-                    }
-                    snprintf(buf, sizeof buf, "%sms", ld);
-                    emit_op_slot(buf, temp);
+                    int from_pool = (v != TREG_R1);
+                    if (v == TREG_R1) temp = to8_r1_slot();
+                    else { temp = to8_temp_alloc(4, 4); e_op_slot(OP_ST, temp); }
+                    e_op_slot(ldsz, temp);
+                    if (from_pool) to8_temp_free(temp, 4, 4);
                 } else {
                     tcc_error("TO8: unsupported float load addressing mode (v=%#x)", v);
                 }
             } else {
                 if (v == VT_CONST)
-                    emit_op_addr(ld, sv->sym, fc);
-                else if (v == VT_LOCAL) {
-                    emit_op_slot(ld, fc);
-                } else
-                    emit_op("ITOF");
+                    e_op_addr(ldsz, sv->sym, fc);
+                else if (v == VT_LOCAL)
+                    e_op_slot(OP_LDF, fc);
+                else
+                    e_op(OP_ITOF);
             }
             return;
         }
@@ -890,35 +871,34 @@ void load(int r, SValue *sv)
     if (!(sv->r & VT_LVAL) && v < TREG_MEM && v != VT_CONST && v != VT_LOCAL &&
         v != VT_LLOCAL && v != VT_CMP && v != VT_JMP && v != VT_JMPI) {
         if (v == r) return;
-        if (v == TREG_R1 && r == TREG_R0) { emit_op_slot("LD", to8_r1_slot()); return; }
-        if (v == TREG_R0 && r == TREG_R1) { emit_op_slot("ST", to8_r1_slot()); return; }
+        if (v == TREG_R1 && r == TREG_R0) { e_op_slot(OP_LD, to8_r1_slot()); return; }
+        if (v == TREG_R0 && r == TREG_R1) { e_op_slot(OP_ST, to8_r1_slot()); return; }
     }
 
     save_slot = -1;
     if (r == TREG_R1) {
-        save_slot = to8_new_temp(4, 4);
-        emit_op_slot("ST", save_slot);
+        save_slot = to8_temp_alloc(4, 4);
+        e_op_slot(OP_ST, save_slot);
     }
 
     if (sv->r & VT_LVAL) {
         if (v == VT_LOCAL) {
-            emit_op_slot("LD", fc);
+            e_op_slot(OP_LD, fc);
         } else if (v == VT_LLOCAL) {
-            snprintf(buf, sizeof buf, "LD%s", suf);
-            emit_op_slot(buf, fc);
+            e_op_slot(ldop, fc);
         } else if (v == VT_CONST) {
-            snprintf(buf, sizeof buf, "LD%s", suf);
-            emit_op_addr(buf, sv->sym, fc);
+            e_op_addr(ldop, sv->sym, fc);
+        } else if (v == TREG_R0) {
+            /* Pointer already sitting in R0: dereference directly,
+               no temp-slot spill needed. */
+            e_op(to8_byte_suffix_ld_r(bt));
         } else if (v < VT_CONST) {
             int temp;
-            if (v == TREG_R1) {
-                temp = to8_r1_slot();
-            } else {
-                temp = to8_new_temp(4, 4);
-                emit_op_slot("ST", temp);
-            }
-            snprintf(buf, sizeof buf, "LD%s", suf);
-            emit_op_slot(buf, temp);
+            int from_pool = (v != TREG_R1);
+            if (v == TREG_R1) temp = to8_r1_slot();
+            else { temp = to8_temp_alloc(4, 4); e_op_slot(OP_ST, temp); }
+            e_op_slot(ldop, temp);
+            if (from_pool) to8_temp_free(temp, 4, 4);
         } else {
             tcc_error("TO8: unsupported load addressing mode (v=%#x)", v);
         }
@@ -926,55 +906,52 @@ void load(int r, SValue *sv)
         switch (v) {
         case VT_CONST:
             if (sv->r & VT_SYM)
-                emit_op_addr("LEAm", sv->sym, fc);
+                e_op_addr(OP_LDi, sv->sym, fc);
             else
-                emit_op_imm("LDi", fc);
+                e_op_imm(OP_LDi, fc);
             break;
         case VT_LOCAL:
-            emit_op_slot("LEA", fc);
+            e_op_slot(OP_LEA, fc);
             break;
         case VT_LLOCAL:
-            emit_op_slot("LD", fc);
+            e_op_slot(OP_LD, fc);
             break;
-        case VT_CMP: {
-            const char *cc = to8_get_set_cond(sv->c.i);
-            emit_op(cc ? cc : "SNZ");
+        case VT_CMP:
+            e_op(to8_get_set_cond(sv->c.i));
             break;
-        }
         case VT_JMP:
-            emit_op_imm("LDi", 0);
+            e_op_imm(OP_LDi, 0);
             gsym(fc);
-            emit_op_imm("LDi", 1);
+            e_op_imm(OP_LDi, 1);
             break;
         case VT_JMPI:
-            emit_op_imm("LDi", 1);
+            e_op_imm(OP_LDi, 1);
             gsym(fc);
-            emit_op_imm("LDi", 0);
+            e_op_imm(OP_LDi, 0);
             break;
         default:
             if (v == r) {
-                if (save_slot >= 0) emit_op_slot("LD", save_slot);
+                if (save_slot >= 0) e_op_slot(OP_LD, save_slot);
                 return;
             }
             if (v >= TREG_MEM) {
-                snprintf(buf, sizeof buf, "LD%s", suf);
-                emit_op_slot(buf, fc);
+                e_op_slot(ldop, fc);
             }
             break;
         }
     }
 
     if (r == TREG_R1) {
-        emit_op_slot("ST", to8_r1_slot());
-        emit_op_slot("LD", save_slot);
+        e_op_slot(OP_ST, to8_r1_slot());
+        e_op_slot(OP_LD, save_slot);
+        to8_temp_free(save_slot, 4, 4);
     }
 }
 
 void store(int r, SValue *v)
 {
     int fr, bt, fc;
-    char buf[16];
-    const char *suffix;
+    to8_opcode stop;
 
     if (r >= NB_REGS) {
         int vbt = vtop->type.t & VT_BTYPE;
@@ -986,28 +963,23 @@ void store(int r, SValue *v)
     bt = v->type.t & VT_BTYPE;
     fc = v->c.i;
     bt &= ~(VT_VOLATILE | VT_CONSTANT);
-    suffix = to8_byte_suffix(bt);
+    stop = to8_byte_suffix_st(bt);
 
     if (r == TREG_F0) {
-        const char *st = (bt == VT_FLOAT) ? "STF32" : "STF64";
+        to8_opcode stsz = (bt == VT_FLOAT) ? OP_STF4 : OP_STF8;
         if (fr == VT_LOCAL) {
-            emit_op_slot(st, fc);
+            e_op_slot(OP_STF, fc);
         } else if (fr == VT_LLOCAL) {
-            snprintf(buf, sizeof buf, "%sms", st);
-            emit_op_slot(buf, fc);
+            e_op_slot(stsz, fc);
         } else if (fr == VT_CONST) {
-            snprintf(buf, sizeof buf, "%sm", st);
-            emit_op_addr(buf, v->sym, fc);
+            e_op_addr(stsz, v->sym, fc);
         } else if (fr < VT_CONST) {
             int temp;
-            if (fr == TREG_R1) {
-                temp = to8_r1_slot();
-            } else {
-                temp = to8_new_temp(4, 4);
-                emit_op_slot("ST", temp);
-            }
-            snprintf(buf, sizeof buf, "%sms", st);
-            emit_op_slot(buf, temp);
+            int from_pool = (fr != TREG_R1);
+            if (fr == TREG_R1) temp = to8_r1_slot();
+            else { temp = to8_temp_alloc(4, 4); e_op_slot(OP_ST, temp); }
+            e_op_slot(stsz, temp);
+            if (from_pool) to8_temp_free(temp, 4, 4);
         } else {
             tcc_error("TO8: unsupported float store addressing mode (fr=%#x)", fr);
         }
@@ -1015,29 +987,22 @@ void store(int r, SValue *v)
     }
 
     if (fr == VT_LOCAL) {
-        if (r == TREG_R1) emit_op_slot("LD", to8_r1_slot());
-        emit_op_slot("ST", fc);
+        if (r == TREG_R1) e_op_slot(OP_LD, to8_r1_slot());
+        e_op_slot(OP_ST, fc);
     } else if (fr == VT_LLOCAL) {
-        if (r == TREG_R1) emit_op_slot("LD", to8_r1_slot());
-        snprintf(buf, sizeof buf, "ST%s", suffix);
-        emit_op_slot(buf, fc);
+        if (r == TREG_R1) e_op_slot(OP_LD, to8_r1_slot());
+        e_op_slot(stop, fc);
     } else if (fr == VT_CONST && (v->r & VT_SYM)) {
-        if (r == TREG_R1) emit_op_slot("LD", to8_r1_slot());
-        snprintf(buf, sizeof buf, "ST%s", suffix);
-        emit_op_addr(buf, v->sym, fc);
+        if (r == TREG_R1) e_op_slot(OP_LD, to8_r1_slot());
+        e_op_addr(stop, v->sym, fc);
     } else if (v->r & VT_LVAL) {
         int addr_slot;
-        if (fr == TREG_R1) {
-            addr_slot = to8_r1_slot();
-        } else {
-            addr_slot = to8_new_temp(4, 4);
-            emit_op_slot("ST", addr_slot);
-        }
-        if (r == TREG_R1) {
-            emit_op_slot("LD", to8_r1_slot());
-        }
-        snprintf(buf, sizeof buf, "ST%s", suffix);
-        emit_op_slot(buf, addr_slot);
+        int from_pool = (fr != TREG_R1);
+        if (fr == TREG_R1) addr_slot = to8_r1_slot();
+        else { addr_slot = to8_temp_alloc(4, 4); e_op_slot(OP_ST, addr_slot); }
+        if (r == TREG_R1) e_op_slot(OP_LD, to8_r1_slot());
+        e_op_slot(stop, addr_slot);
+        if (from_pool) to8_temp_free(addr_slot, 4, 4);
     }
 }
 
@@ -1047,49 +1012,30 @@ void store(int r, SValue *v)
 
 static int to8_spill_and_reload(int v1, int c1)
 {
-    int temp = to8_new_temp(4, 4);
-    emit_op_slot("ST", temp);
-    if (v1 == TREG_R1)
-        emit_op_slot("LD", to8_r1_slot());
-    else
-        emit_op_slot("LD", c1);
+    int temp = to8_temp_alloc(4, 4);
+    e_op_slot(OP_ST, temp);
+    if (v1 == TREG_R1) {
+        e_op_slot(OP_LD, to8_r1_slot());
+    } else {
+        e_op_slot(OP_LD, c1);
+        if (v1 == TREG_R0)
+            to8_temp_free(c1, 4, 4);
+    }
     return temp;
 }
 
-/* Dedicated path for SHL/SAR/SHR: if the shift amount (vtop, the
- * SECOND operand) is a compile-time constant, it is popped without
- * emitting any code for it at all, x is materialized into R0, and a
- * single "SHLi/SARi/SHRi <amount>" is emitted - exactly like x86's
- * "sarl $n,%eax", ARM's "asr #n" or RISC-V's "srai" immediate forms.
- * A non-constant amount falls back to routing it through a slot,
- * since this backend has no separate "shift count" register. */
 static void gen_opi_shift(int op)
 {
-    const char *slot_op, *imm_op;
+    to8_opcode slot_op, imm_op;
     int amount_is_const = (vtop->r & VT_VALMASK) == VT_CONST && !(vtop->r & VT_SYM);
     int amount_val = amount_is_const ? vtop->c.i : 0;
 
     to8_get_arith_ops(op, &slot_op, &imm_op);
 
-    if ((op == TOK_SAR || op == TOK_SHR) &&
-        to8_try_sex_fuse(op, amount_is_const, amount_val)) {
-        vpop();               /* discard the shift-amount operand */
-        vtop->r = TREG_R0;    /* x's own entry (now vtop) is the result */
-        vtop->r2 = VT_CONST;
-        return;
-    }
-    pending_sex_amount = 0;
-
     if (amount_is_const) {
-        vpop();               /* amount becomes an immediate, no load */
-        gv(RC_INT);           /* materialize x (now vtop) into R0 */
-        {
-            int line_start = emit_op_imm(imm_op, amount_val);
-            if (op == TOK_SHL && (amount_val == 24 || amount_val == 16)) {
-                pending_sex_amount = amount_val;
-                pending_sex_line_start = line_start;
-            }
-        }
+        vpop();
+        gv(RC_INT);
+        e_op_imm(imm_op, amount_val);
         vtop->r = TREG_R0;
         vtop->r2 = VT_CONST;
     } else {
@@ -1097,8 +1043,8 @@ static void gen_opi_shift(int op)
         v1 = vtop[-1].r & VT_VALMASK;
         c1 = vtop[-1].c.i;
         if (v1 == TREG_R0) {
-            int pre_spill = to8_new_temp(4, 4);
-            emit_op_slot("ST", pre_spill);
+            int pre_spill = to8_temp_alloc(4, 4);
+            e_op_slot(OP_ST, pre_spill);
             c1 = pre_spill;
         }
         gv(RC_INT);
@@ -1107,7 +1053,8 @@ static void gen_opi_shift(int op)
             c1 = vtop[-1].c.i;
         }
         temp = to8_spill_and_reload(v1, c1);
-        emit_op_slot(slot_op, temp);
+        e_op_slot(slot_op, temp);
+        to8_temp_free(temp, 4, 4);
         vtop--;
         vtop->r = TREG_R0;
         vtop->r2 = VT_CONST;
@@ -1123,12 +1070,51 @@ void gen_opi(int op)
         return;
     }
 
+    if (op == TOK_LT || op == TOK_GT || op == TOK_LE || op == TOK_GE ||
+        op == TOK_EQ || op == TOK_NE || op == TOK_ULT || op == TOK_UGT ||
+        op == TOK_ULE || op == TOK_UGE) {
+
+        int is_unsigned_cmp = (op == TOK_ULT || op == TOK_UGT ||
+                               op == TOK_ULE || op == TOK_UGE);
+        int tst_ok = (op == TOK_EQ || op == TOK_NE ||
+                     op == TOK_LT || op == TOK_GT || op == TOK_LE || op == TOK_GE);
+
+        if ((vtop->r & VT_VALMASK) == VT_CONST && !(vtop->r & VT_SYM)) {
+            int c0 = vtop->c.i;
+            vpop();
+            gv(RC_R0);
+            if (!(c0 == 0 && tst_ok)) {
+                e_op_imm(is_unsigned_cmp ? OP_CMPUi : OP_CMPi, c0);
+            }
+            vset_VT_CMP(op);
+            return;
+        }
+
+        if ((vtop[-1].r & VT_VALMASK) == VT_CONST && !(vtop[-1].r & VT_SYM)) {
+            vswap();
+            gen_opi(to8_swap_cmp_op(op));
+            return;
+        }
+
+        gv(RC_R0);
+        v1 = vtop[-1].r & VT_VALMASK;
+        c1 = vtop[-1].c.i;
+        {
+            int temp = to8_spill_and_reload(v1, c1);
+            e_op_slot(is_unsigned_cmp ? OP_CMPU : OP_CMP, temp);
+            to8_temp_free(temp, 4, 4);
+        }
+        vtop--;
+        vset_VT_CMP(op);
+        return;
+    }
+
     v1 = vtop[-1].r & VT_VALMASK;
     c1 = vtop[-1].c.i;
 
     if (v1 == TREG_R0) {
-        int pre_spill = to8_new_temp(4, 4);
-        emit_op_slot("ST", pre_spill);
+        int pre_spill = to8_temp_alloc(4, 4);
+        e_op_slot(OP_ST, pre_spill);
         c1 = pre_spill;
     }
 
@@ -1139,46 +1125,45 @@ void gen_opi(int op)
         c1 = vtop[-1].c.i;
     }
 
-    if (op == TOK_LT || op == TOK_GT || op == TOK_LE || op == TOK_GE ||
-        op == TOK_EQ || op == TOK_NE || op == TOK_ULT || op == TOK_UGT ||
-        op == TOK_ULE || op == TOK_UGE) {
-        if (v1 == VT_CONST && c1 == 0) {
-            emit_op("TST");
-        } else if (v1 == VT_CONST) {
-            emit_op_imm("CMPi", c1);
-        } else {
-            int temp = to8_spill_and_reload(v1, c1);
-            emit_op_slot("CMP", temp);
+    {
+        to8_opcode slot_op, imm_op;
+        if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) {
+            vtop--; return;
         }
-        vtop--;
-        vset_VT_CMP(op);
-        return;
+
+        if (to8_is_commutative(op)) {
+            if (v1 == VT_CONST) {
+                e_op_imm(imm_op, c1);
+            } else if (v1 == TREG_R0 || v1 == TREG_R1) {
+                /* Left operand genuinely collides with a register (it
+                   IS R0 or R1) - a real spill/reload is unavoidable. */
+                int temp = to8_spill_and_reload(v1, c1);
+                e_op_slot(slot_op, temp);
+                to8_temp_free(temp, 4, 4);
+            } else {
+                /* Left operand already lives in its own memory slot,
+                   untouched by gv(). Since the op is commutative,
+                   "R0(right) op= mem[c1](left)" is exactly as correct
+                   as the textbook left-op-right order - nothing needs
+                   spilling or reloading at all. */
+                e_op_slot(slot_op, c1);
+            }
+        } else {
+            int temp;
+            if (v1 == VT_CONST) {
+                temp = to8_temp_alloc(4, 4);
+                e_op_slot(OP_ST, temp);
+                e_op_imm(OP_LDi, c1);
+                e_op_slot(slot_op, temp);
+                to8_temp_free(temp, 4, 4);
+            } else {
+                temp = to8_spill_and_reload(v1, c1);
+                e_op_slot(slot_op, temp);
+                to8_temp_free(temp, 4, 4);
+            }
+        }
     }
 
-    const char *slot_op, *imm_op;
-    if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) {
-        emit_op("; unsupported integer op");
-        vtop--; return;
-    }
-
-    if (to8_is_commutative(op)) {
-        if (v1 == VT_CONST) emit_op_imm(imm_op, c1);
-        else {
-            int temp = to8_spill_and_reload(v1, c1);
-            emit_op_slot(slot_op, temp);
-        }
-    } else {
-        int temp;
-        if (v1 == VT_CONST) {
-            temp = to8_new_temp(4, 4);
-            emit_op_slot("ST", temp);
-            emit_op_imm("LDi", c1);
-            emit_op_slot(slot_op, temp);
-        } else {
-            temp = to8_spill_and_reload(v1, c1);
-            emit_op_slot(slot_op, temp);
-        }
-    }
     vtop--;
     vtop->r = TREG_R0;
     vtop->r2 = VT_CONST;
@@ -1194,41 +1179,54 @@ void gen_opf(int op)
 
     if (op == TOK_LT || op == TOK_GT || op == TOK_LE || op == TOK_GE ||
         op == TOK_EQ || op == TOK_NE) {
-        const char *fset;
-        switch (op) {
-        case TOK_EQ: fset = "FSEQ"; break;
-        case TOK_NE: fset = "FSNE"; break;
-        case TOK_LT: fset = "FSLT"; break;
-        case TOK_GT: fset = "FSGT"; break;
-        case TOK_LE: fset = "FSLE"; break;
-        case TOK_GE: fset = "FSGE"; break;
-        default: fset = NULL; break;
-        }
-        if (fset) {
-            int fv1 = vtop[-1].r & VT_VALMASK;
-            int fc1 = vtop[-1].c.i;
-            int temp = to8_new_temp(8, 4);
-            emit_op_slot("STF64", temp);
-            if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
-                emit_op_slot("LDF64", fc1);
-            emit_op_slot("FCMP", temp);
-            emit_op(fset);
-        } else {
-            emit_op("; unsupported float comparison");
-        }
+        int fv1 = vtop[-1].r & VT_VALMASK;
+        int fc1 = vtop[-1].c.i;
+        int temp = to8_temp_alloc(8, 4);
+        e_op_slot(OP_STF, temp);
+        if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
+            e_op_slot(OP_LDF, fc1);
+        e_op_slot(OP_FCMP, temp);
+        to8_temp_free(temp, 8, 4);
+
         vtop--;
-        vtop->r = TREG_R0;
-        vtop->r2 = VT_CONST;
+        vset_VT_CMP(op);
         return;
     }
 
-    switch (op) {
-    case '+': emit_op("FADD"); break;
-    case '-': emit_op("FSUB"); break;
-    case '*': emit_op("FMUL"); break;
-    case '/': emit_op("FDIV"); break;
-    default: emit_op("; unsupported float op"); break;
+    {
+        to8_opcode fop;
+        int fv1 = vtop[-1].r & VT_VALMASK;
+        int fc1 = vtop[-1].c.i;
+        int commutative;
+
+        switch (op) {
+        case '+': fop = OP_FADD; break;
+        case '-': fop = OP_FSUB; break;
+        case '*': fop = OP_FMUL; break;
+        case '/': fop = OP_FDIV; break;
+        default:  fop = OP_NOP; break;
+        }
+        commutative = (fop == OP_FADD || fop == OP_FMUL);
+
+        if (fop != OP_NOP) {
+            if (commutative && (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)) {
+                /* Same trick as the integer path: F0 already holds
+                   the right operand (from gv(RC_FLOAT) above), and +
+                   / * don't care about operand order, so F0 op=
+                   mem[fc1] (left) is correct without moving anything
+                   into F0 first. */
+                e_op_slot(fop, fc1);
+            } else {
+                int temp = to8_temp_alloc(8, 4);
+                e_op_slot(OP_STF, temp);
+                if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
+                    e_op_slot(OP_LDF, fc1);
+                e_op_slot(fop, temp);
+                to8_temp_free(temp, 8, 4);
+            }
+        }
     }
+
     vtop--;
     vtop->r = TREG_F0;
     vtop->r2 = VT_CONST;
@@ -1238,8 +1236,8 @@ void gen_opf(int op)
  * Type conversions
  * =================================================================== */
 
-void gen_cvt_itof(int t) { emit_op("ITOF"); }
-void gen_cvt_ftoi(int t) { emit_op("FTOI"); }
+void gen_cvt_itof(int t) { e_op(OP_ITOF); }
+void gen_cvt_ftoi(int t) { e_op(OP_FTOI); }
 void gen_cvt_ftof(int t) { /* precision change placeholder */ }
 
 /* ===================================================================
@@ -1247,7 +1245,7 @@ void gen_cvt_ftof(int t) { /* precision change placeholder */ }
  * =================================================================== */
 
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret,
-                       int *ret_align, int *regsize)
+                        int *ret_align, int *regsize)
 {
     int size, align;
     *ret_align = TO8_STACK_ALIGN;
@@ -1270,44 +1268,352 @@ void gfunc_call(int nb_args)
         SValue *sv = &vtop[-i];
         int v = sv->r & VT_VALMASK;
         if (v == VT_CONST && !(sv->r & VT_SYM)) {
-            to8_push_imm(sv->c.i);
+            e_push_imm(sv->c.i);
         } else if (v == VT_LOCAL || v == VT_LLOCAL) {
-            to8_push_slot(sv->c.i);
+            e_push_slot(sv->c.i);
         } else if (sv->r & VT_SYM) {
-            emit_op_addr("LEAm", sv->sym, sv->c.i);
-            to8_push_r0();
+            e_op_addr(OP_LDi, sv->sym, sv->c.i);
+            e_push_r0();
         } else {
             load(TREG_R0, sv);
-            to8_push_r0();
+            e_push_r0();
         }
     }
+
     save_regs(0);
 
     if ((func->r & VT_VALMASK) == VT_CONST && (func->r & VT_SYM)) {
-        emit_op_addr("JSRi", func->sym, func->c.i);
+        e_op_addr(OP_JSRi, func->sym, func->c.i);
     } else if ((func->r & VT_LVAL) &&
                ((func->r & VT_VALMASK) == VT_LOCAL || (func->r & VT_VALMASK) == VT_LLOCAL)) {
-        emit_op_slot("JSRs", func->c.i);
+        e_op_slot(OP_JSR, func->c.i);
     } else {
         load(TREG_R0, func);
-        emit_op("JSR");
+        e_op(OP_JSRr);
     }
 
     if (nb_args > 0) {
         size = nb_args * PTR_SIZE;
         to8_adjust(size);
     }
+
     vtop -= nb_args + 1;
+}
+
+/* ===================================================================
+ * Peephole passes - run to a FIXED POINT, in gfunc_epilog, over the
+ * finished list, and ONLY when the user opted in via -O1 or higher.
+ * Each pass returns 1 if it changed the list, 0 otherwise; the driver
+ * loop re-runs all three until a full round changes nothing.
+ *
+ * TODO: "LD1 slot; ST slot" (same slot, a dead round trip through a
+ * dereferenced pointer) is the sized-dereference analogue of what
+ * to8_peephole_mov() already does for OP_LD/OP_ST. A generalized
+ * "MOV1/MOV2/MOV4" fusion for OP_LD1/OP_LD2/OP_LD4 + OP_ST1/OP_ST2/
+ * OP_ST4 pairs is the natural next step, but is more intricate than
+ * plain MOV: both sides go through a pointer indirection, so the
+ * fused form would need to mean "copy N bytes from *(slot_a) to
+ * *(slot_b)", not just "copy slot_a to slot_b". Deferred.
+ * =================================================================== */
+
+static int to8_peephole_ext(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+    while (cur) {
+        to8_line *nxt = cur->next;
+        if (cur->op == OP_SHLi && !cur->is_target &&
+            (cur->imm_val == 24 || cur->imm_val == 16) &&
+            nxt && !nxt->is_target &&
+            (nxt->op == OP_SARi || nxt->op == OP_SHRi) &&
+            nxt->imm_val == cur->imm_val) {
+            to8_opcode rep = (nxt->op == OP_SARi)
+                ? (cur->imm_val == 24 ? OP_EXT1S : OP_EXT2S)
+                : (cur->imm_val == 24 ? OP_EXT1U : OP_EXT2U);
+            to8_line *ext = tcc_mallocz(sizeof(to8_line));
+            to8_line *scan_from;
+            ext->op = rep;
+            ext->kind = ARG_NONE;
+
+            const char *c = bare_comment(rep);
+            if (c) { snprintf(ext->comment, sizeof ext->comment, "%s", c); ext->has_comment = 1; }
+
+            to8_insert_after(cur, ext);
+            to8_unlink(cur);
+            to8_unlink(nxt);
+            scan_from = ext->next;
+            cur = scan_from;
+            changed = 1;
+            continue;
+        }
+        cur = nxt;
+    }
+    return changed;
+}
+
+static int to8_peephole_mov(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+    while (cur) {
+        to8_line *nxt = cur->next;
+        if (cur->op == OP_LD && !cur->is_target &&
+            nxt && !nxt->is_target && nxt->op == OP_ST) {
+            if (cur->slot_a == nxt->slot_a && cur->push_depth == nxt->push_depth) {
+                to8_line *scan_from = nxt->next;
+                to8_unlink(cur);
+                to8_unlink(nxt);
+                cur = scan_from;
+                changed = 1;
+                continue;
+            }
+
+            to8_line *mov = tcc_mallocz(sizeof(to8_line));
+            to8_line *scan_from;
+            char desc_dst[24], desc_src[24];
+            mov->op = OP_MOV;
+            mov->kind = ARG_SLOT2;
+            mov->slot_a = nxt->slot_a;
+            mov->slot_b = cur->slot_a;
+            mov->push_depth = nxt->push_depth;
+            slot_desc(desc_dst, sizeof desc_dst, mov->slot_a);
+            slot_desc(desc_src, sizeof desc_src, mov->slot_b);
+            snprintf(mov->comment, sizeof mov->comment, "%s = %s", desc_dst, desc_src);
+            mov->has_comment = 1;
+            to8_insert_after(cur, mov);
+            to8_unlink(cur);
+            to8_unlink(nxt);
+            scan_from = mov->next;
+            cur = scan_from;
+            changed = 1;
+            continue;
+        }
+        cur = nxt;
+    }
+    return changed;
+}
+
+static int to8_peephole_dead_ld(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+    int known_valid = 0, known_slot = 0;
+
+    while (cur) {
+        to8_line *nxt = cur->next;
+
+        if (cur->is_target)
+            known_valid = 0;
+
+        if (cur->op == OP_LD && known_valid && !cur->is_target &&
+            cur->slot_a == known_slot) {
+            to8_unlink(cur);
+            cur = nxt;
+            changed = 1;
+            continue;
+        }
+
+        switch (cur->op) {
+        case OP_LD:
+        case OP_ST:
+            known_valid = 1;
+            known_slot = cur->slot_a;
+            break;
+        case OP_MOV:
+            break;
+        default:
+            known_valid = 0;
+            break;
+        }
+
+        cur = nxt;
+    }
+    return changed;
+}
+
+/* "LD slot; LD1r/LD2r/LD4r" -> "LD1/LD2/LD4 slot". Loading a pointer
+ * into R0 and immediately dereferencing R0 is identical to
+ * dereferencing the slot-held pointer directly - one instruction
+ * saved per occurrence. Same adjacency/not-a-target safety
+ * requirement as to8_peephole_mov(). */
+static int to8_peephole_ld_deref(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+    while (cur) {
+        to8_line *nxt = cur->next;
+        if (cur->op == OP_LD && !cur->is_target &&
+            nxt && !nxt->is_target &&
+            (nxt->op == OP_LD1r || nxt->op == OP_LD2r || nxt->op == OP_LD4r) &&
+            cur->push_depth == nxt->push_depth) {
+            to8_opcode rep = (nxt->op == OP_LD1r) ? OP_LD1
+                            : (nxt->op == OP_LD2r) ? OP_LD2
+                            : OP_LD4;
+            char desc[24];
+
+            cur->op = rep;
+            slot_desc(desc, sizeof desc, cur->slot_a);
+            slot_comment(cur->comment, sizeof cur->comment, rep, desc);
+            cur->has_comment = 1;
+
+            to8_unlink(nxt);
+            changed = 1;
+            cur = cur->next;
+            continue;
+        }
+        cur = nxt;
+    }
+    return changed;
+}
+
+static void to8_peephole_run(void)
+{
+    int changed;
+    int guard = 0;
+
+    if (tcc_state->optimize == 0)
+        return;
+
+    do {
+        changed = 0;
+        changed |= to8_peephole_ext();
+        changed |= to8_peephole_mov();
+        changed |= to8_peephole_dead_ld();
+        changed |= to8_peephole_ld_deref();
+    } while (changed && ++guard < 256);
 }
 
 /* ===================================================================
  * Function prolog / epilog
  * =================================================================== */
 
-static int to8_func_sp_offset;
-static int to8_func_line_start;
-static int to8_func_ret_sub;
-#define TO8_PROLOG_SIZE TO8_FIELD_WIDTH
+static to8_line *to8_func_adj_line;
+static char to8_func_name[256];
+
+static int g_col;
+static void out_char(int c) { g((unsigned char)c); if (c == '\n') g_col = 0; else g_col++; }
+static void out_str(const char *s) { while (*s) out_char((unsigned char)*s++); }
+static void out_int(int v) { char buf[16]; snprintf(buf, sizeof buf, "%d", v); out_str(buf); }
+static void out_tab(void)
+{
+    int next = ((g_col / 8) + 1) * 8;
+    while (g_col < next) out_char(' ');
+}
+
+static int to8_final_slot(int raw_slot, int push_depth)
+{
+    return g_frame_size + raw_slot + push_depth;
+}
+
+static void to8_print_banner(void)
+{
+    g_col = 0;
+    out_str("; TO8 backend "); out_str(TO8_GEN_VERSION); out_char('\n');
+
+    out_str("; out: ");
+    out_str((tcc_state && tcc_state->outfile) ? tcc_state->outfile : "(unknown)");
+    out_str("  src: ");
+    out_str((file && file->filename[0]) ? file->filename : "(unknown)");
+    out_char('\n');
+
+    if (tcc_state && tcc_state->argc > 0 && tcc_state->argv) {
+        int i;
+        out_str("; cmd:");
+        for (i = 0; i < tcc_state->argc; i++) {
+            if (!tcc_state->argv[i]) continue;
+            out_char(' ');
+            out_str(tcc_state->argv[i]);
+        }
+        out_char('\n');
+    }
+}
+
+static void to8_render_line(to8_line *ln)
+{
+    if (ln->is_target) {
+        g_col = 0;
+        out_char('@'); out_char('l'); out_int(ln->id); out_char(':'); out_char('\n');
+    }
+
+    g_col = 0;
+    out_tab();
+    out_str(to8_opcode_name(ln->op));
+    switch (ln->kind) {
+    case ARG_NONE:
+        break;
+    case ARG_SLOT:
+        out_tab();
+        out_int(to8_final_slot(ln->slot_a, ln->push_depth));
+        break;
+    case ARG_SLOT2:
+        out_tab();
+        out_int(to8_final_slot(ln->slot_a, ln->push_depth));
+        out_char(',');
+        out_int(to8_final_slot(ln->slot_b, ln->push_depth));
+        break;
+    case ARG_IMM:
+        out_tab();
+        out_int(ln->imm_val);
+        break;
+    case ARG_SYM:
+        out_tab();
+        if (ln->sym) {
+            const char *name = get_tok_str(ln->sym->v, NULL);
+            out_char('_');
+            out_str(name ? name : "?");
+        } else {
+            out_int(ln->sym_addend);
+        }
+        break;
+    case ARG_JMP:
+        out_tab();
+        out_char('@'); out_char('l');
+        out_int(to8_by_id(ln->jmp_target_id)->id);
+        break;
+    }
+
+    out_tab();
+    out_char(';'); out_char(' ');
+    if (ln->kind == ARG_JMP) {
+        out_str(ln->jump_prefix);
+        out_str(" @l");
+        out_int(to8_by_id(ln->jmp_target_id)->id);
+    } else if (ln->has_comment) {
+        out_str(ln->comment);
+    }
+    out_char('\n');
+}
+
+static void to8_render_function(void)
+{
+    to8_line *ln;
+    ind = to8_func_start_ind;
+    g_col = 0;
+
+    out_char('_'); out_str(to8_func_name); out_char(':');
+    out_tab();
+    out_char(';'); out_char(' ');
+    out_int(g_count_before);
+    out_str(" instr");
+    if (g_count_after != g_count_before) {
+        out_str(" -optim-> ");
+        out_int(g_count_after);
+    }
+    out_char('\n');
+
+    for (ln = g_head; ln; ln = ln->next)
+        to8_render_line(ln);
+}
+
+static void to8_free_list(void)
+{
+    int i;
+    for (i = 0; i < g_next_id; i++)
+        tcc_free(g_by_id[i]);
+    tcc_free(g_by_id);
+    g_by_id = NULL;
+    g_by_id_cap = 0;
+}
 
 void gfunc_prolog(Sym *func_sym)
 {
@@ -1315,20 +1621,35 @@ void gfunc_prolog(Sym *func_sym)
     Sym *sym;
     int addr, size, align;
 
-    to8_func_ret_sub = 0;
     loc = 0;
-    slot_patch_reset();
+    to8_list_reset();
+    to8_temp_pool_reset();
+    r1_shadow_valid = 0;
+    cur_push_depth = 0;
 
-    if (funcname)
-        emit_label(funcname);
+    if (!g_banner_done) {
+        to8_print_banner();
+        g_banner_done = 1;
+    }
 
-    to8_func_line_start = ind;
-    begin_line();
-    emit_str("    ADJ ");
-    to8_func_sp_offset = emit_placeholder_field(TO8_PROLOG_SIZE);
-    emit_str("  ; sp -= frame size");
-    emit_nl();
-    pend_store_valid = 0;
+    /* Defensive: if something advanced `ind` between functions
+       without us writing anything there, patch it with printable '.'
+       rather than leave whatever the section's backing memory held. */
+    if (g_last_end_ind >= 0 && ind > g_last_end_ind) {
+        int save = ind;
+        ind = g_last_end_ind;
+        g_col = 0;
+        while (ind < save)
+            out_char('.');
+        ind = save;
+    }
+
+    to8_func_start_ind = ind;
+
+    snprintf(to8_func_name, sizeof to8_func_name, "%s", funcname ? funcname : "?");
+
+    to8_func_adj_line = to8_append(OP_ADJi);
+    to8_func_adj_line->kind = ARG_IMM;
 
     addr = PTR_SIZE;
 
@@ -1353,7 +1674,7 @@ void gfunc_prolog(Sym *func_sym)
 
 void gfunc_epilog(void)
 {
-    int frame_size, i;
+    int frame_size;
 
 #ifdef CONFIG_TCC_BCHECK
     if (tcc_state->do_bounds_check)
@@ -1361,98 +1682,81 @@ void gfunc_epilog(void)
 #endif
 
     frame_size = -loc;
+    g_frame_size = frame_size;
 
-    if (frame_size > 0) {
-        begin_line();
-        emit_str("    ADJ ");
-        emit_int(frame_size);
-        emit_str("  ; sp += ");
-        emit_int(frame_size);
-        emit_nl();
-        pend_store_valid = 0;
-    }
-
-    emit_op("RET");
-
-    if (frame_size > 0) {
-        write_int_fixed(cur_text_section->data + to8_func_sp_offset,
-                         -frame_size, TO8_PROLOG_SIZE);
+    if (frame_size == 0) {
+        to8_unlink(to8_func_adj_line);
+        if (g_head)
+            to8_func_adj_line->redirect = g_head;
     } else {
-        cur_text_section->data[to8_func_line_start] = ';';
+        to8_func_adj_line->imm_val = -frame_size;
+        imm_comment(to8_func_adj_line->comment, sizeof to8_func_adj_line->comment, OP_ADJi, -frame_size);
+        to8_func_adj_line->has_comment = 1;
+
+        {
+            to8_line *ln = to8_append(OP_ADJi);
+            ln->kind = ARG_IMM;
+            ln->imm_val = frame_size;
+            imm_comment(ln->comment, sizeof ln->comment, OP_ADJi, frame_size);
+            ln->has_comment = 1;
+        }
     }
 
-    for (i = 0; i < slot_patches_n; i++) {
-        int val = frame_size + slot_patches[i].raw_slot + slot_patches[i].push_depth;
-        write_int_fixed(cur_text_section->data + slot_patches[i].text_offset,
-                         val, TO8_FIELD_WIDTH);
-    }
+    e_op(OP_RET);
+
+    g_count_before = to8_count_lines();
+    to8_peephole_run();
+    g_count_after = to8_count_lines();
+
+    to8_render_function();
+    g_last_end_ind = ind;
+    to8_free_list();
 }
 
 /* ===================================================================
  * Jump generation
  * =================================================================== */
 
-static int to8_emit_jmp(const char *mnemonic)
+static int to8_emit_jmp(to8_opcode op)
 {
-    int offset, cmt_off;
-
-    to8_resolve_pending_mov(mnemonic);
-    last_ld_valid = 0;
-
-    begin_line();
-    emit_str("    ");
-    emit_str(mnemonic);
-    g(' ');
-    offset = emit_placeholder_field(TO8_FIELD_WIDTH);
-    emit_str("  ; ");
-    emit_str(jump_comment(mnemonic));
-    g(' ');
-    cmt_off = emit_placeholder_field(TO8_FIELD_WIDTH);
-    jmp_cmt_patch_add(offset, cmt_off);
-    emit_nl();
-    pend_store_valid = 0;
-    return offset;
+    to8_line *ln = to8_append(op);
+    ln->kind = ARG_JMP;
+    ln->jump_prefix = to8_jump_prefix(op);
+    ln->jmp_chain = NULL;
+    ln->jmp_target_id = 0;
+    return ln->id;
 }
 
 ST_FUNC int gjmp(int t)
 {
-    int off = to8_emit_jmp("JMP");
-    if (t) gsym_addr(off, t);
-    return off;
+    int off = to8_emit_jmp(OP_JMP);
+    return gjmp_append(off, t);
 }
 
 ST_FUNC void gjmp_addr(int a)
 {
-    int off;
-
-    to8_resolve_pending_mov("JMP");
-    last_ld_valid = 0;
-
-    begin_line();
-    emit_str("    JMP ");
-    off = emit_placeholder_field(TO8_FIELD_WIDTH);
-    write_label_ref(cur_text_section->data + off, a, TO8_FIELD_WIDTH);
-    emit_str("  ; goto l");
-    emit_int(a);
-    emit_nl();
-    pend_store_valid = 0;
-    mark_or_defer_target(a);
+    to8_line *ln;
+    int target = a - to8_func_start_ind;
+    ln = to8_append(OP_JMP);
+    ln->kind = ARG_JMP;
+    ln->jump_prefix = "goto";
+    ln->jmp_target_id = target;
+    to8_mark_target(target);
 }
 
 ST_FUNC int gjmp_cond(int op, int t)
 {
-    const char *jcond = to8_get_jcond(op);
-    int off = to8_emit_jmp(jcond ? jcond : "JNE");
-    if (t) gsym_addr(off, t);
-    return off;
+    to8_opcode jcond = to8_get_jcond(op);
+    int off = to8_emit_jmp(jcond);
+    return gjmp_append(off, t);
 }
 
 /* ===================================================================
  * VLA support
  * =================================================================== */
 
-ST_FUNC void gen_vla_sp_save(int addr) { emit_op_slot("ST", addr); }
-ST_FUNC void gen_vla_sp_restore(int addr) { emit_op_slot("LD", addr); }
+ST_FUNC void gen_vla_sp_save(int addr) { e_op_slot(OP_ST, addr); }
+ST_FUNC void gen_vla_sp_restore(int addr) { e_op_slot(OP_LD, addr); }
 ST_FUNC void gen_vla_sp_alloc(int size) { to8_adjust(-size); }
 
 /* ===================================================================
@@ -1462,10 +1766,9 @@ ST_FUNC void gen_vla_sp_alloc(int size) { to8_adjust(-size); }
 ST_FUNC int gjmp_append(int n, int t)
 {
     if (n) {
-        int n1 = n, n2;
-        while ((n2 = read_int_fixed(cur_text_section->data + n1, TO8_FIELD_WIDTH)))
-            n1 = n2;
-        write_int_fixed(cur_text_section->data + n1, t, TO8_FIELD_WIDTH);
+        to8_line *ln = to8_by_id(n);
+        while (ln->jmp_chain) ln = ln->jmp_chain;
+        ln->jmp_chain = t ? to8_by_id(t) : NULL;
         return n;
     }
     return t;
@@ -1474,7 +1777,7 @@ ST_FUNC int gjmp_append(int n, int t)
 ST_FUNC void gen_fill_nops(int bytes)
 {
     while (bytes-- > 0)
-        emit_op("NOP");
+        e_op(OP_NOP);
 }
 
 ST_FUNC void ggoto(void)
@@ -1486,8 +1789,8 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
 {
     (void)type;
     (void)align;
-    gv(RC_INT);
-    emit_op("VLA_ALLOC");
+    gv(RC_R0);
+    e_op(OP_ADJr);
     vpop();
 }
 
