@@ -428,8 +428,15 @@ ST_FUNC int tccgen_compile(TCCState *s1)
     return 0;
 }
 
+#ifdef TCC_TARGET_TO8
+ST_FUNC void to8_flush_pending_data(TCCState *s1);
+#endif
+
 ST_FUNC void tccgen_finish(TCCState *s1)
 {
+#ifdef TCC_TARGET_TO8
+    to8_flush_pending_data(s1);
+#endif	
     tcc_debug_end(s1); /* just in case of errors: free memory */
     free_inline_functions(s1);
     sym_pop(&global_stack, NULL, 0);
@@ -1532,6 +1539,10 @@ static int get_temp_local_var(int size,int align, int *r2)
     SValue *p;
     int r;
     unsigned used = 0;
+
+#ifdef TCC_TARGET_TO8
+   align = (align+TO8_STACK_ALIGN-1)&~(TO8_STACK_ALIGN-1);
+#endif
 
     /* mark locations that are still in use */
     for (p = vstack; p <= vtop; p++) {
@@ -8360,6 +8371,12 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r,
             /* add padding between stack variables for bound checking */
             loc -= align;
         }
+#endif
+#ifdef TCC_TARGET_TO8
+    /* TO8 backend: OP_ST always writes 4 bytes, regardless of C type.
+     * Force minimum slot size to 4 bytes for local variables only. */
+        if (align < TO8_STACK_ALIGN) align = TO8_STACK_ALIGN;
+        if (size < TO8_STACK_ALIGN) size = TO8_STACK_ALIGN;
 #endif
         loc = (loc - size) & -align;
         addr = loc;

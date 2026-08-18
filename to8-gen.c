@@ -232,6 +232,8 @@ ST_FUNC void gen_be32_impl(int v);
 #define gen_le16(v) gen_be16_impl(v)
 #define gen_le32(v) gen_be32_impl(v)
 
+#define TO8_STACK_ALIGN 4
+
 #else
 
 /* must be defined before gfunc_prolog/epilog call them */
@@ -240,7 +242,6 @@ ST_FUNC void gen_bounds_epilog(void) {}
 
 #define USING_GLOBALS
 #include "tcc.h"
-#define TO8_STACK_ALIGN 4
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -947,6 +948,10 @@ static void e_op_slot(to8_opcode op, int slot)
 {
     to8_line *ln = to8_append(op);
     char desc[24];
+    if (slot & (TO8_STACK_ALIGN-1)) {
+        tcc_error("TO8 internal error: %s on non-4-aligned slot %d",
+                  to8_opcode_name(op), slot);
+    }
     ln->kind = ARG_SLOT;
     ln->slot_a = slot;
     ln->push_depth = cur_push_depth;
