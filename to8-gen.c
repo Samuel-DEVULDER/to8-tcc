@@ -1,106 +1,113 @@
 /*
- * TO8 backend for TCC - single-register pseudo-ASM generator.
- *
- * Version: 7.14.0
- * Changelog:
- * - v7.14.0: two changes.
- *
- *   1) Comment column alignment fixed. The old code called out_tab()
- *      one extra time for lines that print an argument versus lines
- *      that don't (ARG_NONE), so "RET ; return" landed one full tab
- *      stop earlier than "ADJi -36 ; sp -= 36". Replaced the final
- *      out_tab() before the comment with out_pad_to(24) - pads with
- *      spaces up to a FIXED column, regardless of how much (or how
- *      little) came before it. Every comment now starts at the same
- *      column, with no need for a fake blank argument.
- *
- *   2) New OP_LDF4i / OP_LDF8i - TRUE immediate float/double loads,
- *      completing the "i" family for floats (LDF4/LDF8 = real memory
- *      access via slot-held pointer or symbol; LDF4i/LDF8i = the
- *      value is baked directly into the instruction text, matching
- *      exactly what "i" already means for LDi/JSRi: fully resolved,
- *      zero extra memory access at runtime).
- *
- *      TCC allocates every float/double LITERAL constant as an
- *      ANONYMOUS symbol (sym->v >= SYM_FIRST_ANOM) in .rodata - a
- *      real, user-named global float variable never uses this
- *      mechanism, so checking the anonymous-symbol range is a safe,
- *      reliable signal that the value can never change and is safe
- *      to inline. load() now reads the constant's actual bytes
- *      straight out of its (already-written, by this point in
- *      single-pass codegen) section data via elfsym(), and emits
- *      LDF4i/LDF8i with the real value instead of a symbol
- *      reference - eliminating both the "_L.N" symbol and the memory
- *      read it required. If anything about the symbol/section looks
- *      even slightly off (not anonymous, section missing, out of
- *      bounds), this silently falls back to the original LDF4/LDF8
- *      symbol-reference path - never a wrong value, never a crash.
- *
- * - v7.13.0: merged the "m" (symbol) and "ms" (slot-held pointer)
- *   float dereference forms into one opcode identity each (LDF4/
- *   LDF8/STF4/STF8), distinguished by ARG_SLOT vs ARG_SYM kind -
- *   same idea as OP_LDi already unifying plain immediates and symbol
- *   addresses. The OWN-SLOT forms (LDF32/LDF64) keep their size
- *   marker - unlike integers, a float local's OWN slot genuinely
- *   differs in width (4 vs 8 bytes) even without any pointer
- *   involved, so that marker was never actually redundant.
- *
- * - v7.12.0: fixed a real segfault on any compound (&&/||) condition.
- *   gjmp/gjmp_cond were calling gsym_addr(off, t) (arguments
- *   swapped - t, an instruction id from an earlier pending jump, was
- *   being treated as a raw address) instead of gjmp_append(off, t)
- *   (correctly LINKING the new jump onto the incoming chain, with
- *   resolution deferred to the eventual real gsym() call). The first
- *   condition in any chain always passes t=0, which happened to skip
- *   the buggy code path entirely - that's why this was invisible
- *   until a function with a genuine && condition (mandel()) was
- *   compiled.
- *
- * - v7.11.2: shorter peephole comment format, fused onto the
- *   "_funcname:" line.
- *
- * - v7.11.0: new peephole pass to8_peephole_ld_deref(): "LD slot;
- *   LD1r/LD2r/LD4r" fused into "LD1/LD2/LD4 slot".
- *
- * - v7.10.0 and earlier: see prior versions.
- *
- * Architecture:
- *   R0 = real integer accumulator (also REG_IRET).
- *   R1 = VIRTUAL integer register, memory-backed shadow slot.
- *   F0 = float accumulator (also REG_FRET)
- *   NO status/flags register of any kind, for EITHER integers or
- *   floats. OP_CMP/OP_CMPU/OP_CMPi/OP_CMPUi and OP_FCMP ALL write a
- *   signed comparison result straight into R0. S../J.. just read R0's
- *   sign from that point on - one shared family for both.
- *
- * Naming convention:
- *   - "i" suffix  = opcode is FULLY resolved with NO extra runtime
- *     memory access: a plain immediate, a symbol's ADDRESS (LDi,
- *     JSRi), or now a float/double VALUE baked directly into the
- *     instruction (LDF4i, LDF8i).
- *   - "r" suffix  = opcode takes NO ARGUMENT but reads/writes R0 as
- *     the family's register-operand form (PUSHr, JSRr, ADJr, LD1r/
- *     LD2r/LD4r).
- *   - no suffix   = opcode takes a SLOT (LD, ST, ADD, CMP, PUSH,
- *     JSR...), OR - for the float LDF4/LDF8/STF4/STF8 family only -
- *     a genuine memory dereference (slot-held pointer or a REAL,
- *     possibly-mutable symbol) that DOES cost a real memory access,
- *     which is exactly why those stay separate from the "i" forms.
- *   Own-slot float access (LDF32/LDF64) keeps its size marker -
- *   unlike integers, float locals genuinely differ in width (4 vs 8
- *   bytes) even for their own value, so there is no safe way to drop
- *   it the way OP_LD does for ints.
- *
- * Output format (once per compiled file):
- *   ; TO8 backend <version>
- *   ; out: <outfile>  src: <file->filename>
- *   ; cmd: <argv...>              (only if argc/argv are non-empty)
- * then, per function:
- *   _funcname: ; N instr                (peephole made no change)
- *   _funcname: ; N instr -optim-> M     (peephole reduced N to M)
- *   @lN:
- *   MNEMONIC<tab>args<tab>; comment     (comment always at a fixed column)
- */
+* TO8 backend for TCC - single-register pseudo-ASM generator.
+
+* Version: 7.14.1
+* Changelog:
+* - v7.14.1: OP_LDF32/OP_STF32/OP_LDF64/OP_STF64 (own-slot float/
+* double value, no pointer involved) renamed to OP_LDF/OP_STF
+* (float) and OP_LDG/OP_STG (double) - "F"/"G" letter suffixes
+* instead of a 32/64 bit-width number, per the harmonized mnemonic
+* scheme (i=immediate, r=R0-implicit, no numeric suffix=slot).
+* This also removes the visual clash with LDF4/LDF8/STF4/STF8,
+* whose "4"/"8" mean something ENTIRELY different (byte-size of
+* the pointee behind a slot-held pointer or symbol) - reusing
+* 32/64 for a different axis (the slot's OWN bit-width) was
+* confusing even though it never technically collided.
+
+* - v7.14.0: two changes.
+
+* 1) Comment column alignment fixed. The old code called out_tab()
+* one extra time for lines that print an argument versus lines
+* that don't (ARG_NONE), so "RET ; return" landed one full tab
+* stop earlier than "ADJi -36 ; sp -= 36". Replaced the final
+* out_tab() before the comment with out_pad_to(24) - pads with
+* spaces up to a FIXED column, regardless of how much (or how
+* little) came before it. Every comment now starts at the same
+* column, with no need for a fake blank argument.
+
+* 2) New OP_LDF4i / OP_LDF8i - TRUE immediate float/double loads,
+* completing the "i" family for floats (LDF4/LDF8 = real memory
+* access via slot-held pointer or symbol; LDF4i/LDF8i = the
+* value is baked directly into the instruction text, matching
+* exactly what "i" already means for LDi/JSRi: fully resolved,
+* zero extra memory access at runtime).
+
+* TCC allocates every float/double LITERAL constant as an
+* ANONYMOUS symbol (sym->v >= SYM_FIRST_ANOM) in .rodata - a
+* real, user-named global float variable never uses this
+* mechanism, so checking the anonymous-symbol range is a safe,
+* reliable signal that the value can never change and is safe
+* to inline. load() now reads the constant's actual bytes
+* straight out of its (already-written, by this point in
+* single-pass codegen) section data via elfsym(), and emits
+* LDF4i/LDF8i with the real value instead of a symbol
+* reference - eliminating both the "_L.N" symbol and the memory
+* read it required. If anything about the symbol/section looks
+* even slightly off (not anonymous, section missing, out of
+* bounds), this silently falls back to the original LDF4/LDF8
+* symbol-reference path - never a wrong value, never a crash.
+
+* - v7.13.0: merged the "m" (symbol) and "ms" (slot-held pointer)
+* float dereference forms into one opcode identity each (LDF4/
+* LDF8/STF4/STF8), distinguished by ARG_SLOT vs ARG_SYM kind -
+* same idea as OP_LDi already unifying plain immediates and symbol
+* addresses.
+
+* - v7.12.0: fixed a real segfault on any compound (&&/||) condition.
+* gjmp/gjmp_cond were calling gsym_addr(off, t) (arguments
+* swapped - t, an instruction id from an earlier pending jump, was
+* being treated as a raw address) instead of gjmp_append(off, t)
+* (correctly LINKING the new jump onto the incoming chain, with
+* resolution deferred to the eventual real gsym() call).
+
+* - v7.11.2: shorter peephole comment format, fused onto the
+* "_funcname:" line.
+
+* - v7.11.0: new peephole pass to8_peephole_ld_deref(): "LD slot;
+* LD1r/LD2r/LD4r" fused into "LD1/LD2/LD4 slot".
+
+* - v7.10.0 and earlier: see prior versions.
+
+* Architecture:
+* R0 = real integer accumulator (also REG_IRET).
+* R1 = VIRTUAL integer register, memory-backed shadow slot.
+* F0 = float accumulator (also REG_FRET)
+* NO status/flags register of any kind, for EITHER integers or
+* floats. OP_CMP/OP_CMPU/OP_CMPi/OP_CMPUi and OP_FCMP ALL write a
+* signed comparison result straight into R0. S../J.. just read R0's
+* sign from that point on - one shared family for both.
+
+* Naming convention:
+* - "i" suffix = opcode is FULLY resolved with NO extra runtime
+* memory access: a plain immediate, a symbol's ADDRESS (LDi,
+* JSRi), or a float/double VALUE baked directly into the
+* instruction (LDF4i, LDF8i).
+* - "r" suffix = opcode takes NO ARGUMENT but reads/writes R0 as
+* the family's register-operand form (PUSHr, JSRr, ADJr, LD1r/
+* LD2r/LD4r).
+* - no suffix, integer family = opcode takes a SLOT (LD, ST, ADD,
+* CMP, PUSH, JSR...). Always 4 bytes - ints have one native width,
+* so no letter/number is ever needed to disambiguate.
+* - no suffix, float family = TWO cases, disambiguated by LETTER
+* (not by number, to avoid clashing with the deref family's
+* byte-size numbers):
+* * OP_LDF/OP_STF/OP_LDG/OP_STG: own-slot value, no pointer
+* involved - "F" = float (4 bytes), "G" = double (8 bytes).
+* * OP_LDF4/OP_LDF8/OP_STF4/OP_STF8: genuine memory dereference
+* (slot-held pointer, or a REAL possibly-mutable symbol) -
+* the "4"/"8" here means byte-size of the POINTEE, same axis
+* as integer LD1/LD2/LD4, unrelated to the F/G own-slot forms.
+
+* Output format (once per compiled file):
+* ; TO8 backend
+* ; out: src: filename>
+* ; cmd: (only if argc/argv are non-empty)
+* then, per function:
+* _funcname: ; N instr (peephole made no change)
+* _funcname: ; N instr -optim-> M (peephole reduced N to M)
+* @lN:
+* MNEMONICargs; comment (comment always at a fixed column)
+*/
 
 #ifdef TARGET_DEFS_ONLY
 
@@ -130,9 +137,8 @@ enum {
 
 #define PTR_SIZE 4
 #define LDOUBLE_SIZE 8
-#define LDOUBLE_ALIGN 4
-#define MAX_ALIGN 4
-#define TO8_STACK_ALIGN 4
+#define LDOUBLE_ALIGN 8
+#define MAX_ALIGN 8
 
 #define PROMOTE_RET
 
@@ -149,7 +155,7 @@ ST_FUNC void gen_bounds_epilog(void) {}
 #include <ctype.h>
 #include <string.h>
 
-#define TO8_GEN_VERSION "7.14.0"
+#define TO8_GEN_VERSION "7.14.1"
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -161,11 +167,13 @@ ST_DATA const int reg_classes[NB_REGS] = {
     RC_R1,
 };
 
+#define TO8_STACK_ALIGN 4
+
 /* ===================================================================
  * The entire instruction set, in one place, with its semantics.
  * "slot" always means a stack-frame memory location (a local
  * variable or parameter). "R0"/"F0" are the two accumulators.
- *
+
  * There is NO flags register, for integers or floats. OP_CMP/OP_CMPU/
  * OP_CMPi/OP_CMPUi and OP_FCMP ALL write a SIGNED integer directly
  * into R0. Every S../J.. opcode that follows just reads the sign of
@@ -173,77 +181,76 @@ ST_DATA const int reg_classes[NB_REGS] = {
  * =================================================================== */
 
 typedef enum {
-    OP_NOP,   /* no-op */
-    OP_RET,   /* return from the current function */
-    OP_ADJi,  /* SP -= n if n<0 (allocate), SP += n if n>=0 (release) */
-    OP_ADJr,  /* SP -= R0 (always allocates - the VLA case). */
+    OP_NOP,     /* no-op */
+    OP_RET,     /* return from the current function */
+    OP_ADJi,    /* SP -= n if n<0 (allocate), SP += n if n>=0 (release) */
+    OP_ADJr,    /* SP -= R0 (always allocates - the VLA case). */
+    OP_LD,      /* R0 = slot (4-byte load) */
+    OP_ST,      /* slot = R0 (4-byte store) */
+    OP_LEA,     /* R0 = address of slot */
+    OP_LD1,     /* R0 = *(char*)slot (byte-sized memory load via pointer in slot) */
+    OP_LD2,     /* R0 = *(short*)slot (halfword-sized memory load) */
+    OP_LD4,     /* R0 = *(int*)slot (word-sized memory load) */
+    OP_LD1r,    /* R0 = *(char*)R0 - dereference the pointer ALREADY in R0 */
+    OP_LD2r,    /* R0 = *(short*)R0 */
+    OP_LD4r,    /* R0 = *(int*)R0 */
+    OP_ST1,     /* *(char*)slot = R0 (byte-sized memory store via pointer in slot) */
+    OP_ST2,     /* *(short*)slot = R0 (halfword-sized memory store) */
+    OP_ST4,     /* *(int*)slot = R0 (word-sized memory store) */
 
-    OP_LD,    /* R0 = slot (4-byte load) */
-    OP_ST,    /* slot = R0 (4-byte store) */
-    OP_LEA,   /* R0 = address of slot */
-    OP_LD1,   /* R0 = *(char*)slot (byte-sized memory load via pointer in slot) */
-    OP_LD2,   /* R0 = *(short*)slot (halfword-sized memory load) */
-    OP_LD4,   /* R0 = *(int*)slot (word-sized memory load) */
-    OP_LD1r,  /* R0 = *(char*)R0 - dereference the pointer ALREADY in R0 */
-    OP_LD2r,  /* R0 = *(short*)R0 */
-    OP_LD4r,  /* R0 = *(int*)R0 */
-    OP_ST1,   /* *(char*)slot = R0 (byte-sized memory store via pointer in slot) */
-    OP_ST2,   /* *(short*)slot = R0 (halfword-sized memory store) */
-    OP_ST4,   /* *(int*)slot = R0 (word-sized memory store) */
+    OP_LDi,     /* R0 = immediate, OR R0 = address of a global symbol
+                   (a compile/link-time-known value either way). */
 
-    OP_LDi,   /* R0 = immediate, OR R0 = address of a global symbol
-                 (a compile/link-time-known value either way). */
+    OP_ADD,     /* R0 += slot */
+    OP_SUB,     /* R0 -= slot */
+    OP_AND,     /* R0 &= slot */
+    OP_OR,      /* R0 |= slot */
+    OP_XOR,     /* R0 ^= slot */
+    OP_MUL,     /* R0 *= slot */
+    OP_DIV,     /* R0 /= slot */
+    OP_MOD,     /* R0 %= slot */
+    OP_SHL,     /* R0 <<= slot */
+    OP_SHR,     /* R0 >>= slot (logical/unsigned) */
+    OP_SAR,     /* R0 >>= slot (arithmetic/signed) */
+    OP_CMP,     /* R0 = sign(R0 - slot), SIGNED subtraction. */
+    OP_CMPU,    /* R0 = sign(R0 -u slot), UNSIGNED subtraction. */
 
-    OP_ADD,   /* R0 += slot */
-    OP_SUB,   /* R0 -= slot */
-    OP_AND,   /* R0 &= slot */
-    OP_OR,    /* R0 |= slot */
-    OP_XOR,   /* R0 ^= slot */
-    OP_MUL,   /* R0 *= slot */
-    OP_DIV,   /* R0 /= slot */
-    OP_MOD,   /* R0 %= slot */
-    OP_SHL,   /* R0 <<= slot */
-    OP_SHR,   /* R0 >>= slot (logical/unsigned) */
-    OP_SAR,   /* R0 >>= slot (arithmetic/signed) */
-    OP_CMP,   /* R0 = sign(R0 - slot), SIGNED subtraction. */
-    OP_CMPU,  /* R0 = sign(R0 -u slot), UNSIGNED subtraction. */
+    OP_ADDi,    /* R0 += immediate */
+    OP_SUBi,    /* R0 -= immediate */
+    OP_ANDi,    /* R0 &= immediate */
+    OP_ORi,     /* R0 |= immediate */
+    OP_XORi,    /* R0 ^= immediate */
+    OP_MULi,    /* R0 *= immediate */
+    OP_DIVi,    /* R0 /= immediate */
+    OP_MODi,    /* R0 %= immediate */
+    OP_SHLi,    /* R0 <<= immediate */
+    OP_SHRi,    /* R0 >>= immediate (logical/unsigned) */
+    OP_SARi,    /* R0 >>= immediate (arithmetic/signed) */
+    OP_CMPi,    /* R0 = sign(R0 - immediate), SIGNED */
+    OP_CMPUi,   /* R0 = sign(R0 -u immediate), UNSIGNED */
 
-    OP_ADDi,  /* R0 += immediate */
-    OP_SUBi,  /* R0 -= immediate */
-    OP_ANDi,  /* R0 &= immediate */
-    OP_ORi,   /* R0 |= immediate */
-    OP_XORi,  /* R0 ^= immediate */
-    OP_MULi,  /* R0 *= immediate */
-    OP_DIVi,  /* R0 /= immediate */
-    OP_MODi,  /* R0 %= immediate */
-    OP_SHLi,  /* R0 <<= immediate */
-    OP_SHRi,  /* R0 >>= immediate (logical/unsigned) */
-    OP_SARi,  /* R0 >>= immediate (arithmetic/signed) */
-    OP_CMPi,  /* R0 = sign(R0 - immediate), SIGNED */
-    OP_CMPUi, /* R0 = sign(R0 -u immediate), UNSIGNED */
+    OP_SEQ,     /* R0 = (R0 == 0) ? 1 : 0 */
+    OP_SNE,     /* R0 = (R0 != 0) ? 1 : 0 */
+    OP_SLT,     /* R0 = (R0 < 0) ? 1 : 0 */
+    OP_SGT,     /* R0 = (R0 > 0) ? 1 : 0 */
+    OP_SLE,     /* R0 = (R0 <= 0) ? 1 : 0 */
+    OP_SGE,     /* R0 = (R0 >= 0) ? 1 : 0 */
+    OP_SNZ,     /* R0 = (R0 != 0) ? 1 : 0 (used when no dedicated S.. fits) */
 
-    OP_SEQ,   /* R0 = (R0 == 0) ? 1 : 0 */
-    OP_SNE,   /* R0 = (R0 != 0) ? 1 : 0 */
-    OP_SLT,   /* R0 = (R0 <  0) ? 1 : 0 */
-    OP_SGT,   /* R0 = (R0 >  0) ? 1 : 0 */
-    OP_SLE,   /* R0 = (R0 <= 0) ? 1 : 0 */
-    OP_SGE,   /* R0 = (R0 >= 0) ? 1 : 0 */
-    OP_SNZ,   /* R0 = (R0 != 0) ? 1 : 0 (used when no dedicated S.. fits) */
+    OP_MOV,     /* dst_slot = src_slot, WITHOUT touching R0 - fusion of LD+ST */
 
-    OP_MOV,   /* dst_slot = src_slot, WITHOUT touching R0 - fusion of LD+ST */
+    OP_EXT1S,   /* R0 = (int)(signed char)R0 */
+    OP_EXT2S,   /* R0 = (int)(signed short)R0 */
+    OP_EXT1U,   /* R0 = (int)(unsigned char)R0 */
+    OP_EXT2U,   /* R0 = (int)(unsigned short)R0 */
 
-    OP_EXT1S, /* R0 = (int)(signed char)R0 */
-    OP_EXT2S, /* R0 = (int)(signed short)R0 */
-    OP_EXT1U, /* R0 = (int)(unsigned char)R0 */
-    OP_EXT2U, /* R0 = (int)(unsigned short)R0 */
+    OP_ITOF,    /* F0 = (float/double)R0 */
+    OP_FTOI,    /* R0 = (int)F0 */
 
-    OP_ITOF,  /* F0 = (float/double)R0 */
-    OP_FTOI,  /* R0 = (int)F0 */
-
-    OP_LDF32,   /* F0 = slot (as float) - own slot value */
-    OP_LDF64,   /* F0 = slot (as double) - own slot value */
-    OP_STF32,   /* slot = F0 (as float) */
-    OP_STF64,   /* slot = F0 (as double) */
+    OP_LDF,     /* F0 = slot (own-slot value, as float, 4 bytes) */
+    OP_LDG,     /* F0 = slot (own-slot value, as double, 8 bytes) */
+    OP_STF,     /* slot = F0 (own-slot value, as float) */
+    OP_STG,     /* slot = F0 (own-slot value, as double) */
     OP_LDF4,    /* F0 = *(float*)slot-or-symbol - dereference a
                    slot-held pointer, OR read a REAL (possibly
                    mutable) global float variable by symbol. */
@@ -256,30 +263,30 @@ typedef enum {
                    can never change. */
     OP_LDF8i,   /* F0 = <literal double value>, same idea. */
 
-    OP_FCMP,  /* R0 = sign(F0 - slot), comparing as double - exactly
-                 like OP_CMP, just with F0 on the left instead of R0.
-                 Consumed by the SAME SEQ/SNE/SLT/SGT/SLE/SGE and
-                 JEQ/JNE/... families integers use. */
-    OP_FADD,  /* F0 += slot (as double) */
-    OP_FSUB,  /* F0 -= slot (as double) */
-    OP_FMUL,  /* F0 *= slot (as double) */
-    OP_FDIV,  /* F0 /= slot (as double) */
+    OP_FCMP,    /* R0 = sign(F0 - slot), comparing as double - exactly
+                   like OP_CMP, just with F0 on the left instead of R0.
+                   Consumed by the SAME SEQ/SNE/SLT/SGT/SLE/SGE and
+                   JEQ/JNE/... families integers use. */
+    OP_FADD,    /* F0 += slot (as double) */
+    OP_FSUB,    /* F0 -= slot (as double) */
+    OP_FMUL,    /* F0 *= slot (as double) */
+    OP_FDIV,    /* F0 /= slot (as double) */
 
-    OP_PUSH,  /* push slot's value onto the call-argument stack */
-    OP_PUSHi, /* push an immediate onto the call-argument stack */
-    OP_PUSHr, /* push R0 onto the call-argument stack */
+    OP_PUSH,    /* push slot's value onto the call-argument stack */
+    OP_PUSHi,   /* push an immediate onto the call-argument stack */
+    OP_PUSHr,   /* push R0 onto the call-argument stack */
 
-    OP_JSR,   /* call the function pointer held in slot */
-    OP_JSRi,  /* call the function named by symbol */
-    OP_JSRr,  /* call the function pointer held in R0 */
+    OP_JSR,     /* call the function pointer held in slot */
+    OP_JSRi,    /* call the function named by symbol */
+    OP_JSRr,    /* call the function pointer held in R0 */
 
-    OP_JMP,   /* unconditional: goto target */
-    OP_JEQ,   /* if (R0 == 0) goto target */
-    OP_JNE,   /* if (R0 != 0) goto target */
-    OP_JLT,   /* if (R0 <  0) goto target */
-    OP_JGT,   /* if (R0 >  0) goto target */
-    OP_JLE,   /* if (R0 <= 0) goto target */
-    OP_JGE,   /* if (R0 >= 0) goto target */
+    OP_JMP,     /* unconditional: goto target */
+    OP_JEQ,     /* if (R0 == 0) goto target */
+    OP_JNE,     /* if (R0 != 0) goto target */
+    OP_JLT,     /* if (R0 < 0) goto target */
+    OP_JGT,     /* if (R0 > 0) goto target */
+    OP_JLE,     /* if (R0 <= 0) goto target */
+    OP_JGE,     /* if (R0 >= 0) goto target */
 } to8_opcode;
 
 static const char *to8_opcode_name(to8_opcode op)
@@ -309,8 +316,8 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_EXT1S: return "EXT1S"; case OP_EXT2S: return "EXT2S";
     case OP_EXT1U: return "EXT1U"; case OP_EXT2U: return "EXT2U";
     case OP_ITOF: return "ITOF"; case OP_FTOI: return "FTOI";
-    case OP_LDF32: return "LDF32"; case OP_LDF64: return "LDF64";
-    case OP_STF32: return "STF32"; case OP_STF64: return "STF64";
+    case OP_LDF: return "LDF"; case OP_LDG: return "LDG";
+    case OP_STF: return "STF"; case OP_STG: return "STG";
     case OP_LDF4: return "LDF4"; case OP_LDF8: return "LDF8";
     case OP_STF4: return "STF4"; case OP_STF8: return "STF8";
     case OP_LDF4i: return "LDF4i"; case OP_LDF8i: return "LDF8i";
@@ -546,8 +553,8 @@ static void slot_comment(char *out, size_t outsz, to8_opcode op, const char *des
     case OP_FSUB: snprintf(out, outsz, "F0 -= %s", desc); return;
     case OP_FMUL: snprintf(out, outsz, "F0 *= %s", desc); return;
     case OP_FDIV: snprintf(out, outsz, "F0 /= %s", desc); return;
-    case OP_STF32: case OP_STF64: snprintf(out, outsz, "%s = F0", desc); return;
-    case OP_LDF32: case OP_LDF64: snprintf(out, outsz, "F0 = %s", desc); return;
+    case OP_STF: case OP_STG: snprintf(out, outsz, "%s = F0", desc); return;
+    case OP_LDF: case OP_LDG: snprintf(out, outsz, "F0 = %s", desc); return;
     case OP_STF4: case OP_STF8: snprintf(out, outsz, "*%s = F0", desc); return;
     case OP_LDF4: case OP_LDF8: snprintf(out, outsz, "F0 = *%s", desc); return;
     case OP_PUSH: snprintf(out, outsz, "push %s", desc); return;
@@ -808,15 +815,15 @@ static to8_opcode to8_get_jcond(int op)
 static int to8_swap_cmp_op(int op)
 {
     switch (op) {
-    case TOK_LT:  return TOK_GT;
-    case TOK_GT:  return TOK_LT;
-    case TOK_LE:  return TOK_GE;
-    case TOK_GE:  return TOK_LE;
+    case TOK_LT: return TOK_GT;
+    case TOK_GT: return TOK_LT;
+    case TOK_LE: return TOK_GE;
+    case TOK_GE: return TOK_LE;
     case TOK_ULT: return TOK_UGT;
     case TOK_UGT: return TOK_ULT;
     case TOK_ULE: return TOK_UGE;
     case TOK_UGE: return TOK_ULE;
-    default:      return op;
+    default: return op;
     }
 }
 
@@ -839,9 +846,7 @@ static to8_opcode to8_byte_suffix_st(int bt)
     if (bt == VT_BYTE || bt == VT_BOOL) return OP_ST1;
     if (bt == VT_SHORT) return OP_ST2;
     return OP_ST4;
-}
-
-/* ===================================================================
+}/* ===================================================================
  * Float literal inlining: if `sym` is a compiler-generated anonymous
  * constant (never a real, possibly-mutable named global), read its
  * already-written bytes straight out of its section and hand back
@@ -856,6 +861,7 @@ static int to8_try_read_float_const(Sym *sym, int bt, double *out_val)
     ElfSym *esym;
     Section *sec;
     int size = (bt == VT_FLOAT) ? 4 : 8;
+    unsigned long offset;
 
     if (!sym || sym->v < SYM_FIRST_ANOM)
         return 0;
@@ -863,22 +869,25 @@ static int to8_try_read_float_const(Sym *sym, int bt, double *out_val)
     esym = elfsym(sym);
     if (!esym || esym->st_shndx == 0)
         return 0;
+
     if (!tcc_state || esym->st_shndx >= tcc_state->nb_sections)
         return 0;
 
     sec = tcc_state->sections[esym->st_shndx];
     if (!sec || !sec->data)
         return 0;
-    if ((unsigned long)esym->st_value + size > sec->data_offset)
+
+    offset = (unsigned long)esym->st_value;
+    if (offset + size > sec->data_offset)
         return 0;
 
     if (bt == VT_FLOAT) {
         float f;
-        memcpy(&f, sec->data + esym->st_value, sizeof f);
+        memcpy(&f, sec->data + offset, sizeof f);
         *out_val = (double)f;
     } else {
         double d;
-        memcpy(&d, sec->data + esym->st_value, sizeof d);
+        memcpy(&d, sec->data + offset, sizeof d);
         *out_val = d;
     }
     return 1;
@@ -903,7 +912,7 @@ void load(int r, SValue *sv)
 
     if (r == TREG_F0) {
         if (bt == VT_FLOAT || bt == VT_DOUBLE) {
-            to8_opcode ld = (bt == VT_FLOAT) ? OP_LDF32 : OP_LDF64;
+            to8_opcode ld = (bt == VT_FLOAT) ? OP_LDF : OP_LDG;
             to8_opcode ld4or8 = (bt == VT_FLOAT) ? OP_LDF4 : OP_LDF8;
             to8_opcode ldi = (bt == VT_FLOAT) ? OP_LDF4i : OP_LDF8i;
             if (sv->r & VT_LVAL) {
@@ -961,7 +970,7 @@ void load(int r, SValue *sv)
             e_op_addr(ldop, sv->sym, fc);
         } else if (v == TREG_R0) {
             /* Pointer already sitting in R0: dereference directly,
-               no temp-slot spill needed. */
+             * no temp-slot spill needed. */
             e_op(to8_byte_suffix_ld_r(bt));
         } else if (v < VT_CONST) {
             int temp;
@@ -1037,7 +1046,7 @@ void store(int r, SValue *v)
     stop = to8_byte_suffix_st(bt);
 
     if (r == TREG_F0) {
-        to8_opcode st = (bt == VT_FLOAT) ? OP_STF32 : OP_STF64;
+        to8_opcode st = (bt == VT_FLOAT) ? OP_STF : OP_STG;
         to8_opcode st4or8 = (bt == VT_FLOAT) ? OP_STF4 : OP_STF8;
         if (fr == VT_LOCAL) {
             e_op_slot(st, fc);
@@ -1149,10 +1158,17 @@ void gen_opi(int op)
         int is_unsigned_cmp = (op == TOK_ULT || op == TOK_UGT ||
                                op == TOK_ULE || op == TOK_UGE);
         int tst_ok = (op == TOK_EQ || op == TOK_NE ||
-                     op == TOK_LT || op == TOK_GT || op == TOK_LE || op == TOK_GE);
+                      op == TOK_LT || op == TOK_GT || op == TOK_LE || op == TOK_GE);
 
         if ((vtop->r & VT_VALMASK) == VT_CONST && !(vtop->r & VT_SYM)) {
             int c0 = vtop->c.i;
+            /* NOTE (fix, v7.14.1): vpop() below already removes the
+             * RHS constant from the stack. The v7.14.0 source had an
+             * extra "vtop--;" right before vset_VT_CMP() here, which
+             * double-decremented vtop - consuming BOTH operands with
+             * no result pushed back, hence "internal compiler error:
+             * vstack leak (-1)" on any comparison against a literal
+             * 0/const RHS. Removed the redundant decrement. */
             vpop();
             gv(RC_R0);
             if (!(c0 == 0 && tst_ok)) {
@@ -1171,11 +1187,11 @@ void gen_opi(int op)
         gv(RC_R0);
         v1 = vtop[-1].r & VT_VALMASK;
         c1 = vtop[-1].c.i;
-        {
-            int temp = to8_spill_and_reload(v1, c1);
-            e_op_slot(is_unsigned_cmp ? OP_CMPU : OP_CMP, temp);
-            to8_temp_free(temp, 4, 4);
-        }
+
+        int temp = to8_spill_and_reload(v1, c1);
+        e_op_slot(is_unsigned_cmp ? OP_CMPU : OP_CMP, temp);
+        to8_temp_free(temp, 4, 4);
+
         vtop--;
         vset_VT_CMP(op);
         return;
@@ -1197,35 +1213,33 @@ void gen_opi(int op)
         c1 = vtop[-1].c.i;
     }
 
-    {
-        to8_opcode slot_op, imm_op;
-        if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) {
-            vtop--; return;
-        }
+    to8_opcode slot_op, imm_op;
+    if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) {
+        vtop--; return;
+    }
 
-        if (to8_is_commutative(op)) {
-            if (v1 == VT_CONST) {
-                e_op_imm(imm_op, c1);
-            } else if (v1 == TREG_R0 || v1 == TREG_R1) {
-                int temp = to8_spill_and_reload(v1, c1);
-                e_op_slot(slot_op, temp);
-                to8_temp_free(temp, 4, 4);
-            } else {
-                e_op_slot(slot_op, c1);
-            }
+    if (to8_is_commutative(op)) {
+        if (v1 == VT_CONST) {
+            e_op_imm(imm_op, c1);
+        } else if (v1 == TREG_R0 || v1 == TREG_R1) {
+            int temp = to8_spill_and_reload(v1, c1);
+            e_op_slot(slot_op, temp);
+            to8_temp_free(temp, 4, 4);
         } else {
-            int temp;
-            if (v1 == VT_CONST) {
-                temp = to8_temp_alloc(4, 4);
-                e_op_slot(OP_ST, temp);
-                e_op_imm(OP_LDi, c1);
-                e_op_slot(slot_op, temp);
-                to8_temp_free(temp, 4, 4);
-            } else {
-                temp = to8_spill_and_reload(v1, c1);
-                e_op_slot(slot_op, temp);
-                to8_temp_free(temp, 4, 4);
-            }
+            e_op_slot(slot_op, c1);
+        }
+    } else {
+        int temp;
+        if (v1 == VT_CONST) {
+            temp = to8_temp_alloc(4, 4);
+            e_op_slot(OP_ST, temp);
+            e_op_imm(OP_LDi, c1);
+            e_op_slot(slot_op, temp);
+            to8_temp_free(temp, 4, 4);
+        } else {
+            temp = to8_spill_and_reload(v1, c1);
+            e_op_slot(slot_op, temp);
+            to8_temp_free(temp, 4, 4);
         }
     }
 
@@ -1247,9 +1261,9 @@ void gen_opf(int op)
         int fv1 = vtop[-1].r & VT_VALMASK;
         int fc1 = vtop[-1].c.i;
         int temp = to8_temp_alloc(8, 4);
-        e_op_slot(OP_STF64, temp);
+        e_op_slot(OP_STG, temp);
         if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
-            e_op_slot(OP_LDF64, fc1);
+            e_op_slot(OP_LDG, fc1);
         e_op_slot(OP_FCMP, temp);
         to8_temp_free(temp, 8, 4);
 
@@ -1258,38 +1272,36 @@ void gen_opf(int op)
         return;
     }
 
-    {
-        to8_opcode fop;
-        int fv1 = vtop[-1].r & VT_VALMASK;
-        int fc1 = vtop[-1].c.i;
-        int commutative;
+    to8_opcode fop;
+    int fv1 = vtop[-1].r & VT_VALMASK;
+    int fc1 = vtop[-1].c.i;
+    int commutative;
 
-        switch (op) {
-        case '+': fop = OP_FADD; break;
-        case '-': fop = OP_FSUB; break;
-        case '*': fop = OP_FMUL; break;
-        case '/': fop = OP_FDIV; break;
-        default:  fop = OP_NOP; break;
-        }
-        commutative = (fop == OP_FADD || fop == OP_FMUL);
-
-        if (fop != OP_NOP) {
-            if (commutative && (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)) {
-                e_op_slot(fop, fc1);
-            } else {
-                int temp = to8_temp_alloc(8, 4);
-                e_op_slot(OP_STF64, temp);
-                if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
-                    e_op_slot(OP_LDF64, fc1);
-                e_op_slot(fop, temp);
-                to8_temp_free(temp, 8, 4);
-            }
-        }
+    switch (op) {
+    case '+': fop = OP_FADD; break;
+    case '-': fop = OP_FSUB; break;
+    case '*': fop = OP_FMUL; break;
+    case '/': fop = OP_FDIV; break;
+    default: fop = OP_NOP; break;
     }
 
-    vtop--;
-    vtop->r = TREG_F0;
-    vtop->r2 = VT_CONST;
+    commutative = (fop == OP_FADD || fop == OP_FMUL);
+
+    if (fop != OP_NOP) {
+        if (commutative && (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)) {
+            e_op_slot(fop, fc1);
+        } else {
+            int temp = to8_temp_alloc(8, 4);
+            e_op_slot(OP_STG, temp);
+            if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
+                e_op_slot(OP_LDG, fc1);
+            e_op_slot(fop, temp);
+            to8_temp_free(temp, 8, 4);
+        }
+        vtop--;
+        vtop->r = TREG_F0;
+        vtop->r2 = VT_CONST;
+    }
 }
 
 /* ===================================================================
@@ -1365,7 +1377,7 @@ void gfunc_call(int nb_args)
  * finished list, and ONLY when the user opted in via -O1 or higher.
  * Each pass returns 1 if it changed the list, 0 otherwise; the driver
  * loop re-runs all three until a full round changes nothing.
- *
+
  * TODO: "LD1 slot; ST slot" (same slot, a dead round trip through a
  * dereferenced pointer) is the sized-dereference analogue of what
  * to8_peephole_mov() already does for OP_LD/OP_ST. A generalized
@@ -1499,8 +1511,8 @@ static int to8_peephole_ld_deref(void)
             (nxt->op == OP_LD1r || nxt->op == OP_LD2r || nxt->op == OP_LD4r) &&
             cur->push_depth == nxt->push_depth) {
             to8_opcode rep = (nxt->op == OP_LD1r) ? OP_LD1
-                            : (nxt->op == OP_LD2r) ? OP_LD2
-                            : OP_LD4;
+                : (nxt->op == OP_LD2r) ? OP_LD2
+                : OP_LD4;
             char desc[24];
 
             cur->op = rep;
@@ -1552,14 +1564,16 @@ static void out_tab(void)
     int next = ((g_col / 8) + 1) * 8;
     while (g_col < next) out_char(' ');
 }
+
 /* Pad with spaces up to a FIXED column, instead of always advancing
-   by one full tab stop the way out_tab() does. Used just before the
-   comment, so every line's comment starts at the same place whether
-   or not it printed an argument. */
+ * by one full tab stop the way out_tab() does. Used just before the
+ * comment, so every line's comment starts at the same place whether
+ * or not it printed an argument. */
 static void out_pad_to(int col)
 {
     while (g_col < col) out_char(' ');
 }
+
 #define TO8_COMMENT_COL 24
 
 static int to8_final_slot(int raw_slot, int push_depth)
@@ -1574,7 +1588,7 @@ static void to8_print_banner(void)
 
     out_str("; out: ");
     out_str((tcc_state && tcc_state->outfile) ? tcc_state->outfile : "(unknown)");
-    out_str("  src: ");
+    out_str(" src: ");
     out_str((file && file->filename[0]) ? file->filename : "(unknown)");
     out_char('\n');
 
@@ -1647,6 +1661,7 @@ static void to8_render_line(to8_line *ln)
     } else if (ln->has_comment) {
         out_str(ln->comment);
     }
+
     out_char('\n');
 }
 
@@ -1755,15 +1770,13 @@ void gfunc_epilog(void)
         to8_func_adj_line->imm_val = -frame_size;
         imm_comment(to8_func_adj_line->comment, sizeof to8_func_adj_line->comment, OP_ADJi, -frame_size);
         to8_func_adj_line->has_comment = 1;
-
-        {
-            to8_line *ln = to8_append(OP_ADJi);
-            ln->kind = ARG_IMM;
-            ln->imm_val = frame_size;
-            imm_comment(ln->comment, sizeof ln->comment, OP_ADJi, frame_size);
-            ln->has_comment = 1;
-        }
     }
+
+    to8_line *ln = to8_append(OP_ADJi);
+    ln->kind = ARG_IMM;
+    ln->imm_val = frame_size;
+    imm_comment(ln->comment, sizeof ln->comment, OP_ADJi, frame_size);
+    ln->has_comment = 1;
 
     e_op(OP_RET);
 
