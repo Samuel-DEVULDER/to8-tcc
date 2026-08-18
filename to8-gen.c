@@ -1,7 +1,15 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.25.1 (fix: commutative peephole no longer drops the ST)
+ * Version: 7.27.0 (fix: commutative peephole no longer drops the ST)
  * Changelog:
+ * - v7.27.0: new peephole to8_peephole_useless_ld() replaces the old
+ *   to8_peephole_dead_ld(). Removes redundant LD slot when R0 already
+ *   holds 'slot' (after prior LD/ST of same slot). Unlike the old version,
+ *   uses conservative forward scan: only LD/ST preserve tracking; all other
+ *   instructions (arithmetic, MOV to tracked slot, labels) invalidate it.
+ *
+ * - v7.26.0: fuse "LD slotA ; OP slotB" into "OP2 slotA,slotB"
+ *
  * - v7.25.1: to8_peephole_commute() no longer removes the leading
  *   "ST T" when fusing "ST T ; LD S ; <op> T" -> "<op> S". Real bug
  *   found in a generated __qsort() listing (2026-08-16): the "ST T"
@@ -247,7 +255,7 @@ ST_FUNC void gen_bounds_epilog(void) {}
 #include <string.h>
 #include <math.h>
 
-#define TO8_GEN_VERSION "7.25.1"
+#define TO8_GEN_VERSION "7.27.0"
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -437,6 +445,16 @@ typedef enum {
     OP_JGT,   /* if (R0 > 0) goto target */
     OP_JLE,   /* if (R0 <= 0) goto target */
     OP_JGE,   /* if (R0 >= 0) goto target */
+    
+    /* OP2 */
+    OP_ADD2,   /* R0 = slotA + slotB   (fusion de "LD slotA ; ADD slotB") */
+    OP_SUB2,   /* R0 = slotA - slotB */
+    OP_MUL2,   /* R0 = slotA * slotB */
+    OP_AND2,   /* R0 = slotA & slotB */
+    OP_OR2,    /* R0 = slotA | slotB */
+    OP_XOR2,   /* R0 = slotA ^ slotB */
+    OP_CMP2,   /* R0 = sign(slotA - slotB), SIGNED */
+    OP_CMPU2,  /* R0 = sign(slotA -u slotB), UNSIGNED */
 } to8_opcode;
 
 static const char *to8_opcode_name(to8_opcode op)
@@ -484,6 +502,14 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_JSR: return "JSR"; case OP_JSRi: return "JSRi"; case OP_JSRr: return "JSRr";
     case OP_JMP: return "JMP"; case OP_JEQ: return "JEQ"; case OP_JNE: return "JNE";
     case OP_JLT: return "JLT"; case OP_JGT: return "JGT"; case OP_JLE: return "JLE"; case OP_JGE: return "JGE";
+    case OP_ADD2:  return "ADD2";
+    case OP_SUB2:  return "SUB2";
+    case OP_MUL2:  return "MUL2";
+    case OP_AND2:  return "AND2";
+    case OP_OR2:   return "OR2";
+    case OP_XOR2:  return "XOR2";
+    case OP_CMP2:  return "CMP2";
+    case OP_CMPU2: return "CMPU2";
     }
     return "?";
 }
@@ -912,6 +938,22 @@ static const char *to8_jump_prefix(to8_opcode op)
     }
 }
 
+static void op2_comment(char *out, size_t outsz, to8_opcode op2,
+                         const char *desc_a, const char *desc_b)
+{
+    switch (op2) {
+    case OP_ADD2:  snprintf(out, outsz, "R0 = %s + %s", desc_a, desc_b); return;
+    case OP_SUB2:  snprintf(out, outsz, "R0 = %s - %s", desc_a, desc_b); return;
+    case OP_MUL2:  snprintf(out, outsz, "R0 = %s * %s", desc_a, desc_b); return;
+    case OP_AND2:  snprintf(out, outsz, "R0 = %s & %s", desc_a, desc_b); return;
+    case OP_OR2:   snprintf(out, outsz, "R0 = %s | %s", desc_a, desc_b); return;
+    case OP_XOR2:  snprintf(out, outsz, "R0 = %s ^ %s", desc_a, desc_b); return;
+    case OP_CMP2:  snprintf(out, outsz, "R0 = sign(%s - %s)", desc_a, desc_b); return;
+    case OP_CMPU2: snprintf(out, outsz, "R0 = sign(%s -u %s)", desc_a, desc_b); return;
+    default:       snprintf(out, outsz, "%s , %s", desc_a, desc_b); return;
+    }
+}
+
 /* ===================================================================
  * Append helpers - plain, no fusion bookkeeping.
  * =================================================================== */
@@ -1061,6 +1103,26 @@ static int to8_get_arith_ops(int op, to8_opcode *slot_op, to8_opcode *imm_op)
     case TOK_UDIV: *slot_op = OP_DIV; *imm_op = OP_DIVi; return 0;
     case TOK_UMOD: *slot_op = OP_MOD; *imm_op = OP_MODi; return 0;
     default: return -1;
+    }
+}
+
+static to8_opcode to8_op2_variant(to8_opcode op1)
+{
+    switch (op1) {
+    case OP_ADD:  return OP_ADD2;
+    case OP_SUB:  return OP_SUB2;
+    case OP_MUL:  return OP_MUL2;
+    case OP_AND:  return OP_AND2;
+    case OP_OR:   return OP_OR2;
+    case OP_XOR:  return OP_XOR2;
+    case OP_CMP:  return OP_CMP2;
+    case OP_CMPU: return OP_CMPU2;
+    /* OP_DIV / OP_MOD deliberement exclus : la division a une
+     * semantique plus lourde (piege sur division par zero, quotient
+     * ET reste couples sur la future implementation 6809 reelle) -
+     * pas de gain net a fusionner ce cas, contrairement a une simple
+     * elimination de "LD mort". */
+    default: return OP_NOP;
     }
 }
 
@@ -1757,40 +1819,52 @@ static int to8_peephole_mov(void)
     return changed;
 }
 
-static int to8_peephole_dead_ld(void)
+static int to8_peephole_useless_ld(void)
 {
     int changed = 0;
     to8_line *cur = g_head;
-    int known_valid = 0, known_slot = 0;
-
+    int r0_holds_slot = -1;  /* -1 = unknown, >=0 = R0 holds that slot */
+    
     while (cur) {
         to8_line *nxt = cur->next;
-
+        
+        /* A jump target invalidates our knowledge */
         if (cur->is_target)
-            known_valid = 0;
-
-        if (cur->op == OP_LD && known_valid && !cur->is_target &&
-            cur->slot_a == known_slot) {
+            r0_holds_slot = -1;
+        
+        /* Check for useless LD */
+        if (cur->op == OP_LD && cur->kind == ARG_SLOT &&
+            r0_holds_slot >= 0 && cur->slot_a == r0_holds_slot) {
             to8_unlink(cur);
-            cur = nxt;
             changed = 1;
+            cur = nxt;
             continue;
         }
-
+        
+        /* Update tracking */
         switch (cur->op) {
         case OP_LD:
+            if (cur->kind == ARG_SLOT)
+                r0_holds_slot = cur->slot_a;
+            else
+                r0_holds_slot = -1;
+            break;
         case OP_ST:
-            known_valid = 1;
-            known_slot = cur->slot_a;
+            if (cur->kind == ARG_SLOT)
+                r0_holds_slot = cur->slot_a;
             break;
         case OP_MOV:
+            if (cur->kind == ARG_SLOT2 && cur->slot_a == r0_holds_slot)
+                r0_holds_slot = -1;
             break;
         default:
-            known_valid = 0;
+            r0_holds_slot = -1;
             break;
         }
+        
         cur = nxt;
     }
+    
     return changed;
 }
 
@@ -1898,6 +1972,73 @@ static int to8_peephole_commute(void)
     return changed;
 }
 
+/* ===================================================================
+ * v7.26.0: to8_peephole_op2() - fusionne "LD slotA ; OP slotB" en un
+ * seul "OP2 slotA,slotB" (R0 = slotA op slotB), en supprimant le LD.
+ *
+ * Justification: R0 est un accumulateur unique, sans autre lecteur
+ * entre deux instructions consecutives. Quand un simple "LD slotA"
+ * est immediatement suivi d'un "OP slotB" a un seul slot, la valeur
+ * que le LD vient d'ecrire dans R0 ne sert QU'A UNE SEULE CHOSE -
+ * etre l'operande gauche de ce OP - puis est immediatement ecrasee
+ * par le resultat. Ce LD est donc du pur gaspillage : une valeur est
+ * recopiee de la memoire vers R0 seulement pour etre relue l'instruction
+ * d'apres et aussitot detruite. OP2 permet au futur generateur 6809 reel
+ * de lire slotA directement dans le registre dont il a besoin, sans
+ * ce detour inutile par "R0 contient une copie de slotA".
+ *
+ * Securite: seul `nxt` (le OP) doit etre `!is_target`, PAS `cur` (le
+ * LD) - si l'execution saute directement sur `cur`, le LD s'execute
+ * puis on enchaine normalement sur le OP, comme avant fusion. Mais si
+ * un saut pouvait atterrir sur `nxt` (en sautant le LD), R0 contiendrait
+ * autre chose a cet instant, et fusionner substituerait silencieusement
+ * "slotA" comme s'il avait ete charge - donc `nxt` ne doit JAMAIS etre
+ * une cible de saut. C'est exactement le meme raisonnement que
+ * to8_peephole_ld_deref() (v7.24.0) plus haut.
+ *
+ * DIV/MOD sont exclus via to8_op2_variant() - voir son commentaire.
+ * =================================================================== */
+static int to8_peephole_op2(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+
+    while (cur) {
+        to8_line *nxt = cur->next;
+
+        if (cur->op == OP_LD && cur->kind == ARG_SLOT &&
+            nxt && !nxt->is_target && nxt->kind == ARG_SLOT &&
+            cur->push_depth == nxt->push_depth) {
+            to8_opcode op2 = to8_op2_variant(nxt->op);
+
+            if (op2 != OP_NOP) {
+                char desc_a[24], desc_b[24];
+                int slot_a = cur->slot_a;
+                int slot_b = nxt->slot_a;
+
+                /* on modifie `cur` en place (garde son id/position,
+                 * donc toute cible de saut existante reste valide) */
+                cur->op = op2;
+                cur->kind = ARG_SLOT2;
+                cur->slot_a = slot_a;
+                cur->slot_b = slot_b;
+
+                slot_desc(desc_a, sizeof desc_a, slot_a);
+                slot_desc(desc_b, sizeof desc_b, slot_b);
+                op2_comment(cur->comment, sizeof cur->comment, op2, desc_a, desc_b);
+                cur->has_comment = 1;
+
+                to8_unlink(nxt);
+                changed = 1;
+                cur = cur->next;
+                continue;
+            }
+        }
+        cur = nxt;
+    }
+    return changed;
+}
+
 static void to8_peephole_run(void)
 {
     int changed;
@@ -1910,9 +2051,10 @@ static void to8_peephole_run(void)
         changed = 0;
         changed |= to8_peephole_ext();
         changed |= to8_peephole_mov();
-        changed |= to8_peephole_dead_ld();
+        changed |= to8_peephole_useless_ld();
         changed |= to8_peephole_ld_deref();
         changed |= to8_peephole_commute();
+	changed |= to8_peephole_op2();      /* NEW v7.26.0 */
     } while (changed && ++guard < 256);
 }
 
