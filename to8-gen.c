@@ -1,65 +1,93 @@
 /*
  * TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.18.0 (FCB data dump, ADJi-0 dedup via to8_adjust, clean-up pass)
+ * Version: 7.19.0 (big-endian gen_le16/32 redirect, FCB block format,
+ *                   end-of-asm marker, debug trace for raw asm())
  * Changelog:
- * - v7.18.0: three cleanups on top of 7.17.0, all found while getting
- *   a real multi-function test file (raw asm() + string literal +
- *   putc/puts) to render correctly:
+ * - v7.19.0: three changes, none touching common tccgen.c code:
  *
- *   1) gfunc_epilog()'s frame-release ADJi is now emitted through
- *      to8_adjust(frame_size) instead of a hand-rolled to8_append().
- *      to8_adjust() already had a "does nothing when n==0" guard
- *      (needed for gfunc_call(), which is never actually called with
- *      n==0 in practice, but is a good defensive default) - routing
- *      the epilog through it means a frame_size of 0 (a function
- *      with no locals) no longer prints a useless "ADJi 0 ; sp += 0"
- *      line. One point of truth for "skip no-op stack adjustments"
- *      instead of duplicating the zero-check at every call site.
+ *   1) gen_le16(v)/gen_le32(v) are now MACROS, defined here in the
+ *      TARGET_DEFS_ONLY block (the ONLY part of this backend that
+ *      gets included BEFORE tccgen.c in the ONESOURCE build), that
+ *      redirect to gen_be16_impl()/gen_be32_impl() (to8-stubs.c).
+ *      TO8 (6809) is __BIG_ENDIAN__ (see target_machine_defs below),
+ *      but the original gen_le16/gen_le32 were copy-pasted from a
+ *      little-endian backend and wrote low-byte-first - exactly
+ *      backwards for any multi-byte value they encode on this
+ *      target. A macro defined THIS early rewrites every bare
+ *      gen_le16/gen_le32 call in tccgen.c (and anywhere else in the
+ *      single translation unit compiled afterwards) into a call to
+ *      the correctly-ordered implementation, without editing a
+ *      single line of common code. The two implementations are
+ *      forward-declared ST_FUNC right here too, so that when
+ *      to8-stubs.c later *defines* them (also ST_FUNC/static), there
+ *      is no "static declaration follows non-static declaration"
+ *      linkage clash - the exact bug that hit to8_flush_pending_data
+ *      earlier this session for the identical reason.
  *
- *   2) to8_flush_pending_data() (added to dump string literals/const
- *      data as FCB directives, see below) was silently producing NO
- *      output at all: out_char() -> g() (to8-stubs.c) has an early
- *      "if (nocode_wanted) return;" guard, and nocode_wanted is left
- *      set to DATA_ONLY_WANTED by gen_function() right after the
- *      LAST function in a translation unit finishes compiling - and
- *      stays that way through tcc_elf_end_file() and into
- *      tcc_gen_finish(), where this function is called. Fixed by
- *      saving/clearing/restoring nocode_wanted around the whole
- *      dump, the same way gfunc_prolog() clears it (to 0) before
- *      generating a function body.
+ *   2) to8_emit_raw_asm_n() now has a temporary stderr trace, to
+ *      pin down a still-open mystery: a function whose ENTIRE body
+ *      is a single asm("text"); statement (e.g. test_asm() in the
+ *      test file) never renders that text, while an otherwise
+ *      identical two-statement case (putc()) renders both of its
+ *      asm() lines correctly. No code path in this file (four
+ *      peephole passes, gfunc_prolog/epilog, to8_render_line) was
+ *      found that could explain a difference between those two
+ *      cases - the trace will show definitively whether
+ *      to8_emit_raw_asm_n() is even invoked for the "test" literal,
+ *      bisecting the bug into "never called" (upstream, in tccasm.c/
+ *      the parser) vs. "called but never rendered" (downstream,
+ *      still in this file). Remove once resolved.
  *
- *   3) to8_flush_pending_data(): confirmed and documented that
- *      `symtab_section` must be referenced BARE (no "s1->" prefix) -
- *      tcc.h #defines it as a convenience macro expanding to
- *      "tcc_state->symtab_section", so "s1->symtab_section" was
- *      literally expanding to "s1->tcc_state->symtab_section" (a
- *      member TCCState doesn't have). `s1->sections`/`s1->nb_sections`
- *      have no such macro and keep their explicit "s1->" prefix.
+ *   3) to8_flush_pending_data(): FCB bytes are now wrapped 8 per
+ *      line (readability, on request), a trailing
+ *      "; --- end of asm ---" marker is always emitted (purely to
+ *      make the boundary between our generated pseudo-asm listing
+ *      and the raw bytes of other ELF sections legible when scanning
+ *      the .o file with `strings` - it does NOT and cannot suppress
+ *      the real string-literal bytes that necessarily also exist,
+ *      unavoidably, in .data.ro), and `cur_text_section->data_offset`
+ *      is explicitly resynced to `ind` at the very end: g() advances
+ *      the global `ind` on every byte written but never touches
+ *      `sec->data_offset` itself, so without this line everything
+ *      written past the OLD data_offset was silently truncated at
+ *      final .o serialization - the exact "plus de FCB" bug from
+ *      earlier this session.
+ *
+ * - v7.18.0: three cleanups on top of 7.17.0:
+ *   1) gfunc_epilog()'s frame-release ADJi now goes through
+ *      to8_adjust(frame_size) (which already no-ops on n==0) instead
+ *      of a hand-rolled to8_append() - no more useless "ADJi 0" for
+ *      functions with no locals.
+ *   2) to8_flush_pending_data() added, dumping rodata/data section
+ *      contents as FCB directives; nocode_wanted (left at
+ *      DATA_ONLY_WANTED after the last function) is saved/cleared/
+ *      restored around it, since g() early-returns while it's set.
+ *   3) `symtab_section` must be referenced BARE (no "s1->" prefix) -
+ *      it's a tcc.h macro expanding to "tcc_state->symtab_section";
+ *      `s1->sections`/`s1->nb_sections` have no such macro.
+ *   Also: cur_text_section is stale/NULL by the time tcc_gen_finish()
+ *   runs (tcc_elf_end_file() already ran), so to8_flush_pending_data()
+ *   points it at `text_section` and resyncs `ind` to its
+ *   data_offset before writing anything.
  *
  * - v7.17.0: VLA support removed entirely, on top of the 7.16.0
  *   signed/unsigned sub-word load fix. gen_vla_alloc() now calls
- *   tcc_error() instead of emitting OP_ADJr (removed from the ISA,
- *   from to8_opcode_name() and from bare_comment()). This is fully
- *   compliant with C11, where VLAs are an optional feature (this
- *   backend now advertises __STDC_NO_VLA__ in target_machine_defs).
+ *   tcc_error() instead of emitting OP_ADJr (removed from the ISA).
+ *   This is fully compliant with C11, where VLAs are an optional
+ *   feature (this backend advertises __STDC_NO_VLA__).
  *   gen_vla_sp_save()/gen_vla_sp_restore() are KEPT as harmless
- *   stubs (see the comment right above their definitions below) -
- *   tccgen.c references them unconditionally at link time even
- *   though gen_vla_alloc() always rejects the VLA before they can
- *   do anything observable.
+ *   stubs - tccgen.c references them unconditionally at link time
+ *   even though gen_vla_alloc() always rejects the VLA first.
  *
  * - v7.16.0: fixed a real correctness bug found while testing
  *   tst_ext() (int f(char *a, unsigned short *b) { return *a + *b; }).
- *
  *   load() emitted OP_LD1/OP_LD2 for char/short lvalues but NEVER
  *   sign- or zero-extended the upper 24/16 bits of R0 afterwards.
- *   Fixed by following the RISC-V/ARM/MIPS convention: extension is
- *   baked into the load opcode itself, at zero extra cost:
+ *   Fixed by baking extension into the load opcode itself:
  *   - OP_LD1 / OP_LD2 / OP_LD1r / OP_LD2r = load + SIGN-extend.
  *   - OP_LDU1 / OP_LDU2 / OP_LDU1r / OP_LDU2r = load + ZERO-extend.
  *   - VT_BOOL always routes to the unsigned form (LDU1/LDU1r).
- *   - OP_LD4/OP_LD4r are untouched (already full register width).
  *
  * - v7.15.0 and earlier: see prior versions (float/double ISA split,
  *   raw inline-asm passthrough, etc.)
@@ -110,7 +138,8 @@
  * MNEMONIC<arg> ; <comment at fixed column>
  * then, once, at the very end (see to8_flush_pending_data()):
  * _symbol: ; N bytes (data)
- * FCB <byte>,<byte>,...
+ * FCB <byte>,<byte>,... (wrapped 8 per line)
+ * ; --- end of asm ---
  */
 
 #ifdef TARGET_DEFS_ONLY
@@ -146,6 +175,20 @@ enum {
 
 #define PROMOTE_RET
 
+/* v7.19.0: TO8 (6809) is __BIG_ENDIAN__. gen_le16/gen_le32 are
+ * called from common tccgen.c code assuming little-endian byte
+ * order; redirected here (the ONLY part of this backend included
+ * BEFORE tccgen.c in the ONESOURCE build) to big-endian-correct
+ * implementations, without touching a single line of common code.
+ * Forward-declared ST_FUNC here so the later ST_FUNC definitions in
+ * to8-stubs.c don't clash ("static declaration follows non-static
+ * declaration") with an implicit declaration created by tccgen.c's
+ * macro-expanded calls. */
+ST_FUNC void gen_be16_impl(int v);
+ST_FUNC void gen_be32_impl(int v);
+#define gen_le16(v) gen_be16_impl(v)
+#define gen_le32(v) gen_be32_impl(v)
+
 #else
 
 /* must be defined before gfunc_prolog/epilog call them */
@@ -154,13 +197,13 @@ ST_FUNC void gen_bounds_epilog(void) {}
 
 #define USING_GLOBALS
 #include "tcc.h"
-#define TO8_STACK_ALIGN 4
+#define  TO8_STACK_ALIGN 4
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-#define TO8_GEN_VERSION "7.18.0"
+#define TO8_GEN_VERSION "7.19.0"
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -609,6 +652,11 @@ ST_FUNC void to8_emit_raw_asm_n(const char *text, size_t len)
 {
     size_t cap = sizeof(((to8_line *)0)->rawtext) - 1;
     if (len > cap) len = cap;
+
+    /* v7.19.0: TEMPORARY debug trace - see changelog. Remove once the
+     * test_asm()-only-statement mystery is resolved. */
+    fprintf(stderr, "[DEBUG] to8_emit_raw_asm_n: func=%s g_in_function=%d len=%zu text=%.*s\n",
+            funcname ? funcname : "?", g_in_function, len, (int)len, text);
 
     if (g_in_function) {
         to8_line *ln = to8_append(OP_NOP);
@@ -2018,26 +2066,24 @@ ST_FUNC void gen_vla_sp_save(int addr) { e_op_slot(OP_ST, addr); }
 ST_FUNC void gen_vla_sp_restore(int addr) { e_op_slot(OP_LD, addr); }
 
 /* ===================================================================
- * v7.18.0: dump rodata/data section contents as readable FCB byte
- * directives into the SAME pseudo-asm text stream that already
+ * v7.18.0/7.19.0: dump rodata/data section contents as readable FCB
+ * byte directives into the SAME pseudo-asm text stream that already
  * carries the code. Without this, string literals and other
  * initialized globals exist only as raw binary bytes in a section
  * nobody prints - invisible in the listing, even though code refers
  * to them by symbol (e.g. LDi _L.3).
  *
  * Called once, at end-of-compilation, from tcc_gen_finish() (see the
- * #ifdef TCC_TARGET_TO8 hook that must be added there - see
- * to8-tccgen.patch / the integration notes for the exact one-line
- * forward declaration + call site).
+ * #ifdef TCC_TARGET_TO8 hook that must be added there - see the
+ * integration notes for the exact one-line forward declaration +
+ * call site).
  *
  * IMPORTANT: nocode_wanted is left set to DATA_ONLY_WANTED by
  * gen_function() right after the LAST function in the translation
  * unit finishes, and stays that way through tcc_elf_end_file() and
  * into tcc_gen_finish(). g() (to8-stubs.c) has an early
  * "if (nocode_wanted) return;" guard, so every out_char() call below
- * would silently no-op without the save/clear/restore dance here -
- * exactly like gfunc_prolog() clears nocode_wanted (to 0) before
- * generating a function body.
+ * would silently no-op without the save/clear/restore dance here.
  *
  * IMPORTANT: `symtab_section` must be referenced BARE, with no
  * "s1->" prefix - tcc.h #defines it as a convenience macro expanding
@@ -2045,16 +2091,28 @@ ST_FUNC void gen_vla_sp_restore(int addr) { e_op_slot(OP_LD, addr); }
  * expands to "s1->tcc_state->symtab_section" (TCCState has no
  * "tcc_state" member). `s1->sections`/`s1->nb_sections` have no such
  * macro and keep their explicit "s1->" prefix.
+ *
+ * IMPORTANT: cur_text_section is stale/NULL by the time this runs
+ * (tcc_elf_end_file() already ran) - point it at `text_section`
+ * (also bare, same macro convention) and resync `ind` to its
+ * data_offset before writing anything, or the writes land at the
+ * wrong offset and corrupt/overwrite earlier content.
+ *
+ * IMPORTANT: g() advances the global `ind` on every byte written but
+ * NEVER updates `sec->data_offset` itself. Without resyncing
+ * `cur_text_section->data_offset = ind;` at the very end, everything
+ * written here past the OLD data_offset is silently truncated at
+ * final .o serialization.
  * =================================================================== */
 
 ST_FUNC void to8_flush_pending_data(TCCState *s1)
 {
     int save_nocode_wanted = nocode_wanted;
-    Section *symtab = symtab_section; /* bare - macro déjà résolue */
+    Section *symtab = symtab_section; /* bare - macro already resolves to tcc_state->symtab_section */
     int nb_syms, i;
 
     nocode_wanted = 0;
-    cur_text_section = text_section;
+    cur_text_section = text_section; /* bare, same reasoning */
     ind = cur_text_section->data_offset;
 
     if (!symtab || !symtab->data) {
@@ -2070,11 +2128,11 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
 
         if (!sec || !sec->data || sec->data_offset == 0)
             continue;
-        if (sec->sh_type == SHT_NOBITS)
+        if (sec->sh_type == SHT_NOBITS)      /* .bss: no bytes to show */
             continue;
-        if (!(sec->sh_flags & SHF_ALLOC))
+        if (!(sec->sh_flags & SHF_ALLOC))    /* debug/symtab/etc: not runtime data */
             continue;
-        if (sec == cur_text_section)
+        if (sec == cur_text_section)         /* code: already rendered as pseudo-asm */
             continue;
 
         for (j = 1; j < nb_syms; j++) {
@@ -2116,30 +2174,20 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
         }
     }
 
-    /* v7.18.1: two related end-of-dump fixes.
-     *
-     * 1) Trailing "; --- end of asm ---" marker: purely cosmetic,
-     *    to distinguish (via `strings`) where our generated
-     *    pseudo-asm listing stops and where the raw bytes of other
-     *    ELF sections (rodata, symtab, etc.) begin. It does NOT
-     *    remove the duplication of string literals in .data.ro
-     *    (unavoidable - that's the real runtime storage), it just
-     *    makes the boundary readable.
-     *
-     * 2) cur_text_section->data_offset = ind: g() (to8-stubs.c)
-     *    advances the global `ind` on every byte written but NEVER
-     *    updates sec->data_offset. Without this line, everything
-     *    written above past the OLD data_offset is silently
-     *    truncated at final .o serialization - exactly the "plus de
-     *    FCB" bug: the text existed in memory but never made it
-     *    into the file written to disk.
-     */
-     if (!g_banner_done) { to8_print_banner(); g_banner_done = 1; }
+    /* Trailing marker: purely cosmetic, to distinguish (via `strings`)
+     * where our generated pseudo-asm listing stops and where the raw
+     * bytes of other ELF sections (rodata, symtab, etc.) begin. Does
+     * NOT remove the duplication of string literals in .data.ro
+     * (unavoidable - that's the real runtime storage), it just makes
+     * the boundary readable. Then resync data_offset (see the big
+     * comment above) so nothing written here gets truncated at final
+     * .o serialization. */
+    if (!g_banner_done) { to8_print_banner(); g_banner_done = 1; }
     g_col = 0;
     out_str("; --- end of asm ---");
     out_char('\n');
-    cur_text_section->data_offset = ind;
 
+    cur_text_section->data_offset = ind;
     nocode_wanted = save_nocode_wanted;
 }
 
