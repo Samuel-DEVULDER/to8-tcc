@@ -121,6 +121,7 @@ DEF-c67            = -DTCC_TARGET_C67 -w # disable warnigs
 DEF-x86_64-FreeBSD = $(DEF-x86_64) -DTARGETOS_FreeBSD
 DEF-x86_64-NetBSD  = $(DEF-x86_64) -DTARGETOS_NetBSD
 DEF-x86_64-OpenBSD = $(DEF-x86_64) -DTARGETOS_OpenBSD
+DEF-to8 = -DTCC_TARGET_TO8 -w # TO8 pseudo-architecture (single-register backend)
 
 ifeq ($(INCLUDED),no)
 # --------------------------------------------------------------------------
@@ -135,10 +136,12 @@ all: $(PROGS) $(TCCLIBS) $(TCCDOCS)
 # cross compiler targets to build
 TCC_X = i386 x86_64 i386-win32 x86_64-win32 x86_64-osx arm arm64 arm64-win32 arm-wince c67
 TCC_X += riscv64 arm64-osx
+TCC_X += to8
 # TCC_X += arm-fpa arm-fpa-ld arm-vfp arm-eabi
 
 # cross libtcc1.a targets to build
-LIBTCC1_X = $(filter-out c67,$(TCC_X))
+# c67 and to8 have no standard runtime support library
+LIBTCC1_X = $(filter-out c67 to8,$(TCC_X))
 
 PROGS_CROSS = $(foreach X,$(TCC_X),$X-tcc$(EXESUF))
 LIBTCC1_CROSS = $(foreach X,$(LIBTCC1_X),$X-libtcc1.a)
@@ -148,6 +151,9 @@ cross: $(LIBTCC1_CROSS) $(PROGS_CROSS)
 
 # build specific cross compiler & lib
 cross-%: %-tcc$(EXESUF) %-libtcc1.a ;
+
+# convenience: build only the TO8 cross compiler (no libtcc1)
+cross-to8: to8-tcc$(EXESUF) ;
 
 install: ; @$(MAKE) --no-print-directory  install$(CFG)
 install-strip: ; @$(MAKE) --no-print-directory  install$(CFG) CONFIG_strip=yes
@@ -217,6 +223,8 @@ arm64-osx_FILES = $(arm64_FILES) tccmacho.c
 arm64-win32_FILES = $(arm64_FILES) tccpe.c
 c67_FILES = $(CORE_FILES) c67-gen.c c67-link.c tcccoff.c
 riscv64_FILES = $(CORE_FILES) riscv64-gen.c riscv64-link.c riscv64-asm.c
+# TO8: pseudo single-register backend (like c67: gen only + shared core)
+to8_FILES = $(CORE_FILES) to8-gen.c to8-link.c to8-stubs.c
 
 TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
 
@@ -505,6 +513,8 @@ help:
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make cross"
 	@echo "   build all cross compilers"
+	@echo "make cross-to8"
+	@echo "   build only the TO8 cross compiler (no libtcc1)"
 	@echo "make test"
 	@echo "   run all tests"
 	@echo "make tests2.all / make tests2.37 / make tests2.37+"
