@@ -23,12 +23,10 @@ ST_FUNC void gen_le16(int v)
     g(v >> 8);
 }
 
-ST_FUNC void gen_le32(int c)
+ST_FUNC void gen_le32(int v)
 {
-    g(c);
-    g(c >> 8);
-    g(c >> 16);
-    g(c >> 24);
+    gen_le16(v);
+    gen_le16(v >> 16);
 }
 
 #ifdef CONFIG_TCC_ASM
@@ -38,17 +36,31 @@ ST_FUNC void gen_le32(int c)
  * into the pseudo-ASM output. No operands (":"), no constraints, no
  * clobbers, no GAS-style opcode parsing - just raw text passthrough.
  *
- * See the v7.23.0/v7.20.0/v7.18.0 changelog entries above for the
- * full history of why this needs the file->prev walk AND the
- * (pointer, length) dedup key.
+ * Technique: tcc_assemble_inline() (tccasm.c) opens a virtual ":asm:"
+ * pseudo-file and memcpy()s the exact literal text (unmodified, as
+ * long as there is no ":" operand list) into file->buffer BEFORE
+ * tokenizing it. By the time asm_opcode() is first called for that
+ * file, the lexer has already had to peek one char past the text to
+ * find the first token's boundary, which triggers handle_eob()
+ * (tccpp.c) and writes CH_EOB ('\0') right after the valid content -
+ * making file->buffer a properly NUL-terminated C string holding the
+ * ORIGINAL text, verbatim, before any tokenization or substitution.
  * =================================================================== */
-
-static const uint8_t *g_asm_dump_key;
-static size_t g_asm_dump_len;
-
 ST_FUNC void asm_opcode(TCCState *s1, int opcode)
 {
-	tcc_error("inline asm() not supported (yet)");
+    static void *last_file = NULL;
+    (void)s1;
+    (void)opcode;
+
+    if (file && file != last_file) {
+        last_file = file;
+        to8_emit_raw_asm((const char *)file->buffer);
+    }
+
+    /* consume the rest of this statement so tcc_assemble_internal's
+       "expect end of line" check right after this call succeeds */
+    while (tok != ';' && tok != TOK_LINEFEED && tok != CH_EOF)
+        next();
 }
 
 ST_FUNC void gen_expr32(ExprValue *pe)
@@ -63,19 +75,19 @@ ST_FUNC int asm_parse_regvar(int t)
 }
 
 ST_FUNC void asm_compute_constraints(ASMOperand *operands, int nb_operands,
-                                      int nb_outputs, const uint8_t *clobber_regs,
-                                      int *pout_reg)
+                                     int nb_outputs, const uint8_t *clobber_regs,
+                                     int *pout_reg)
 {
     (void)operands;
     (void)nb_operands;
     (void)nb_outputs;
     (void)clobber_regs;
     (void)pout_reg;
-    /* no operands handled: nothing to compute */
+    /* pas d'operandes geres : rien a calculer */
 }
 
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
-                           int is_output, uint8_t *clobber_regs, int out_reg)
+                          int is_output, uint8_t *clobber_regs, int out_reg)
 {
     (void)operands;
     (void)nb_operands;
@@ -83,7 +95,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
     (void)is_output;
     (void)clobber_regs;
     (void)out_reg;
-    /* the text was already emitted in asm_opcode() */
+    /* le texte a deja ete emis dans asm_opcode() */
 }
 
 ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
