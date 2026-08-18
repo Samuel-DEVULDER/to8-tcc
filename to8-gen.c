@@ -1,8 +1,44 @@
 /*
  * TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.15.0 (+ raw inline-asm passthrough patch, float/double ISA split)
+ * Version: 7.16.0 (+ signed/unsigned byte & halfword load split)
  * Changelog:
+ * - v7.16.0: fixed a real correctness bug found while testing
+ *   tst_ext() (int f(char *a, unsigned short *b) { return *a + *b; }).
+ *
+ *   load() emitted OP_LD1/OP_LD2 for char/short lvalues but NEVER
+ *   sign- or zero-extended the upper 24/16 bits of R0 afterwards.
+ *   OP_EXT1S/OP_EXT2S/OP_EXT1U/OP_EXT2U existed in the opcode enum,
+ *   but nothing in load() ever asked for them - the only place that
+ *   referenced them was to8_peephole_ext(), which can only FUSE an
+ *   existing "SHLi 24/16 ; SARi/SHRi 24/16" pattern into an EXT, it
+ *   can never CREATE that pattern from nothing. Since load() never
+ *   emitted that raw shift pair either, the whole EXT path was dead
+ *   code and the bug was present at -O0 *and* -O1+ alike.
+ *
+ *   Fixed by following the RISC-V/ARM/MIPS convention: extension is
+ *   now baked into the load opcode itself, at zero extra cost,
+ *   instead of a separate EXT instruction a caller could forget to
+ *   emit:
+ *     - OP_LD1 / OP_LD2 / OP_LD1r / OP_LD2r now mean "load + SIGN-
+ *       extend" (the signed case, matching plain OP_LD/OP_CMP being
+ *       the signed-by-default family).
+ *     - New OP_LDU1 / OP_LDU2 / OP_LDU1r / OP_LDU2r mean "load +
+ *       ZERO-extend" (unsigned case), mirroring the existing
+ *       OP_CMP / OP_CMPU pairing.
+ *     - VT_BOOL always routes to the unsigned form (LDU1/LDU1r),
+ *       regardless of plain-char signedness on the target: _Bool has
+ *       no signed variant in C, so there is nothing to consult
+ *       VT_UNSIGNED for.
+ *     - OP_LD4/OP_LD4r are untouched: a 4-byte load is already full
+ *       register width, there is nothing to extend.
+ *
+ *   to8_byte_suffix_ld()/to8_byte_suffix_ld_r() now take the operand's
+ *   signedness explicitly and resolve to the correct opcode in one
+ *   place; load() computes it once (sv->type.t & VT_UNSIGNED) and
+ *   every existing call site downstream is fixed automatically,
+ *   since they all just use the resolved `ldop` variable.
+ *
  * - v7.15.0: two related ISA cleanups, both from real bugs found while
  *   testing mandel() (float-only locals/params):
  *
@@ -104,13 +140,18 @@
  *   that follows just reads the sign of whatever is currently in R0.
  *
  * Naming convention:
- *   - "i" suffix  = opcode is FULLY resolved with NO extra runtime
+ *   - "i" suffix = opcode is FULLY resolved with NO extra runtime
  *     memory access: a plain immediate, a symbol's ADDRESS (LDi,
  *     JSRi), or a float/double VALUE baked directly into the
  *     instruction (LDFi, LDGi).
- *   - "r" suffix  = opcode takes NO ARGUMENT but reads/writes R0 as
+ *   - "r" suffix = opcode takes NO ARGUMENT but reads/writes R0 as
  *     the family's register-operand form (PUSHr, JSRr, ADJr, LD1r/
- *     LD2r/LD4r).
+ *     LDU1r/LD2r/LDU2r/LD4r).
+ *   - "U" prefix-less vs "U"-suffixed pair (integer family only) =
+ *     signed vs unsigned. Applies to compares (CMP vs CMPU, CMPi vs
+ *     CMPUi) AND, since v7.16.0, to sub-word loads (LD1 vs LDU1,
+ *     LD2 vs LDU2, LD1r vs LDU1r, LD2r vs LDU2r): the "U" form
+ *     zero-extends into R0, the plain form sign-extends.
  *   - "F"/"G" suffix (float family only) = operates on a 4-byte
  *     float slot (F) or an 8-byte double slot (G). Applies to the
  *     own-slot load/store (LDF/STF vs LDG/STG), the arithmetic family
@@ -127,13 +168,13 @@
  *
  * Output format (once per compiled file):
  *   ; TO8 backend <version>
- *   ; out: <outfile>  src: <filename>
- *   ; cmd: <argv...>  (only if argc/argv are non-empty)
- * then, per function:
- *   _funcname:                ; N instr (peephole made no change)
- *   _funcname:                ; N instr (opt. M) (peephole reduced N to M)
+ *   ; out: <outfile> src: <srcfile>
+ *   ; cmd: <argv...> (only if argc/argv are non-empty)
+ *   then, per function:
+ *   _funcname: ; N instr (peephole made no change)
+ *   _funcname: ; N instr (M before -O) (peephole reduced M to N)
  *   @lN:
- *       MNEMONIC<tab>args<tab>; comment (comment always at a fixed column)
+ *   MNEMONIC<tab>args<tab>; comment (comment always at a fixed column)
  */
 
 #ifdef TARGET_DEFS_ONLY
@@ -142,12 +183,12 @@
 #define NB_ASM_REGS 0
 #define CONFIG_TCC_ASM
 
-#define RC_R0    0x0001
-#define RC_R1    0x0002
+#define RC_R0 0x0001
+#define RC_R1 0x0002
 #define RC_FLOAT 0x0004
-#define RC_INT   (RC_R0 | RC_R1)
-#define RC_IRET  RC_R0
-#define RC_FRET  RC_FLOAT
+#define RC_INT (RC_R0 | RC_R1)
+#define RC_IRET RC_R0
+#define RC_FRET RC_FLOAT
 
 enum {
     TREG_R0 = 0,
@@ -183,7 +224,7 @@ ST_FUNC void gen_bounds_epilog(void) {}
 #include <ctype.h>
 #include <string.h>
 
-#define TO8_GEN_VERSION "7.15.0"
+#define TO8_GEN_VERSION "7.16.0"
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -207,118 +248,122 @@ ST_DATA const int reg_classes[NB_REGS] = {
  * =================================================================== */
 
 typedef enum {
-    OP_NOP,      /* no-op */
-    OP_RET,      /* return from the current function */
-    OP_ADJi,     /* SP -= n if n<0 (allocate), SP += n if n>=0 (release) */
-    OP_ADJr,     /* SP -= R0 (always allocates - the VLA case). */
+    OP_NOP,   /* no-op */
+    OP_RET,   /* return from the current function */
+    OP_ADJi,  /* SP -= n if n<0 (allocate), SP += n if n>=0 (release) */
+    OP_ADJr,  /* SP -= R0 (always allocates - the VLA case). */
 
-    OP_LD,       /* R0 = slot (4-byte load) */
-    OP_ST,       /* slot = R0 (4-byte store) */
-    OP_LEA,      /* R0 = address of slot */
-    OP_LD1,      /* R0 = *(char*)slot (byte-sized memory load via pointer in slot) */
-    OP_LD2,      /* R0 = *(short*)slot (halfword-sized memory load) */
-    OP_LD4,      /* R0 = *(int*)slot (word-sized memory load) */
-    OP_LD1r,     /* R0 = *(char*)R0 - dereference the pointer ALREADY in R0 */
-    OP_LD2r,     /* R0 = *(short*)R0 */
-    OP_LD4r,     /* R0 = *(int*)R0 */
-    OP_ST1,      /* *(char*)slot = R0 (byte-sized memory store via pointer in slot) */
-    OP_ST2,      /* *(short*)slot = R0 (halfword-sized memory store) */
-    OP_ST4,      /* *(int*)slot = R0 (word-sized memory store) */
+    OP_LD,    /* R0 = slot (4-byte load) */
+    OP_ST,    /* slot = R0 (4-byte store) */
+    OP_LEA,   /* R0 = address of slot */
+    OP_LD1,   /* R0 = (int)(signed char)*(char*)slot   - byte load, SIGN-extend */
+    OP_LDU1,  /* R0 = (int)(unsigned char)*(char*)slot - byte load, ZERO-extend */
+    OP_LD2,   /* R0 = (int)(signed short)*(short*)slot   - halfword load, SIGN-extend */
+    OP_LDU2,  /* R0 = (int)(unsigned short)*(short*)slot - halfword load, ZERO-extend */
+    OP_LD4,   /* R0 = *(int*)slot (word-sized memory load; already full width) */
+    OP_LD1r,  /* R0 = (int)(signed char)*(char*)R0   - dereference pointer ALREADY in R0, SIGN-extend */
+    OP_LDU1r, /* R0 = (int)(unsigned char)*(char*)R0 - dereference pointer ALREADY in R0, ZERO-extend */
+    OP_LD2r,  /* R0 = (int)(signed short)*(short*)R0   - dereference, SIGN-extend */
+    OP_LDU2r, /* R0 = (int)(unsigned short)*(short*)R0 - dereference, ZERO-extend */
+    OP_LD4r,  /* R0 = *(int*)R0 */
+    OP_ST1,   /* *(char*)slot = R0 (byte-sized memory store via pointer in slot) */
+    OP_ST2,   /* *(short*)slot = R0 (halfword-sized memory store) */
+    OP_ST4,   /* *(int*)slot = R0 (word-sized memory store) */
 
-    OP_LDi,      /* R0 = immediate, OR R0 = address of a global symbol
-                    (a compile/link-time-known value either way). */
+    OP_LDi,   /* R0 = immediate, OR R0 = address of a global symbol
+                 (a compile/link-time-known value either way). */
 
-    OP_ADD,      /* R0 += slot */
-    OP_SUB,      /* R0 -= slot */
-    OP_AND,      /* R0 &= slot */
-    OP_OR,       /* R0 |= slot */
-    OP_XOR,      /* R0 ^= slot */
-    OP_MUL,      /* R0 *= slot */
-    OP_DIV,      /* R0 /= slot */
-    OP_MOD,      /* R0 %= slot */
-    OP_SHL,      /* R0 <<= slot */
-    OP_SHR,      /* R0 >>= slot (logical/unsigned) */
-    OP_SAR,      /* R0 >>= slot (arithmetic/signed) */
-    OP_CMP,      /* R0 = sign(R0 - slot), SIGNED subtraction. */
-    OP_CMPU,     /* R0 = sign(R0 -u slot), UNSIGNED subtraction. */
+    OP_ADD,   /* R0 += slot */
+    OP_SUB,   /* R0 -= slot */
+    OP_AND,   /* R0 &= slot */
+    OP_OR,    /* R0 |= slot */
+    OP_XOR,   /* R0 ^= slot */
+    OP_MUL,   /* R0 *= slot */
+    OP_DIV,   /* R0 /= slot */
+    OP_MOD,   /* R0 %= slot */
+    OP_SHL,   /* R0 <<= slot */
+    OP_SHR,   /* R0 >>= slot (logical/unsigned) */
+    OP_SAR,   /* R0 >>= slot (arithmetic/signed) */
+    OP_CMP,   /* R0 = sign(R0 - slot), SIGNED subtraction. */
+    OP_CMPU,  /* R0 = sign(R0 -u slot), UNSIGNED subtraction. */
 
-    OP_ADDi,     /* R0 += immediate */
-    OP_SUBi,     /* R0 -= immediate */
-    OP_ANDi,     /* R0 &= immediate */
-    OP_ORi,      /* R0 |= immediate */
-    OP_XORi,     /* R0 ^= immediate */
-    OP_MULi,     /* R0 *= immediate */
-    OP_DIVi,     /* R0 /= immediate */
-    OP_MODi,     /* R0 %= immediate */
-    OP_SHLi,     /* R0 <<= immediate */
-    OP_SHRi,     /* R0 >>= immediate (logical/unsigned) */
-    OP_SARi,     /* R0 >>= immediate (arithmetic/signed) */
-    OP_CMPi,     /* R0 = sign(R0 - immediate), SIGNED */
-    OP_CMPUi,    /* R0 = sign(R0 -u immediate), UNSIGNED */
+    OP_ADDi,  /* R0 += immediate */
+    OP_SUBi,  /* R0 -= immediate */
+    OP_ANDi,  /* R0 &= immediate */
+    OP_ORi,   /* R0 |= immediate */
+    OP_XORi,  /* R0 ^= immediate */
+    OP_MULi,  /* R0 *= immediate */
+    OP_DIVi,  /* R0 /= immediate */
+    OP_MODi,  /* R0 %= immediate */
+    OP_SHLi,  /* R0 <<= immediate */
+    OP_SHRi,  /* R0 >>= immediate (logical/unsigned) */
+    OP_SARi,  /* R0 >>= immediate (arithmetic/signed) */
+    OP_CMPi,  /* R0 = sign(R0 - immediate), SIGNED */
+    OP_CMPUi, /* R0 = sign(R0 -u immediate), UNSIGNED */
 
-    OP_SEQ,      /* R0 = (R0 == 0) ? 1 : 0 */
-    OP_SNE,      /* R0 = (R0 != 0) ? 1 : 0 */
-    OP_SLT,      /* R0 = (R0 < 0)  ? 1 : 0 */
-    OP_SGT,      /* R0 = (R0 > 0)  ? 1 : 0 */
-    OP_SLE,      /* R0 = (R0 <= 0) ? 1 : 0 */
-    OP_SGE,      /* R0 = (R0 >= 0) ? 1 : 0 */
-    OP_SNZ,      /* R0 = (R0 != 0) ? 1 : 0 (used when no dedicated S.. fits) */
+    OP_SEQ,   /* R0 = (R0 == 0) ? 1 : 0 */
+    OP_SNE,   /* R0 = (R0 != 0) ? 1 : 0 */
+    OP_SLT,   /* R0 = (R0 < 0) ? 1 : 0 */
+    OP_SGT,   /* R0 = (R0 > 0) ? 1 : 0 */
+    OP_SLE,   /* R0 = (R0 <= 0) ? 1 : 0 */
+    OP_SGE,   /* R0 = (R0 >= 0) ? 1 : 0 */
+    OP_SNZ,   /* R0 = (R0 != 0) ? 1 : 0 (used when no dedicated S.. fits) */
 
-    OP_MOV,      /* dst_slot = src_slot, WITHOUT touching R0 - fusion of LD+ST */
+    OP_MOV,   /* dst_slot = src_slot, WITHOUT touching R0 - fusion of LD+ST */
 
-    OP_EXT1S,    /* R0 = (int)(signed char)R0 */
-    OP_EXT2S,    /* R0 = (int)(signed short)R0 */
-    OP_EXT1U,    /* R0 = (int)(unsigned char)R0 */
-    OP_EXT2U,    /* R0 = (int)(unsigned short)R0 */
+    OP_EXT1S, /* R0 = (int)(signed char)R0 */
+    OP_EXT2S, /* R0 = (int)(signed short)R0 */
+    OP_EXT1U, /* R0 = (int)(unsigned char)R0 */
+    OP_EXT2U, /* R0 = (int)(unsigned short)R0 */
 
-    OP_ITOF,     /* F0 = (float/double)R0 */
-    OP_FTOI,     /* R0 = (int)F0 */
+    OP_ITOF,  /* F0 = (float/double)R0 */
+    OP_FTOI,  /* R0 = (int)F0 */
 
-    OP_LDF,      /* F0 = slot (own-slot value, as float, 4 bytes) */
-    OP_LDG,      /* F0 = slot (own-slot value, as double, 8 bytes) */
-    OP_STF,      /* slot = F0 (own-slot value, as float) */
-    OP_STG,      /* slot = F0 (own-slot value, as double) */
-    OP_LDF4,     /* F0 = *(float*)slot-or-symbol - dereference a
-                    slot-held pointer, OR read a REAL (possibly
-                    mutable) global float variable by symbol. */
-    OP_LDF8,     /* F0 = *(double*)slot-or-symbol */
-    OP_STF4,     /* *(float*)slot-or-symbol = F0 */
-    OP_STF8,     /* *(double*)slot-or-symbol = F0 */
-    OP_LDFi,     /* F0 = <literal float>, baked directly into the
-                    instruction - no memory access at all. Only used
-                    for compiler-generated anonymous constants that
-                    can never change. */
-    OP_LDGi,     /* F0 = <literal double>, same idea. */
+    OP_LDF,   /* F0 = slot (own-slot value, as float, 4 bytes) */
+    OP_LDG,   /* F0 = slot (own-slot value, as double, 8 bytes) */
+    OP_STF,   /* slot = F0 (own-slot value, as float) */
+    OP_STG,   /* slot = F0 (own-slot value, as double) */
+    OP_LDF4,  /* F0 = *(float*)slot-or-symbol - dereference a
+                 slot-held pointer, OR read a REAL (possibly
+                 mutable) global float variable by symbol. */
+    OP_LDF8,  /* F0 = *(double*)slot-or-symbol */
+    OP_STF4,  /* *(float*)slot-or-symbol = F0 */
+    OP_STF8,  /* *(double*)slot-or-symbol = F0 */
+    OP_LDFi,  /* F0 = <float literal>, baked directly into the
+                 instruction - no memory access at all. Only used
+                 for compiler-generated anonymous constants that
+                 can never change. */
+    OP_LDGi,  /* F0 = <double literal>, same idea. */
 
-    OP_CMPF,     /* R0 = sign(F0 - slot), comparing as FLOAT (4-byte
-                    slot). Consumed by the SAME SEQ/SNE/SLT/SGT/SLE/
-                    SGE and JEQ/JNE/... families integers use. */
-    OP_CMPG,     /* R0 = sign(F0 - slot), comparing as DOUBLE (8-byte
-                    slot). */
-    OP_ADDF,     /* F0 += slot (as float, 4-byte slot) */
-    OP_SUBF,     /* F0 -= slot (as float) */
-    OP_MULF,     /* F0 *= slot (as float) */
-    OP_DIVF,     /* F0 /= slot (as float) */
-    OP_ADDG,     /* F0 += slot (as double, 8-byte slot) */
-    OP_SUBG,     /* F0 -= slot (as double) */
-    OP_MULG,     /* F0 *= slot (as double) */
-    OP_DIVG,     /* F0 /= slot (as double) */
+    OP_CMPF,  /* R0 = sign(F0 - slot), comparing as FLOAT (4-byte
+                 slot). Consumed by the SAME SEQ/SNE/SLT/SGT/SLE/
+                 SGE and JEQ/JNE/... families integers use. */
+    OP_CMPG,  /* R0 = sign(F0 - slot), comparing as DOUBLE (8-byte
+                 slot). */
+    OP_ADDF,  /* F0 += slot (as float, 4-byte slot) */
+    OP_SUBF,  /* F0 -= slot (as float) */
+    OP_MULF,  /* F0 *= slot (as float) */
+    OP_DIVF,  /* F0 /= slot (as float) */
+    OP_ADDG,  /* F0 += slot (as double, 8-byte slot) */
+    OP_SUBG,  /* F0 -= slot (as double) */
+    OP_MULG,  /* F0 *= slot (as double) */
+    OP_DIVG,  /* F0 /= slot (as double) */
 
-    OP_PUSH,     /* push slot's value onto the call-argument stack */
-    OP_PUSHi,    /* push an immediate onto the call-argument stack */
-    OP_PUSHr,    /* push R0 onto the call-argument stack */
+    OP_PUSH,  /* push slot's value onto the call-argument stack */
+    OP_PUSHi, /* push an immediate onto the call-argument stack */
+    OP_PUSHr, /* push R0 onto the call-argument stack */
 
-    OP_JSR,      /* call the function pointer held in slot */
-    OP_JSRi,     /* call the function named by symbol */
-    OP_JSRr,     /* call the function pointer held in R0 */
+    OP_JSR,   /* call the function pointer held in slot */
+    OP_JSRi,  /* call the function named by symbol */
+    OP_JSRr,  /* call the function pointer held in R0 */
 
-    OP_JMP,      /* unconditional: goto target */
-    OP_JEQ,      /* if (R0 == 0) goto target */
-    OP_JNE,      /* if (R0 != 0) goto target */
-    OP_JLT,      /* if (R0 < 0)  goto target */
-    OP_JGT,      /* if (R0 > 0)  goto target */
-    OP_JLE,      /* if (R0 <= 0) goto target */
-    OP_JGE,      /* if (R0 >= 0) goto target */
+    OP_JMP,   /* unconditional: goto target */
+    OP_JEQ,   /* if (R0 == 0) goto target */
+    OP_JNE,   /* if (R0 != 0) goto target */
+    OP_JLT,   /* if (R0 < 0) goto target */
+    OP_JGT,   /* if (R0 > 0) goto target */
+    OP_JLE,   /* if (R0 <= 0) goto target */
+    OP_JGE,   /* if (R0 >= 0) goto target */
 } to8_opcode;
 
 static const char *to8_opcode_name(to8_opcode op)
@@ -327,8 +372,12 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_NOP: return "NOP"; case OP_RET: return "RET";
     case OP_ADJi: return "ADJi"; case OP_ADJr: return "ADJr";
     case OP_LD: return "LD"; case OP_ST: return "ST"; case OP_LEA: return "LEA";
-    case OP_LD1: return "LD1"; case OP_LD2: return "LD2"; case OP_LD4: return "LD4";
-    case OP_LD1r: return "LD1r"; case OP_LD2r: return "LD2r"; case OP_LD4r: return "LD4r";
+    case OP_LD1: return "LD1"; case OP_LDU1: return "LDU1";
+    case OP_LD2: return "LD2"; case OP_LDU2: return "LDU2";
+    case OP_LD4: return "LD4";
+    case OP_LD1r: return "LD1r"; case OP_LDU1r: return "LDU1r";
+    case OP_LD2r: return "LD2r"; case OP_LDU2r: return "LDU2r";
+    case OP_LD4r: return "LD4r";
     case OP_ST1: return "ST1"; case OP_ST2: return "ST2"; case OP_ST4: return "ST4";
     case OP_LDi: return "LDi";
     case OP_ADD: return "ADD"; case OP_SUB: return "SUB"; case OP_AND: return "AND";
@@ -663,8 +712,10 @@ static void slot_desc(char *out, size_t outsz, int slot)
 static const char *to8_size_name(to8_opcode op)
 {
     switch (op) {
-    case OP_LD1: case OP_ST1: return "char";
-    case OP_LD2: case OP_ST2: return "short";
+    case OP_LD1: case OP_ST1: return "signed char";
+    case OP_LDU1:              return "unsigned char";
+    case OP_LD2: case OP_ST2: return "signed short";
+    case OP_LDU2:              return "unsigned short";
     default: return "int";
     }
 }
@@ -704,7 +755,7 @@ static void slot_comment(char *out, size_t outsz, to8_opcode op, const char *des
     case OP_LDF4: case OP_LDF8: snprintf(out, outsz, "F0 = *%s", desc); return;
     case OP_PUSH: snprintf(out, outsz, "push %s", desc); return;
     case OP_JSR: snprintf(out, outsz, "call *%s", desc); return;
-    case OP_LD1: case OP_LD2: case OP_LD4:
+    case OP_LD1: case OP_LDU1: case OP_LD2: case OP_LDU2: case OP_LD4:
         snprintf(out, outsz, "R0 = *(%s*)%s", to8_size_name(op), desc); return;
     case OP_ST1: case OP_ST2: case OP_ST4:
         snprintf(out, outsz, "*(%s*)%s = R0", to8_size_name(op), desc); return;
@@ -755,8 +806,10 @@ static const char *bare_comment(to8_opcode op)
     case OP_ADJr: return "sp -= R0 (VLA alloc)";
     case OP_PUSHr: return "push R0";
     case OP_JSRr: return "call *R0";
-    case OP_LD1r: return "R0 = *(char*)R0";
-    case OP_LD2r: return "R0 = *(short*)R0";
+    case OP_LD1r: return "R0 = (int)(signed char)*(char*)R0";
+    case OP_LDU1r: return "R0 = (int)(unsigned char)*(char*)R0";
+    case OP_LD2r: return "R0 = (int)(signed short)*(short*)R0";
+    case OP_LDU2r: return "R0 = (int)(unsigned short)*(short*)R0";
     case OP_LD4r: return "R0 = *(int*)R0";
     case OP_ITOF: return "R0 -> F0 (int to float)";
     case OP_FTOI: return "F0 -> R0 (float to int)";
@@ -972,20 +1025,28 @@ static int to8_swap_cmp_op(int op)
     }
 }
 
-static to8_opcode to8_byte_suffix_ld(int bt)
+/* v7.16.0: now takes the operand's signedness explicitly instead of
+ * only its base type. VT_BOOL is special-cased: a _Bool has no signed
+ * variant in C, so it always routes to the unsigned (zero-extending)
+ * form regardless of what VT_UNSIGNED happens to say. */
+static to8_opcode to8_byte_suffix_ld(int bt, int is_unsigned)
 {
-    if (bt == VT_BYTE || bt == VT_BOOL) return OP_LD1;
-    if (bt == VT_SHORT) return OP_LD2;
+    if (bt == VT_BOOL) return OP_LDU1;
+    if (bt == VT_BYTE) return is_unsigned ? OP_LDU1 : OP_LD1;
+    if (bt == VT_SHORT) return is_unsigned ? OP_LDU2 : OP_LD2;
     return OP_LD4;
 }
 
-static to8_opcode to8_byte_suffix_ld_r(int bt)
+static to8_opcode to8_byte_suffix_ld_r(int bt, int is_unsigned)
 {
-    if (bt == VT_BYTE || bt == VT_BOOL) return OP_LD1r;
-    if (bt == VT_SHORT) return OP_LD2r;
+    if (bt == VT_BOOL) return OP_LDU1r;
+    if (bt == VT_BYTE) return is_unsigned ? OP_LDU1r : OP_LD1r;
+    if (bt == VT_SHORT) return is_unsigned ? OP_LDU2r : OP_LD2r;
     return OP_LD4r;
 }
 
+/* Stores never need a signedness argument: truncation on write does
+ * not care about sign, so this one is unchanged. */
 static to8_opcode to8_byte_suffix_st(int bt)
 {
     if (bt == VT_BYTE || bt == VT_BOOL) return OP_ST1;
@@ -1046,6 +1107,7 @@ static int to8_try_read_float_const(Sym *sym, int bt, double *out_val)
 void load(int r, SValue *sv)
 {
     int v, ft, fc, bt;
+    int is_unsigned;
     int save_slot;
     to8_opcode ldop;
 
@@ -1054,7 +1116,13 @@ void load(int r, SValue *sv)
     v = sv->r & VT_VALMASK;
     ft &= ~(VT_VOLATILE | VT_CONSTANT);
     bt = ft & VT_BTYPE;
-    ldop = to8_byte_suffix_ld(bt);
+    /* v7.16.0: resolve signed vs unsigned ONCE, right here, and let
+       `ldop` carry the answer to every branch below - this is the
+       single point of correction for the missing sign/zero-extension
+       bug (see changelog). No call site past this point needs to
+       change: they were already just using `ldop`. */
+    is_unsigned = (sv->type.t & VT_UNSIGNED) != 0;
+    ldop = to8_byte_suffix_ld(bt, is_unsigned);
 
     if (r == TREG_F0) {
         if (bt == VT_FLOAT || bt == VT_DOUBLE) {
@@ -1117,7 +1185,7 @@ void load(int r, SValue *sv)
         } else if (v == TREG_R0) {
             /* Pointer already sitting in R0: dereference directly,
                no temp-slot spill needed. */
-            e_op(to8_byte_suffix_ld_r(bt));
+            e_op(to8_byte_suffix_ld_r(bt, is_unsigned));
         } else if (v < VT_CONST) {
             int temp;
             int from_pool = (v != TREG_R1);
@@ -1405,15 +1473,7 @@ void gen_opi(int op)
  * (bt = vtop->type.t & VT_BTYPE, VT_FLOAT or VT_DOUBLE) and threads
  * that choice through EVERY path below - the comparison spill, the
  * "commutative and already sitting in a LOCAL/LLOCAL slot" fast
- * path, and the general spill-and-reload path. Previously every one
- * of these paths was hardcoded to the 8-byte double family (OP_STG/
- * OP_LDG/OP_FCMP/OP_FADD/...), so a genuine 4-byte `float` operand's
- * OWN slot (only ever written 4 bytes wide via OP_STF/OP_LDF) got
- * read back as if it held 8 valid bytes - silently reading 4 bytes
- * of unrelated adjacent stack memory. That is exactly the bug seen
- * in mandel()'s "x*x": LDF (correct, float) followed by STG (wrong,
- * double) into a slot about to be read back by the old always-double
- * FMUL.
+ * path, and the general spill-and-reload path.
  * =================================================================== */
 
 void gen_opf(int op)
@@ -1474,11 +1534,11 @@ void gen_opf(int op)
                 to8_temp_free(temp, tsize, 4);
             }
         }
-    }
 
-    vtop--;
-    vtop->r = TREG_F0;
-    vtop->r2 = VT_CONST;
+        vtop--;
+        vtop->r = TREG_F0;
+        vtop->r2 = VT_CONST;
+    }
 }
 
 /* ===================================================================
@@ -1494,7 +1554,7 @@ void gen_cvt_ftof(int t) { /* precision change placeholder */ }
  * =================================================================== */
 
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret,
-                        int *ret_align, int *regsize)
+                       int *ret_align, int *regsize)
 {
     int size, align;
     *ret_align = TO8_STACK_ALIGN;
@@ -1545,7 +1605,6 @@ void gfunc_call(int nb_args)
         size = nb_args * PTR_SIZE;
         to8_adjust(size);
     }
-
     vtop -= nb_args + 1;
 }
 
@@ -1554,6 +1613,13 @@ void gfunc_call(int nb_args)
  * finished list, and ONLY when the user opted in via -O1 or higher.
  * Each pass returns 1 if it changed the list, 0 otherwise; the driver
  * loop re-runs all three until a full round changes nothing.
+ *
+ * v7.16.0 note: to8_peephole_ext() can no longer be reached by any
+ * pattern this backend actually emits, since load() now bakes the
+ * sign/zero-extension directly into the LD1/LDU1/LD2/LDU2 opcode
+ * choice - it never emits the raw "SHLi ; SARi/SHRi" pair this pass
+ * looks for. Left in place as a harmless no-op safety net (e.g. for
+ * a future hand-written inline-asm producer of that raw pattern).
  * =================================================================== */
 
 static int to8_peephole_ext(void)
@@ -1574,10 +1640,12 @@ static int to8_peephole_ext(void)
             to8_line *scan_from;
             ext->op = rep;
             ext->kind = ARG_NONE;
+
             {
                 const char *c = bare_comment(rep);
                 if (c) { snprintf(ext->comment, sizeof ext->comment, "%s", c); ext->has_comment = 1; }
             }
+
             to8_insert_after(cur, ext);
             to8_unlink(cur);
             to8_unlink(nxt);
@@ -1666,7 +1734,6 @@ static int to8_peephole_dead_ld(void)
             known_valid = 0;
             break;
         }
-
         cur = nxt;
     }
     return changed;
@@ -1680,10 +1747,14 @@ static int to8_peephole_ld_deref(void)
         to8_line *nxt = cur->next;
         if (cur->op == OP_LD && !cur->is_target &&
             nxt && !nxt->is_target &&
-            (nxt->op == OP_LD1r || nxt->op == OP_LD2r || nxt->op == OP_LD4r) &&
+            (nxt->op == OP_LD1r || nxt->op == OP_LDU1r ||
+             nxt->op == OP_LD2r || nxt->op == OP_LDU2r ||
+             nxt->op == OP_LD4r) &&
             cur->push_depth == nxt->push_depth) {
             to8_opcode rep = (nxt->op == OP_LD1r) ? OP_LD1
+                            : (nxt->op == OP_LDU1r) ? OP_LDU1
                             : (nxt->op == OP_LD2r) ? OP_LD2
+                            : (nxt->op == OP_LDU2r) ? OP_LDU2
                             : OP_LD4;
             char desc[24];
 
