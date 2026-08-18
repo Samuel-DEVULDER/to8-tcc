@@ -1,110 +1,129 @@
 /*
  * TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.14.2 (+ raw inline-asm passthrough patch)
+ * Version: 7.15.0 (+ raw inline-asm passthrough patch, float/double ISA split)
  * Changelog:
+ * - v7.15.0: two related ISA cleanups, both from real bugs found while
+ *   testing mandel() (float-only locals/params):
+ *
+ *   1) OP_FADD/OP_FSUB/OP_FMUL/OP_FDIV were HARDCODED to treat their
+ *      slot operand as an 8-byte double, no matter what. gen_opf()'s
+ *      "commutative && operand is LOCAL/LLOCAL" fast path did
+ *      e_op_slot(fop, fc1) directly against the operand's OWN slot -
+ *      but for a genuine `float` local, that own slot is only 4 bytes
+ *      wide (written via OP_STF/OP_LDF). Reading it as a double via
+ *      the old FMUL/FADD meant reading 4 valid bytes of the float
+ *      plus 4 bytes of UNRELATED adjacent stack memory - exactly the
+ *      bug spotted in mandel()'s "x*x": LDF (float, correct) followed
+ *      by STG (double!) into a slot that was about to be read back by
+ *      FMUL, silently corrupting/misinterpreting the value.
+ *
+ *      Fixed by splitting each arithmetic opcode into a real float/
+ *      double PAIR, mirroring the LDF/LDG own-slot naming already in
+ *      place since v7.14.1: OP_FADD -> OP_ADDF (4-byte float slot) +
+ *      OP_ADDG (8-byte double slot), same for SUB/MUL/DIV, and for
+ *      the comparison opcode: OP_FCMP -> OP_CMPF + OP_CMPG (the old
+ *      code ALSO always spilled through OP_STG/OP_LDG for comparisons,
+ *      same bug). gen_opf() now inspects vtop->type.t & VT_BTYPE once
+ *      and picks the width-matched opcode + temp size (4 vs 8) for
+ *      EVERY path - the fast path, the spill path, and comparisons.
+ *
+ *   2) OP_LDF4i / OP_LDF8i renamed to OP_LDFi / OP_LDGi. These are
+ *      IMMEDIATE float/double literals baked directly into the
+ *      instruction - no pointer, no dereference, so the "4"/"8" byte-
+ *      size suffix was pure noise once "F" and "G" already mean
+ *      float(4)/double(8) on their own (matching LDF/LDG/STF/STG).
+ *      The "4"/"8" suffix is now used for EXACTLY ONE thing:
+ *      OP_LDF4/OP_LDF8/OP_STF4/OP_STF8, the DEREFERENCE family (a
+ *      slot-held pointer or a real mutable symbol), where "4 vs 8"
+ *      genuinely means "size of the pointee", a distinct axis from
+ *      the F/G own-slot-width convention. No collision, no ambiguity:
+ *      bare F/G = own value (slot or immediate); F4/F8 = dereference.
+ *
+ * - v7.14.4: fixed a heap OOB read in the v7.14.3 raw-asm patch.
+ *   CH_EOB (tcc.h) is '\\' (backslash), NOT '\0'. to8_emit_raw_asm()
+ *   used to be handed a bare (const char*) and relied on out_str()/
+ *   pstrcpy(), both of which scan for a real '\0' terminator. Since
+ *   the actual sentinel byte written by tcc_open_bf() at file->buffer
+ *   [initlen] is CH_EOB ('\\'), NOT '\0', that scan ran straight past
+ *   the intended text, printed the backslash as a normal character,
+ *   and then kept reading adjacent heap memory (undefined content)
+ *   until it happened to hit a real zero byte somewhere.
+ *
+ *   Fix: never scan for a terminator at all. asm_opcode() (in
+ *   to8-stubs.c) now computes the EXACT length as
+ *   (file->buf_end - file->buffer) - set directly from 'initlen' by
+ *   tcc_open_bf() at open time, always exactly right - and passes it
+ *   to to8_emit_raw_asm_n(text, len), which memcpy()s exactly 'len'
+ *   bytes with no terminator-scanning of any kind.
+ *
+ * - v7.14.3: fixed a heap-corruption bug in the v7.14.2 raw-asm patch.
+ *   to8_emit_raw_asm() unconditionally called to8_append(), which
+ *   writes into g_tail (g_tail->next = ln). g_head/g_tail are STRICTLY
+ *   function-scoped: reset in gfunc_prolog() via to8_list_reset(), and
+ *   their nodes are tcc_free()'d by to8_free_list() in gfunc_epilog().
+ *   Between one function's epilog and the next function's prolog,
+ *   g_tail is a DANGLING pointer to already-freed memory. A global/
+ *   file-scope asm("..."); statement (parsed via asm_global_instr(),
+ *   not asm_instr()) calls asm_opcode() -> to8_emit_raw_asm() at
+ *   exactly that in-between moment, so the old code corrupted the
+ *   heap via a use-after-free write.
+ *
+ *   Fix: track g_in_function (set in gfunc_prolog, cleared in
+ *   gfunc_epilog). to8_emit_raw_asm_n() branches on it: inside a
+ *   function, append a NOP-carrier line to the function's own list;
+ *   at global/file scope, write the text directly to the output
+ *   stream right now, bypassing g_head/g_tail entirely.
+ *
  * - v7.14.2: added to8_emit_raw_asm() and struct field
  *   is_raw_text/rawtext[] so that asm_opcode() (in to8-stubs.c) can
  *   dump the verbatim text of a simple asm("..."); statement (no
- *   operands) directly into the pseudo-ASM output, bypassing the
- *   normal opcode/slot/imm rendering entirely.
+ *   operands) directly into the pseudo-ASM output.
  * - v7.14.1: OP_LDF32/OP_STF32/OP_LDF64/OP_STF64 (own-slot float/
- * double value, no pointer involved) renamed to OP_LDF/OP_STF
- * (float) and OP_LDG/OP_STG (double) - "F"/"G" letter suffixes
- * instead of a 32/64 bit-width number, per the harmonized mnemonic
- * scheme (i=immediate, r=R0-implicit, no numeric suffix=slot).
- * This also removes the visual clash with LDF4/LDF8/STF4/STF8,
- * whose "4"/"8" mean something ENTIRELY different (byte-size of
- * the pointee behind a slot-held pointer or symbol) - reusing
- * 32/64 for a different axis (the slot's OWN bit-width) was
- * confusing even though it never technically collided.
- *
- * - v7.14.0: two changes.
- *
- *   1) Comment column alignment fixed. The old code called out_tab()
- *      one extra time for lines that print an argument versus lines
- *      that don't (ARG_NONE), so "RET       ; return" landed one full
- *      tab stop earlier than "ADJi -36   ; sp -= 36". Replaced the
- *      final out_tab() before the comment with out_pad_to(24) - pads
- *      with spaces up to a FIXED column, regardless of how much (or
- *      how little) came before it. Every comment now starts at the
- *      same column, with no need for a fake blank argument.
- *   2) New OP_LDF4i / OP_LDF8i - TRUE immediate float/double loads,
- *      completing the "i" family for floats (LDF4/LDF8 = real memory
- *      access via slot-held pointer or symbol; LDF4i/LDF8i = the
- *      value is baked directly into the instruction text, matching
- *      exactly what "i" already means for LDi/JSRi: fully resolved,
- *      zero extra memory access at runtime).
- *
- *      TCC allocates every float/double LITERAL constant as an
- *      ANONYMOUS symbol (sym->v >= SYM_FIRST_ANOM) in .rodata - a
- *      real, user-named global float variable never uses this
- *      mechanism, so checking the anonymous-symbol range is a safe,
- *      reliable signal that the value can never change and is safe
- *      to inline. load() now reads the constant's actual bytes
- *      straight out of its (already-written, by this point in
- *      single-pass codegen) section data via elfsym(), and emits
- *      LDF4i/LDF8i with the real value instead of a symbol
- *      reference - eliminating both the "_L.N" symbol and the memory
- *      read it required. If anything about the symbol/section looks
- *      even slightly off (not anonymous, section missing, out of
- *      bounds), this silently falls back to the original LDF4/LDF8
- *      symbol-reference path - never a wrong value, never a crash.
- *
- * - v7.13.0: merged the "m" (symbol) and "ms" (slot-held pointer)
- *   float dereference forms into one opcode identity each (LDF4/
- *   LDF8/STF4/STF8), distinguished by ARG_SLOT vs ARG_SYM kind -
- *   same idea as OP_LDi already unifying plain immediates and symbol
- *   addresses. The OWN-SLOT forms (LDF32/LDF64) keep their size
- *   marker - unlike integers, a float local's OWN slot genuinely
- *   differs in width (4 vs 8 bytes) even without any pointer
- *   involved, so that marker was never actually redundant.
- *
- * - v7.12.0: fixed a real segfault on any compound (&&/||) condition.
- *   gjmp/gjmp_cond were calling gsym_addr(off, t) (arguments
- *   swapped - t, an instruction id from an earlier pending jump, was
- *   being treated as a raw address) instead of gjmp_append(off, t)
- *   (correctly LINKING the new jump onto the incoming chain, with
- *   resolution deferred to the eventual real gsym() call). The first
- *   condition in any chain always passes t=0, which happened to skip
- *   the buggy code path entirely - that's why this was invisible
- *   until a function with a genuine && condition (mandel()) was
- *   compiled.
- *
- * - v7.11.2: shorter peephole comment format, fused onto the
- *   "_funcname:" line.
- *
- * - v7.11.0: new peephole pass to8_peephole_ld_deref(): "LD slot;
- *   LD1r/LD2r/LD4r" fused into "LD1/LD2/LD4 slot".
- *
- * - v7.10.0 and earlier: see prior versions.
+ *   double value, no pointer involved) renamed to OP_LDF/OP_STF
+ *   (float) and OP_LDG/OP_STG (double).
+ * - v7.14.0: comment column alignment fixed; new OP_LDF4i/OP_LDF8i
+ *   (now OP_LDFi/OP_LDGi, see v7.15.0 above).
+ * - v7.13.0: merged "m"/"ms" float dereference forms into LDF4/LDF8/
+ *   STF4/STF8, distinguished by ARG_SLOT vs ARG_SYM kind.
+ * - v7.12.0: fixed a real segfault on any compound (&&/||) condition
+ *   (gjmp_append vs gsym_addr argument-order bug).
+ * - v7.11.2 / v7.11.0 / v7.10.0 and earlier: see prior versions.
  *
  * Architecture:
  *   R0 = real integer accumulator (also REG_IRET).
  *   R1 = VIRTUAL integer register, memory-backed shadow slot.
- *   F0 = float accumulator (also REG_FRET)
+ *   F0 = float/double accumulator (also REG_FRET) - width is tracked
+ *        by the CALLER (gen_opf, load, store), never by F0 itself;
+ *        every float-family opcode name says explicitly whether it
+ *        operates on a 4-byte float slot (F) or an 8-byte double slot
+ *        (G) - there is no ambiguity left after v7.15.0.
  *   NO status/flags register of any kind, for EITHER integers or
- *   floats. OP_CMP/OP_CMPU/OP_CMPi/OP_CMPUi and OP_FCMP ALL write a
- *   signed comparison result straight into R0. S../J.. just read R0's
- *   sign from that point on - one shared family for both.
+ *   floats. OP_CMP/OP_CMPU/OP_CMPi/OP_CMPUi and OP_CMPF/OP_CMPG ALL
+ *   write a SIGNED integer directly into R0. Every S../J.. opcode
+ *   that follows just reads the sign of whatever is currently in R0.
  *
  * Naming convention:
  *   - "i" suffix  = opcode is FULLY resolved with NO extra runtime
  *     memory access: a plain immediate, a symbol's ADDRESS (LDi,
- *     JSRi), or now a float/double VALUE baked directly into the
- *     instruction (LDF4i, LDF8i).
+ *     JSRi), or a float/double VALUE baked directly into the
+ *     instruction (LDFi, LDGi).
  *   - "r" suffix  = opcode takes NO ARGUMENT but reads/writes R0 as
  *     the family's register-operand form (PUSHr, JSRr, ADJr, LD1r/
  *     LD2r/LD4r).
- *   - no suffix   = opcode takes a SLOT (LD, ST, ADD, CMP, PUSH,
- *     JSR...), OR - for the float LDF4/LDF8/STF4/STF8 family only -
- *     a genuine memory dereference (slot-held pointer or a REAL,
- *     possibly-mutable symbol) that DOES cost a real memory access,
- *     which is exactly why those stay separate from the "i" forms.
- *     Own-slot float access (LDF32/LDF64) keeps its size marker -
- *     unlike integers, float locals genuinely differ in width (4 vs 8
- *     bytes) even for their own value, so there is no safe way to drop
- *     it the way OP_LD does for ints.
+ *   - "F"/"G" suffix (float family only) = operates on a 4-byte
+ *     float slot (F) or an 8-byte double slot (G). Applies to the
+ *     own-slot load/store (LDF/STF vs LDG/STG), the arithmetic family
+ *     (ADDF/SUBF/MULF/DIVF vs ADDG/SUBG/MULG/DIVG), the comparison
+ *     (CMPF vs CMPG), and the immediates (LDFi vs LDGi).
+ *   - "4"/"8" numeric suffix (float DEREFERENCE family only, LDF4/
+ *     LDF8/STF4/STF8) = size of the POINTEE behind a slot-held
+ *     pointer or a real mutable symbol - a genuinely different axis
+ *     from the F/G own-value suffix, which is why both can coexist
+ *     without ambiguity (LDF4 dereferences a 4-byte float pointee;
+ *     LDF, no digit, reads a float's OWN slot value).
+ *   - no suffix (integer family) = opcode takes a SLOT (LD, ST, ADD,
+ *     CMP, PUSH, JSR...).
  *
  * Output format (once per compiled file):
  *   ; TO8 backend <version>
@@ -112,7 +131,7 @@
  *   ; cmd: <argv...>  (only if argc/argv are non-empty)
  * then, per function:
  *   _funcname:                ; N instr (peephole made no change)
- *   _funcname:                ; N instr (opt. N) (peephole reduced N to M)
+ *   _funcname:                ; N instr (opt. M) (peephole reduced N to M)
  *   @lN:
  *       MNEMONIC<tab>args<tab>; comment (comment always at a fixed column)
  */
@@ -158,12 +177,13 @@ ST_FUNC void gen_bounds_epilog(void) {}
 
 #define USING_GLOBALS
 #include "tcc.h"
+#define TO8_STACK_ALIGN 4
 #include <assert.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <string.h>
 
-#define TO8_GEN_VERSION "7.14.2"
+#define TO8_GEN_VERSION "7.15.0"
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -175,17 +195,15 @@ ST_DATA const int reg_classes[NB_REGS] = {
     RC_R1,
 };
 
-#define TO8_STACK_ALIGN 4
-
 /* ===================================================================
  * The entire instruction set, in one place, with its semantics.
  * "slot" always means a stack-frame memory location (a local
  * variable or parameter). "R0"/"F0" are the two accumulators.
  *
  * There is NO flags register, for integers or floats. OP_CMP/OP_CMPU/
- * OP_CMPi/OP_CMPUi and OP_FCMP ALL write a SIGNED integer directly
- * into R0. Every S../J.. opcode that follows just reads the sign of
- * whatever is currently in R0.
+ * OP_CMPi/OP_CMPUi and OP_CMPF/OP_CMPG ALL write a SIGNED integer
+ * directly into R0. Every S../J.. opcode that follows just reads the
+ * sign of whatever is currently in R0.
  * =================================================================== */
 
 typedef enum {
@@ -256,30 +274,35 @@ typedef enum {
     OP_ITOF,     /* F0 = (float/double)R0 */
     OP_FTOI,     /* R0 = (int)F0 */
 
-    OP_LDF,     /* F0 = slot (own-slot value, as float, 4 bytes) */
-    OP_LDG,     /* F0 = slot (own-slot value, as double, 8 bytes) */
-    OP_STF,     /* slot = F0 (own-slot value, as float) */
-    OP_STG,     /* slot = F0 (own-slot value, as double) */
+    OP_LDF,      /* F0 = slot (own-slot value, as float, 4 bytes) */
+    OP_LDG,      /* F0 = slot (own-slot value, as double, 8 bytes) */
+    OP_STF,      /* slot = F0 (own-slot value, as float) */
+    OP_STG,      /* slot = F0 (own-slot value, as double) */
     OP_LDF4,     /* F0 = *(float*)slot-or-symbol - dereference a
                     slot-held pointer, OR read a REAL (possibly
                     mutable) global float variable by symbol. */
     OP_LDF8,     /* F0 = *(double*)slot-or-symbol */
     OP_STF4,     /* *(float*)slot-or-symbol = F0 */
     OP_STF8,     /* *(double*)slot-or-symbol = F0 */
-    OP_LDF4i,   /* F0 = <literal float value>, baked directly into the
+    OP_LDFi,     /* F0 = <literal float>, baked directly into the
                     instruction - no memory access at all. Only used
                     for compiler-generated anonymous constants that
                     can never change. */
-    OP_LDF8i,   /* F0 = <literal double value>, same idea. */
+    OP_LDGi,     /* F0 = <literal double>, same idea. */
 
-    OP_FCMP,     /* R0 = sign(F0 - slot), comparing as double - exactly
-                    like OP_CMP, just with F0 on the left instead of R0.
-                    Consumed by the SAME SEQ/SNE/SLT/SGT/SLE/SGE and
-                    JEQ/JNE/... families integers use. */
-    OP_FADD,     /* F0 += slot (as double) */
-    OP_FSUB,     /* F0 -= slot (as double) */
-    OP_FMUL,     /* F0 *= slot (as double) */
-    OP_FDIV,     /* F0 /= slot (as double) */
+    OP_CMPF,     /* R0 = sign(F0 - slot), comparing as FLOAT (4-byte
+                    slot). Consumed by the SAME SEQ/SNE/SLT/SGT/SLE/
+                    SGE and JEQ/JNE/... families integers use. */
+    OP_CMPG,     /* R0 = sign(F0 - slot), comparing as DOUBLE (8-byte
+                    slot). */
+    OP_ADDF,     /* F0 += slot (as float, 4-byte slot) */
+    OP_SUBF,     /* F0 -= slot (as float) */
+    OP_MULF,     /* F0 *= slot (as float) */
+    OP_DIVF,     /* F0 /= slot (as float) */
+    OP_ADDG,     /* F0 += slot (as double, 8-byte slot) */
+    OP_SUBG,     /* F0 -= slot (as double) */
+    OP_MULG,     /* F0 *= slot (as double) */
+    OP_DIVG,     /* F0 /= slot (as double) */
 
     OP_PUSH,     /* push slot's value onto the call-argument stack */
     OP_PUSHi,    /* push an immediate onto the call-argument stack */
@@ -329,9 +352,12 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_STF: return "STF"; case OP_STG: return "STG";
     case OP_LDF4: return "LDF4"; case OP_LDF8: return "LDF8";
     case OP_STF4: return "STF4"; case OP_STF8: return "STF8";
-    case OP_LDF4i: return "LDF4i"; case OP_LDF8i: return "LDF8i";
-    case OP_FCMP: return "FCMP"; case OP_FADD: return "FADD"; case OP_FSUB: return "FSUB";
-    case OP_FMUL: return "FMUL"; case OP_FDIV: return "FDIV";
+    case OP_LDFi: return "LDFi"; case OP_LDGi: return "LDGi";
+    case OP_CMPF: return "CMPF"; case OP_CMPG: return "CMPG";
+    case OP_ADDF: return "ADDF"; case OP_SUBF: return "SUBF";
+    case OP_MULF: return "MULF"; case OP_DIVF: return "DIVF";
+    case OP_ADDG: return "ADDG"; case OP_SUBG: return "SUBG";
+    case OP_MULG: return "MULG"; case OP_DIVG: return "DIVG";
     case OP_PUSH: return "PUSH"; case OP_PUSHi: return "PUSHi"; case OP_PUSHr: return "PUSHr";
     case OP_JSR: return "JSR"; case OP_JSRi: return "JSRi"; case OP_JSRr: return "JSRr";
     case OP_JMP: return "JMP"; case OP_JEQ: return "JEQ"; case OP_JNE: return "JNE";
@@ -445,7 +471,8 @@ static int g_last_end_ind = -1;
  * pair. g_head/g_tail/to8_func_start_ind are ONLY valid while this is
  * set - a global/file-scope asm() statement executes OUTSIDE any such
  * pair, so to8_emit_raw_asm_n() must never touch g_head/g_tail when
- * this is 0. */
+ * this is 0 (doing so used to write into an already-freed to8_line,
+ * i.e. a use-after-free heap corruption - see v7.14.3 changelog). */
 static int g_in_function = 0;
 
 static void to8_by_id_set(int id, to8_line *ln)
@@ -541,9 +568,9 @@ static void out_tab(void)
 }
 
 /* Pad with spaces up to a FIXED column, instead of always advancing
- * by one full tab stop the way out_tab() does. Used just before the
- * comment, so every line's comment starts at the same place whether
- * or not it printed an argument. */
+   by one full tab stop the way out_tab() does. Used just before the
+   comment, so every line's comment starts at the same place whether
+   or not it printed an argument. */
 static void out_pad_to(int col)
 {
     while (g_col < col) out_char(' ');
@@ -661,11 +688,16 @@ static void slot_comment(char *out, size_t outsz, to8_opcode op, const char *des
     case OP_SAR: snprintf(out, outsz, "R0 >>= %s (arith)", desc); return;
     case OP_CMP: snprintf(out, outsz, "R0 = sign(R0 - %s)", desc); return;
     case OP_CMPU: snprintf(out, outsz, "R0 = sign(R0 -u %s)", desc); return;
-    case OP_FCMP: snprintf(out, outsz, "R0 = sign(F0 - %s)", desc); return;
-    case OP_FADD: snprintf(out, outsz, "F0 += %s", desc); return;
-    case OP_FSUB: snprintf(out, outsz, "F0 -= %s", desc); return;
-    case OP_FMUL: snprintf(out, outsz, "F0 *= %s", desc); return;
-    case OP_FDIV: snprintf(out, outsz, "F0 /= %s", desc); return;
+    case OP_CMPF: snprintf(out, outsz, "R0 = sign(F0 - %s) (float)", desc); return;
+    case OP_CMPG: snprintf(out, outsz, "R0 = sign(F0 - %s) (double)", desc); return;
+    case OP_ADDF: snprintf(out, outsz, "F0 += %s (float)", desc); return;
+    case OP_SUBF: snprintf(out, outsz, "F0 -= %s (float)", desc); return;
+    case OP_MULF: snprintf(out, outsz, "F0 *= %s (float)", desc); return;
+    case OP_DIVF: snprintf(out, outsz, "F0 /= %s (float)", desc); return;
+    case OP_ADDG: snprintf(out, outsz, "F0 += %s (double)", desc); return;
+    case OP_SUBG: snprintf(out, outsz, "F0 -= %s (double)", desc); return;
+    case OP_MULG: snprintf(out, outsz, "F0 *= %s (double)", desc); return;
+    case OP_DIVG: snprintf(out, outsz, "F0 /= %s (double)", desc); return;
     case OP_STF: case OP_STG: snprintf(out, outsz, "%s = F0", desc); return;
     case OP_LDF: case OP_LDG: snprintf(out, outsz, "F0 = %s", desc); return;
     case OP_STF4: case OP_STF8: snprintf(out, outsz, "*%s = F0", desc); return;
@@ -965,10 +997,10 @@ static to8_opcode to8_byte_suffix_st(int bt)
  * Float literal inlining: if `sym` is a compiler-generated anonymous
  * constant (never a real, possibly-mutable named global), read its
  * already-written bytes straight out of its section and hand back
- * the real value - so the caller can emit a true LDF4i/LDF8i
- * immediate instead of a symbol reference. Any doubt at all (wrong
- * symbol range, missing section, out-of-bounds offset) returns 0 and
- * the caller falls back to the existing symbol-based path.
+ * the real value - so the caller can emit a true LDFi/LDGi immediate
+ * instead of a symbol reference. Any doubt at all (wrong symbol
+ * range, missing section, out-of-bounds offset) returns 0 and the
+ * caller falls back to the existing symbol-based path.
  * =================================================================== */
 
 static int to8_try_read_float_const(Sym *sym, int bt, double *out_val)
@@ -1028,7 +1060,7 @@ void load(int r, SValue *sv)
         if (bt == VT_FLOAT || bt == VT_DOUBLE) {
             to8_opcode ld = (bt == VT_FLOAT) ? OP_LDF : OP_LDG;
             to8_opcode ld4or8 = (bt == VT_FLOAT) ? OP_LDF4 : OP_LDF8;
-            to8_opcode ldi = (bt == VT_FLOAT) ? OP_LDF4i : OP_LDF8i;
+            to8_opcode ldi = (bt == VT_FLOAT) ? OP_LDFi : OP_LDGi;
             if (sv->r & VT_LVAL) {
                 if (v == VT_LOCAL) {
                     e_op_slot(ld, fc);
@@ -1058,8 +1090,8 @@ void load(int r, SValue *sv)
                 else
                     e_op(OP_ITOF);
             }
+        }
         return;
-    }
     }
 
     if (!(sv->r & VT_LVAL) && v < TREG_MEM && v != VT_CONST && v != VT_LOCAL &&
@@ -1084,7 +1116,7 @@ void load(int r, SValue *sv)
             e_op_addr(ldop, sv->sym, fc);
         } else if (v == TREG_R0) {
             /* Pointer already sitting in R0: dereference directly,
-             * no temp-slot spill needed. */
+               no temp-slot spill needed. */
             e_op(to8_byte_suffix_ld_r(bt));
         } else if (v < VT_CONST) {
             int temp;
@@ -1277,12 +1309,12 @@ void gen_opi(int op)
         if ((vtop->r & VT_VALMASK) == VT_CONST && !(vtop->r & VT_SYM)) {
             int c0 = vtop->c.i;
             /* NOTE (fix, v7.14.1): vpop() below already removes the
-             * RHS constant from the stack. The v7.14.0 source had an
-             * extra "vtop--;" right before vset_VT_CMP() here, which
-             * double-decremented vtop - consuming BOTH operands with
-             * no result pushed back, hence "internal compiler error:
-             * vstack leak (-1)" on any comparison against a literal
-             * 0/const RHS. Removed the redundant decrement. */
+               RHS constant from the stack. The v7.14.0 source had an
+               extra "vtop--;" right before vset_VT_CMP() here, which
+               double-decremented vtop - consuming BOTH operands with
+               no result pushed back, hence "internal compiler error:
+               vstack leak (-1)" on any comparison against a literal
+               0/const RHS. Removed the redundant decrement. */
             vpop();
             gv(RC_R0);
             if (!(c0 == 0 && tst_ok)) {
@@ -1368,22 +1400,43 @@ void gen_opi(int op)
 
 /* ===================================================================
  * Binary float operations
+ *
+ * v7.15.0: this function now inspects the ACTUAL operand width once
+ * (bt = vtop->type.t & VT_BTYPE, VT_FLOAT or VT_DOUBLE) and threads
+ * that choice through EVERY path below - the comparison spill, the
+ * "commutative and already sitting in a LOCAL/LLOCAL slot" fast
+ * path, and the general spill-and-reload path. Previously every one
+ * of these paths was hardcoded to the 8-byte double family (OP_STG/
+ * OP_LDG/OP_FCMP/OP_FADD/...), so a genuine 4-byte `float` operand's
+ * OWN slot (only ever written 4 bytes wide via OP_STF/OP_LDF) got
+ * read back as if it held 8 valid bytes - silently reading 4 bytes
+ * of unrelated adjacent stack memory. That is exactly the bug seen
+ * in mandel()'s "x*x": LDF (correct, float) followed by STG (wrong,
+ * double) into a slot about to be read back by the old always-double
+ * FMUL.
  * =================================================================== */
 
 void gen_opf(int op)
 {
+    int bt;
+
     gv(RC_FLOAT);
+    bt = vtop->type.t & VT_BTYPE; /* VT_FLOAT or VT_DOUBLE - width of THIS operation */
 
     if (op == TOK_LT || op == TOK_GT || op == TOK_LE || op == TOK_GE ||
         op == TOK_EQ || op == TOK_NE) {
+        to8_opcode own_st = (bt == VT_FLOAT) ? OP_STF : OP_STG;
+        to8_opcode own_ld = (bt == VT_FLOAT) ? OP_LDF : OP_LDG;
+        to8_opcode cmp_op = (bt == VT_FLOAT) ? OP_CMPF : OP_CMPG;
+        int tsize = (bt == VT_FLOAT) ? 4 : 8;
         int fv1 = vtop[-1].r & VT_VALMASK;
         int fc1 = vtop[-1].c.i;
-        int temp = to8_temp_alloc(8, 4);
-        e_op_slot(OP_STG, temp);
+        int temp = to8_temp_alloc(tsize, 4);
+        e_op_slot(own_st, temp);
         if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
-            e_op_slot(OP_LDG, fc1);
-        e_op_slot(OP_FCMP, temp);
-        to8_temp_free(temp, 8, 4);
+            e_op_slot(own_ld, fc1);
+        e_op_slot(cmp_op, temp);
+        to8_temp_free(temp, tsize, 4);
 
         vtop--;
         vset_VT_CMP(op);
@@ -1392,36 +1445,40 @@ void gen_opf(int op)
 
     {
         to8_opcode fop;
+        to8_opcode own_st = (bt == VT_FLOAT) ? OP_STF : OP_STG;
+        to8_opcode own_ld = (bt == VT_FLOAT) ? OP_LDF : OP_LDG;
+        int tsize = (bt == VT_FLOAT) ? 4 : 8;
         int fv1 = vtop[-1].r & VT_VALMASK;
         int fc1 = vtop[-1].c.i;
         int commutative;
 
         switch (op) {
-        case '+': fop = OP_FADD; break;
-        case '-': fop = OP_FSUB; break;
-        case '*': fop = OP_FMUL; break;
-        case '/': fop = OP_FDIV; break;
+        case '+': fop = (bt == VT_FLOAT) ? OP_ADDF : OP_ADDG; break;
+        case '-': fop = (bt == VT_FLOAT) ? OP_SUBF : OP_SUBG; break;
+        case '*': fop = (bt == VT_FLOAT) ? OP_MULF : OP_MULG; break;
+        case '/': fop = (bt == VT_FLOAT) ? OP_DIVF : OP_DIVG; break;
         default: fop = OP_NOP; break;
         }
 
-        commutative = (fop == OP_FADD || fop == OP_FMUL);
+        commutative = (op == '+' || op == '*');
 
         if (fop != OP_NOP) {
             if (commutative && (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)) {
                 e_op_slot(fop, fc1);
             } else {
-                int temp = to8_temp_alloc(8, 4);
-            	e_op_slot(OP_STG, temp);
+                int temp = to8_temp_alloc(tsize, 4);
+                e_op_slot(own_st, temp);
                 if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
-                	e_op_slot(OP_LDG, fc1);
+                    e_op_slot(own_ld, fc1);
                 e_op_slot(fop, temp);
-                to8_temp_free(temp, 8, 4);
+                to8_temp_free(temp, tsize, 4);
             }
-	    	vtop--;
-    		vtop->r = TREG_F0;
-    		vtop->r2 = VT_CONST;
         }
     }
+
+    vtop--;
+    vtop->r = TREG_F0;
+    vtop->r2 = VT_CONST;
 }
 
 /* ===================================================================
@@ -1497,12 +1554,6 @@ void gfunc_call(int nb_args)
  * finished list, and ONLY when the user opted in via -O1 or higher.
  * Each pass returns 1 if it changed the list, 0 otherwise; the driver
  * loop re-runs all three until a full round changes nothing.
- *
- * TODO: "LD1 slot; ST slot" (same slot, a dead round trip through a
- * dereferenced pointer) is the sized-dereference analogue of what
- * to8_peephole_mov() already does for OP_LD/OP_ST. A generalized
- * "MOV1/MOV2/MOV4" fusion for OP_LD1/OP_LD2/OP_LD4 + OP_ST1/OP_ST2/
- * OP_ST4 pairs is the natural next step. Deferred.
  * =================================================================== */
 
 static int to8_peephole_ext(void)
@@ -1762,7 +1813,7 @@ static void to8_render_function(void)
     if (g_count_after != g_count_before) {
         out_str(" (");
         out_int(g_count_before);
-	out_str(" before -O)");
+        out_str(" before -O)");
     }
     out_char('\n');
 
@@ -1791,6 +1842,7 @@ void gfunc_prolog(Sym *func_sym)
     to8_temp_pool_reset();
     r1_shadow_valid = 0;
     cur_push_depth = 0;
+    g_in_function = 1;
 
     if (!g_banner_done) {
         to8_print_banner();
@@ -1873,6 +1925,7 @@ void gfunc_epilog(void)
     to8_render_function();
     g_last_end_ind = ind;
     to8_free_list();
+    g_in_function = 0;
 }
 
 /* ===================================================================
@@ -1957,4 +2010,3 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
 }
 
 #endif /* TARGET_DEFS_ONLY */
-
