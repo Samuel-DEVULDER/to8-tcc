@@ -1,6 +1,15 @@
 /* TO8 stubs — only symbols NOT defined in to8-gen.c
  * Included after to8-gen.c from libtcc.c
  *
+ * v7.19.0: gen_le16/gen_le32 replaced by gen_be16_impl/gen_be32_impl,
+ * redirected via a macro defined in to8-gen.c's TARGET_DEFS_ONLY
+ * block (visible early enough to rewrite tccgen.c's calls, without
+ * touching a single line of common tccgen.c code). The TO8 (6809)
+ * target is __BIG_ENDIAN__ (see target_machine_defs), but gen_le16/
+ * gen_le32 were copy-pasted from a little-endian backend and wrote
+ * low-byte-first - exactly backwards for any multi-byte value they
+ * encode on this target.
+ *
  * v7.18.0: removed the "static void *last_file" dedup guard in
  * asm_opcode() - it caused every asm() statement AFTER THE FIRST ONE
  * in a whole compilation unit to be silently dropped, as soon as a
@@ -28,16 +37,24 @@ ST_FUNC void g(int c)
     ind = ind1;
 }
 
-ST_FUNC void gen_le16(int v)
+/* v7.19.0: MSB-first (big-endian) emitters. Called via the
+ * gen_le16(v)/gen_le32(v) macros defined in to8-gen.c's
+ * TARGET_DEFS_ONLY block, which rewrite every gen_le16/gen_le32
+ * call site in tccgen.c (and anywhere else in the single ONESOURCE
+ * translation unit compiled AFTER that macro definition) into a
+ * call to these functions - no common code touched, no symbol name
+ * collision (the bare names "gen_le16"/"gen_le32" no longer need to
+ * exist anywhere once the macro has fired everywhere they're used). */
+ST_FUNC void gen_be16_impl(int v)
 {
-    g(v);
     g(v >> 8);
+    g(v);
 }
 
-ST_FUNC void gen_le32(int v)
+ST_FUNC void gen_be32_impl(int v)
 {
-    gen_le16(v);
-    gen_le16(v >> 16);
+    gen_be16_impl(v >> 16);
+    gen_be16_impl(v);
 }
 
 #ifdef CONFIG_TCC_ASM
@@ -64,12 +81,26 @@ ST_FUNC void gen_le32(int v)
  * =================================================================== */
 ST_FUNC void asm_opcode(TCCState *s1, int opcode)
 {
+    BufferedFile *bf = file;
     (void)s1;
     (void)opcode;
 
-    if (file) {
-        size_t len = (size_t)(file->buf_end - file->buffer);
-        to8_emit_raw_asm_n((const char *)file->buffer, len);
+    /* v7.19.1: pour un corps asm() à un seul token sans opérande
+     * (ex: asm("test");), le lookahead d'un seul token nécessaire
+     * pour vérifier un ':' ou '=' final épuise ENTIÈREMENT le
+     * buffer virtuel ":asm:", ce qui déclenche le même mécanisme
+     * de dépilement qu'un #include épuisé - AVANT que cette
+     * fonction ne s'exécute. `file` ne pointe donc plus sur le
+     * pseudo-fichier ":asm:" mais sur le fichier source réel.
+     * Le buffer dépilé reste vivant (tcc_close() n'est appelé par
+     * tcc_assemble_inline() qu'après le retour complet de
+     * tcc_assemble_internal()) - on le retrouve via file->prev. */
+    while (bf && strcmp(bf->filename, ":asm:") != 0)
+        bf = bf->prev;
+
+    if (bf) {
+        size_t len = (size_t)(bf->buf_end - bf->buffer);
+        to8_emit_raw_asm_n((const char *)bf->buffer, len);
     }
 
     /* consume the rest of this statement so tcc_assemble_internal's
