@@ -1,58 +1,70 @@
 /*
  * TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.19.0 (big-endian gen_le16/32 redirect, FCB block format,
- *                   end-of-asm marker, debug trace for raw asm())
+ * Version: 7.21.0 (__native_asm() intrinsic - robust raw-asm
+ *                   passthrough via ordinary string literals)
  * Changelog:
- * - v7.19.0: three changes, none touching common tccgen.c code:
+ * - v7.21.0: added __native_asm("text") - a plain C function call,
+ *   intercepted in gfunc_call() below, that emits its single string
+ *   literal argument's raw bytes VERBATIM into the pseudo-asm output,
+ *   with NO real call ever generated or linked.
  *
- *   1) gen_le16(v)/gen_le32(v) are now MACROS, defined here in the
- *      TARGET_DEFS_ONLY block (the ONLY part of this backend that
- *      gets included BEFORE tccgen.c in the ONESOURCE build), that
- *      redirect to gen_be16_impl()/gen_be32_impl() (to8-stubs.c).
- *      TO8 (6809) is __BIG_ENDIAN__ (see target_machine_defs below),
- *      but the original gen_le16/gen_le32 were copy-pasted from a
- *      little-endian backend and wrote low-byte-first - exactly
- *      backwards for any multi-byte value they encode on this
- *      target. A macro defined THIS early rewrites every bare
- *      gen_le16/gen_le32 call in tccgen.c (and anywhere else in the
- *      single translation unit compiled afterwards) into a call to
- *      the correctly-ordered implementation, without editing a
- *      single line of common code. The two implementations are
- *      forward-declared ST_FUNC right here too, so that when
- *      to8-stubs.c later *defines* them (also ST_FUNC/static), there
- *      is no "static declaration follows non-static declaration"
- *      linkage clash - the exact bug that hit to8_flush_pending_data
- *      earlier this session for the identical reason.
+ *   Why: asm("text") (see to8-stubs.c's asm_opcode()) reads raw
+ *   bytes from file->buffer, which is fragile - proven, over a long
+ *   diagnosis session (2026-08-15), to corrupt itself for certain
+ *   short asm() bodies (specifically: when the second meaningful
+ *   token ends exactly at the true end of the source text, with
+ *   nothing - not even a trailing space - after it). No backend-only
+ *   fix exists for that: the corruption happens inside common
+ *   tccpp.c/tccasm.c code (the internal tokenizer's own lookahead),
+ *   before asm_opcode() ever runs.
  *
- *   2) to8_emit_raw_asm_n() now has a temporary stderr trace, to
- *      pin down a still-open mystery: a function whose ENTIRE body
- *      is a single asm("text"); statement (e.g. test_asm() in the
- *      test file) never renders that text, while an otherwise
- *      identical two-statement case (putc()) renders both of its
- *      asm() lines correctly. No code path in this file (four
- *      peephole passes, gfunc_prolog/epilog, to8_render_line) was
- *      found that could explain a difference between those two
- *      cases - the trace will show definitively whether
- *      to8_emit_raw_asm_n() is even invoked for the "test" literal,
- *      bisecting the bug into "never called" (upstream, in tccasm.c/
- *      the parser) vs. "called but never rendered" (downstream,
- *      still in this file). Remove once resolved.
+ *   __native_asm("text") sidesteps the ENTIRE ":asm:" pseudo-file
+ *   mechanism: "text" is parsed as an ORDINARY C string literal, by
+ *   TCC's normal string tokenizer (used for every string literal in
+ *   the language - completely unrelated code path, no fragility).
+ *   Its bytes are read back directly from the anonymous rodata
+ *   symbol tcc already created for it (same technique as
+ *   to8_try_read_float_const() below), and emitted verbatim via
+ *   to8_emit_raw_asm_n() - byte for byte, tabs/commas/anything
+ *   included, no reformatting, works for text of ANY length
+ *   including a single token.
  *
- *   3) to8_flush_pending_data(): FCB bytes are now wrapped 8 per
- *      line (readability, on request), a trailing
- *      "; --- end of asm ---" marker is always emitted (purely to
- *      make the boundary between our generated pseudo-asm listing
- *      and the raw bytes of other ELF sections legible when scanning
- *      the .o file with `strings` - it does NOT and cannot suppress
- *      the real string-literal bytes that necessarily also exist,
- *      unavoidably, in .data.ro), and `cur_text_section->data_offset`
- *      is explicitly resynced to `ind` at the very end: g() advances
- *      the global `ind` on every byte written but never touches
- *      `sec->data_offset` itself, so without this line everything
- *      written past the OLD data_offset was silently truncated at
- *      final .o serialization - the exact "plus de FCB" bug from
- *      earlier this session.
+ *   The "__" prefix is deliberate: identifiers starting with two
+ *   underscores are reserved to the implementation by the C standard
+ *   (7.1.3) - exactly the right namespace for a compiler intrinsic
+ *   like this one. The user still needs a declaration for the C
+ *   parser to accept the call syntax:
+ *       void __native_asm(const char *s);
+ *   It is NEVER actually called at runtime or linked against; this
+ *   backend swallows every call to it entirely at compile time. If
+ *   called with anything other than exactly one string-literal
+ *   argument, tcc_error() rejects it with a clear message instead of
+ *   silently doing the wrong thing.
+ *
+ *   asm("text") is KEPT for GNU-inline-asm syntax compatibility, but
+ *   __native_asm("text") is now the RECOMMENDED way to emit verbatim
+ *   pseudo-asm text on this backend.
+ *
+ * - v7.20.0: documented (comment only, near OP_LDF/OP_LDG/OP_STF/
+ *   OP_STG below) the floating-point endianness/format architecture
+ *   decision: this backend and tccgen.c deliberately do NOT touch
+ *   the IEEE-754 bytes TCC's common front-end writes for float/
+ *   double constants (host-native, little-endian). Converting to/
+ *   from the target's actual runtime float format (EXTRAMON FAC/ARG,
+ *   for now) is the responsibility of the eventual REAL 6809
+ *   implementation of LDF/LDG/STF/STG - the one place the C type is
+ *   known with certainty (a .fcb dump or ELF symbol walk cannot
+ *   reliably tell a float apart from an int/pointer of the same
+ *   size).
+ *
+ * - v7.19.0: gen_le16(v)/gen_le32(v) are now MACROS, defined in the
+ *   TARGET_DEFS_ONLY block (the ONLY part of this backend included
+ *   BEFORE tccgen.c in the ONESOURCE build), redirecting to
+ *   gen_be16_impl()/gen_be32_impl() (to8-stubs.c). TO8 (6809) is
+ *   __BIG_ENDIAN__, but gen_le16/gen_le32 were copy-pasted from a
+ *   little-endian backend and wrote low-byte-first. NOTE: does not
+ *   affect float/double constant bytes - see v7.20.0 above.
  *
  * - v7.18.0: three cleanups on top of 7.17.0:
  *   1) gfunc_epilog()'s frame-release ADJi now goes through
@@ -60,25 +72,27 @@
  *      of a hand-rolled to8_append() - no more useless "ADJi 0" for
  *      functions with no locals.
  *   2) to8_flush_pending_data() added, dumping rodata/data section
- *      contents as FCB directives; nocode_wanted (left at
+ *      contents as FCB directives (wrapped 8 bytes/line), with a
+ *      trailing "; --- end of asm ---" marker; nocode_wanted (left at
  *      DATA_ONLY_WANTED after the last function) is saved/cleared/
- *      restored around it, since g() early-returns while it's set.
- *   3) `symtab_section` must be referenced BARE (no "s1->" prefix) -
- *      it's a tcc.h macro expanding to "tcc_state->symtab_section";
- *      `s1->sections`/`s1->nb_sections` have no such macro.
- *   Also: cur_text_section is stale/NULL by the time tcc_gen_finish()
- *   runs (tcc_elf_end_file() already ran), so to8_flush_pending_data()
- *   points it at `text_section` and resyncs `ind` to its
- *   data_offset before writing anything.
+ *      restored around it; cur_text_section is stale/NULL by the
+ *      time tcc_gen_finish() runs, so it's pointed at `text_section`
+ *      and `ind` resynced to its data_offset before writing;
+ *      `cur_text_section->data_offset` is resynced to `ind` at the
+ *      very end too, or the FCB bytes get silently truncated at
+ *      final .o serialization (g() never updates data_offset itself).
+ *   3) `symtab_section`/`text_section`/`cur_text_section` must be
+ *      referenced BARE (no "s1->" prefix) - tcc.h #defines them as
+ *      convenience macros expanding to "tcc_state->...".
  *
  * - v7.17.0: VLA support removed entirely, on top of the 7.16.0
  *   signed/unsigned sub-word load fix. gen_vla_alloc() now calls
  *   tcc_error() instead of emitting OP_ADJr (removed from the ISA).
- *   This is fully compliant with C11, where VLAs are an optional
- *   feature (this backend advertises __STDC_NO_VLA__).
- *   gen_vla_sp_save()/gen_vla_sp_restore() are KEPT as harmless
- *   stubs - tccgen.c references them unconditionally at link time
- *   even though gen_vla_alloc() always rejects the VLA first.
+ *   Fully compliant with C11, where VLAs are an optional feature
+ *   (this backend advertises __STDC_NO_VLA__). gen_vla_sp_save()/
+ *   gen_vla_sp_restore() are KEPT as harmless stubs - tccgen.c
+ *   references them unconditionally at link time even though
+ *   gen_vla_alloc() always rejects the VLA first.
  *
  * - v7.16.0: fixed a real correctness bug found while testing
  *   tst_ext() (int f(char *a, unsigned short *b) { return *a + *b; }).
@@ -183,7 +197,11 @@ enum {
  * Forward-declared ST_FUNC here so the later ST_FUNC definitions in
  * to8-stubs.c don't clash ("static declaration follows non-static
  * declaration") with an implicit declaration created by tccgen.c's
- * macro-expanded calls. */
+ * macro-expanded calls.
+ *
+ * Does NOT cover float/double constant bytes (see the big comment
+ * near OP_LDF/OP_LDG below) - those go through a completely
+ * different, common-code path that never calls gen_le16/gen_le32. */
 ST_FUNC void gen_be16_impl(int v);
 ST_FUNC void gen_be32_impl(int v);
 #define gen_le16(v) gen_be16_impl(v)
@@ -197,13 +215,13 @@ ST_FUNC void gen_bounds_epilog(void) {}
 
 #define USING_GLOBALS
 #include "tcc.h"
-#define  TO8_STACK_ALIGN 4
+#define TO8_STACK_ALIGN 4
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-#define TO8_GEN_VERSION "7.19.0"
+#define TO8_GEN_VERSION "7.21.0"
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -297,6 +315,56 @@ typedef enum {
 
     OP_ITOF,    /* F0 = (float/double)R0 */
     OP_FTOI,    /* R0 = (int)F0 */
+
+    /* ===============================================================
+     * ARCHITECTURE NOTE - floating-point storage format:
+     *
+     * The 4/8 raw bytes referenced by LDF/LDG/STF/STG below are
+     * written by TCC's common front-end (tccgen.c's gv(), for any
+     * float/double constant that can't be used as an immediate
+     * operand -> init_put_v()) as plain IEEE-754, in the HOST's
+     * native (little-endian) byte order. This backend deliberately
+     * does NOT rewrite them at the .fcb-dump or ELF-symbol level:
+     * doing so would require GUESSING which 4/8-byte symbols are
+     * floats, which is not reliably knowable from ELF symbol info
+     * alone (size and address only, no C type info survives to
+     * that point).
+     *
+     * The C type IS known with certainty right here, at the point
+     * LDF/LDG/STF/STG are chosen instead of LD/LD4 - so converting
+     * between IEEE-754 (as stored) and the target's actual runtime
+     * float format is the responsibility of the eventual REAL 6809
+     * implementation of these four opcodes, not of this pseudo-asm
+     * generator and not of tccgen.c.
+     *
+     * Decision (2026-08-15): start with EXTRAMON's native FAC/ARG
+     * format (already in ROM on the TO8, zero link cost), documented
+     * in the EXTRAMON manual: 1-byte excess-128 exponent + mantissa
+     * with an EXPLICIT leading "1" bit (24 bits for float/VALTYP=4,
+     * 56 bits for double/VALTYP=8, zero-padded past the 53 IEEE
+     * double significant bits) + a separate sign byte (bit 7 only).
+     * Conversion formulas (verified against the EXTRAMON manual's own
+     * worked example, 100 decimal -> exponent $87/135, mantissa
+     * $C80000):
+     *   FACEXP (float)  = ieee_biased_exponent + 2
+     *   FACEXP (double) = ieee_biased_exponent - 894
+     *   mantissa        = (1 << ieee_mantissa_bits) | ieee_mantissa,
+     *                     left-shifted by 3 extra bits for double
+     *                     (56-bit EXTRAMON field vs 53 IEEE sig. bits)
+     *   sign            = IEEE sign bit -> bit 7 of FACSGN/ARGSGN
+     * LDF/LDG must convert IEEE -> EXTRAMON on load into FAC/ARG;
+     * STF/STG must convert EXTRAMON -> IEEE (little-endian) on store
+     * back to the slot. Watch for FACEXP overflow/underflow: EXTRAMON's
+     * 1-byte exponent covers roughly 2^-128..2^127, far narrower than
+     * IEEE double's 2^-1022..2^1023 range.
+     *
+     * An alternative, faster+smaller-but-not-ROM-resident format
+     * (LBFP, Lennart Benschop's 6809 floating point package - see
+     * github.com/6809/sbc09, basic/fbasic.asm) was evaluated and
+     * benchmarked faster than EXTRAMON (7465 vs 8752 cycles on a
+     * reference calculation) but deliberately deferred: EXTRAMON's
+     * zero integration cost (no library to link) wins for now.
+     * =============================================================== */
 
     OP_LDF,     /* F0 = slot (own-slot value, as float, 4 bytes) */
     OP_LDG,     /* F0 = slot (own-slot value, as double, 8 bytes) */
@@ -632,15 +700,15 @@ static void to8_print_banner(void)
 /* ===================================================================
  * Raw inline-asm passthrough: emit a NOP-carrier line whose text is
  * dumped verbatim by to8_render_line(), bypassing normal opcode/arg
- * rendering entirely. Called from asm_opcode() in to8-stubs.c.
+ * rendering entirely. Called from asm_opcode() (to8-stubs.c) for
+ * legacy asm("text"); statements, AND from the __native_asm()
+ * interception in gfunc_call() below (the recommended path).
  *
  * IMPORTANT (v7.14.4): 'text' is NOT a NUL-terminated C string, and
- * must never be scanned for a terminator of any kind. CH_EOB (the
- * sentinel tcc_open_bf() writes right after the valid content) is
- * '\\' (backslash, see tcc.h), NOT '\0' - the caller MUST pass the
- * exact length (file->buf_end - file->buffer in asm_opcode()), and
- * this function copies EXACTLY that many bytes, with no scanning
- * whatsoever, into a manually NUL-terminated local buffer.
+ * must never be scanned for a terminator of any kind - the caller
+ * MUST pass the exact length, and this function copies EXACTLY that
+ * many bytes, with no scanning whatsoever, into a manually
+ * NUL-terminated local buffer.
  *
  * See the v7.14.3 changelog entry for g_in_function: inside a
  * function, append normally to the function's own line list
@@ -652,11 +720,6 @@ ST_FUNC void to8_emit_raw_asm_n(const char *text, size_t len)
 {
     size_t cap = sizeof(((to8_line *)0)->rawtext) - 1;
     if (len > cap) len = cap;
-
-    /* v7.19.0: TEMPORARY debug trace - see changelog. Remove once the
-     * test_asm()-only-statement mystery is resolved. */
-    fprintf(stderr, "[DEBUG] to8_emit_raw_asm_n: func=%s g_in_function=%d len=%zu text=%.*s\n",
-            funcname ? funcname : "?", g_in_function, len, (int)len, text);
 
     if (g_in_function) {
         to8_line *ln = to8_append(OP_NOP);
@@ -1090,6 +1153,49 @@ static int to8_try_read_float_const(Sym *sym, int bt, double *out_val)
         memcpy(&d, sec->data + offset, sizeof d);
         *out_val = d;
     }
+    return 1;
+}
+
+/* ===================================================================
+ * __native_asm("text") support: read the raw bytes of a string
+ * literal already stored by TCC's common front-end as an anonymous
+ * rodata symbol - same technique as to8_try_read_float_const() above,
+ * generalized to arbitrary-length byte data instead of a fixed 4/8
+ * byte float. See the v7.21.0 changelog entry at the top of this
+ * file for the full rationale.
+ * =================================================================== */
+
+static int to8_try_read_string_const(Sym *sym, int c_offset,
+                                      const char **out_data, int *out_len)
+{
+    ElfSym *esym;
+    Section *sec;
+    unsigned long offset;
+    int len;
+
+    if (!sym)
+        return 0;
+    esym = elfsym(sym);
+    if (!esym || esym->st_shndx == 0)
+        return 0;
+    if (!tcc_state || esym->st_shndx >= tcc_state->nb_sections)
+        return 0;
+    sec = tcc_state->sections[esym->st_shndx];
+    if (!sec || !sec->data)
+        return 0;
+
+    offset = (unsigned long)esym->st_value + (unsigned long)c_offset;
+    len = (int)esym->st_size - c_offset;
+    if (len <= 0 || offset + (unsigned long)len > sec->data_offset)
+        return 0;
+
+    /* the C string literal is always NUL-terminated in storage; we
+     * don't want that trailing byte in the emitted pseudo-asm text */
+    if (len > 0 && sec->data[offset + len - 1] == 0)
+        len--;
+
+    *out_data = (const char *)(sec->data + offset);
+    *out_len = len;
     return 1;
 }
 
@@ -1565,6 +1671,35 @@ void gfunc_call(int nb_args)
 {
     int i, size;
     SValue *func = &vtop[-nb_args];
+
+    /* v7.21.0: intercept __native_asm("text") before ANY normal call
+     * codegen. See the big comment near to8_try_read_string_const()
+     * above and the v7.21.0 changelog entry at the top of this file.
+     * Only fires for a plain direct call by name ("func" resolved to
+     * a known symbol at compile time, VT_CONST|VT_SYM, no VT_LVAL -
+     * exactly how a bare "__native_asm(...)" call site looks) with
+     * exactly one argument that is itself a plain string-literal
+     * address (VT_CONST|VT_SYM, no VT_LVAL - how a string literal
+     * decays to pointer when passed by value). Anything else calling
+     * a function named "__native_asm" is a user error - reject it
+     * clearly instead of silently emitting a broken real call. */
+    if (nb_args == 1 &&
+        (func->r & VT_VALMASK) == VT_CONST && (func->r & VT_SYM) && func->sym) {
+        const char *fname = get_tok_str(func->sym->v, NULL);
+        if (fname && !strcmp(fname, "__native_asm")) {
+            SValue *arg = &vtop[0];
+            if ((arg->r & VT_VALMASK) == VT_CONST && (arg->r & VT_SYM) && arg->sym) {
+                const char *data;
+                int len;
+                if (to8_try_read_string_const(arg->sym, arg->c.i, &data, &len)) {
+                    to8_emit_raw_asm_n(data, (size_t)len);
+                    vtop -= nb_args + 1;
+                    return;
+                }
+            }
+            tcc_error("TO8: __native_asm() requires a single string literal argument");
+        }
+    }
 
     for (i = 0; i < nb_args; i++) {
         SValue *sv = &vtop[-i];
@@ -2066,7 +2201,7 @@ ST_FUNC void gen_vla_sp_save(int addr) { e_op_slot(OP_ST, addr); }
 ST_FUNC void gen_vla_sp_restore(int addr) { e_op_slot(OP_LD, addr); }
 
 /* ===================================================================
- * v7.18.0/7.19.0: dump rodata/data section contents as readable FCB
+ * v7.18.0/7.20.0: dump rodata/data section contents as readable FCB
  * byte directives into the SAME pseudo-asm text stream that already
  * carries the code. Without this, string literals and other
  * initialized globals exist only as raw binary bytes in a section
@@ -2085,9 +2220,9 @@ ST_FUNC void gen_vla_sp_restore(int addr) { e_op_slot(OP_LD, addr); }
  * "if (nocode_wanted) return;" guard, so every out_char() call below
  * would silently no-op without the save/clear/restore dance here.
  *
- * IMPORTANT: `symtab_section` must be referenced BARE, with no
- * "s1->" prefix - tcc.h #defines it as a convenience macro expanding
- * to "tcc_state->symtab_section", so "s1->symtab_section" literally
+ * IMPORTANT: `symtab_section`/`text_section` must be referenced BARE,
+ * with no "s1->" prefix - tcc.h #defines them as convenience macros
+ * expanding to "tcc_state->...", so "s1->symtab_section" literally
  * expands to "s1->tcc_state->symtab_section" (TCCState has no
  * "tcc_state" member). `s1->sections`/`s1->nb_sections` have no such
  * macro and keep their explicit "s1->" prefix.
@@ -2103,6 +2238,13 @@ ST_FUNC void gen_vla_sp_restore(int addr) { e_op_slot(OP_LD, addr); }
  * `cur_text_section->data_offset = ind;` at the very end, everything
  * written here past the OLD data_offset is silently truncated at
  * final .o serialization.
+ *
+ * NOTE: this function does NOT and cannot know which 4/8-byte
+ * symbols are float/double vs. int/pointer - it dumps whatever raw
+ * bytes are there, faithfully, in whatever order TCC's common
+ * front-end wrote them. See the architecture comment near OP_LDF/
+ * OP_LDG above for why float/double format conversion belongs in the
+ * eventual real-6809 implementation of LDF/LDG/STF/STG instead.
  * =================================================================== */
 
 ST_FUNC void to8_flush_pending_data(TCCState *s1)
