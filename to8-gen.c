@@ -1,8 +1,43 @@
 /*
  * TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.23.0 (reverted __native_asm() - back to classic asm())
+ * Version: 7.25.0 (peephole: fuse spill/reload around commutative ops)
  * Changelog:
+ * - v7.25.0: new peephole pass to8_peephole_commute(). Found while
+ *   reviewing a generated listing (2026-08-16): int f(char*a,
+ *   unsigned short*b){return *a+*b;} produced
+ *       ST  T   ; spill *b (currently in R0) into temp T
+ *       LD  S   ; reload *a from its slot S into R0
+ *       ADD T   ; R0 += T  ->  R0 = *a + *b
+ *   even though R0 already held the correct *b value right before
+ *   the ST. Since +/*&|^ are all commutative, this exact 3-line
+ *   spill-reload-add dance (emitted by to8_spill_and_reload(), called
+ *   from gen_opi()'s commutative branch whenever the front-end still
+ *   thinks the left operand is sitting in R0 at that point) collapses
+ *   to a single "ADD S" - R0 already has the right value, no need to
+ *   touch it before adding the other operand's slot directly. T came
+ *   from to8_temp_alloc() purely for this one ST/ADD pair and is
+ *   to8_temp_free()'d immediately after in the caller, so it is never
+ *   read anywhere else - the fusion needs no liveness analysis beyond
+ *   recognizing the exact three consecutive lines. Applies to ADD,
+ *   MUL, AND, OR, XOR (the same set to8_is_commutative() in gen_opi()
+ *   already restricts itself to) - never to SUB/DIV/MOD/CMP, which
+ *   are not commutative and would change the computed value if
+ *   reordered this way.
+ *
+ * - v7.24.0: to8_peephole_ld_deref() no longer requires `!cur->is_target`
+ *   before fusing "LD slot" + "LD1r/LDU1r/LD2r/LDU2r/LD4r" into a
+ *   single "LD1/LDU1/LD2/LDU2/LD4 slot". A loop-header LD immediately
+ *   after a label (the extremely common "while (*p) { ... p++; }"
+ *   shape) never got fused before, because the pass required BOTH
+ *   `cur` (the LD) and `nxt` (the LDxr) to be non-targets. Fusing
+ *   keeps `cur`'s id/position (only `nxt` is unlinked), so any label
+ *   attached to `cur` stays attached to the SAME instruction, which
+ *   now performs the combined load+dereference - no jump can ever
+ *   land "in the middle" of the fused pair, since the only dangerous
+ *   case (something jumps directly to `nxt`, skipping the LD) is
+ *   still excluded by keeping the `!nxt->is_target` check.
+ *
  * - v7.23.0: __native_asm() (the gfunc_call()-interception compiler
  *   intrinsic added in v7.21.0) has been REMOVED, per the 2026-08-16
  *   testing session decision to go back to plain asm("...") as the
@@ -189,7 +224,7 @@ ST_FUNC void gen_bounds_epilog(void) {}
 #include <string.h>
 #include <math.h>
 
-#define TO8_GEN_VERSION "7.23.0"
+#define TO8_GEN_VERSION "7.25.0"
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -1742,7 +1777,7 @@ static int to8_peephole_ld_deref(void)
     to8_line *cur = g_head;
     while (cur) {
         to8_line *nxt = cur->next;
-        if (cur->op == OP_LD && !cur->is_target &&
+        if (cur->op == OP_LD &&
             nxt && !nxt->is_target &&
             (nxt->op == OP_LD1r || nxt->op == OP_LDU1r ||
              nxt->op == OP_LD2r || nxt->op == OP_LDU2r ||
@@ -1770,6 +1805,65 @@ static int to8_peephole_ld_deref(void)
     return changed;
 }
 
+/* ===================================================================
+ * v7.25.0: fuse the "ST T ; LD S ; <commutative-op> T" spill-reload
+ * dance (emitted by to8_spill_and_reload(), from gen_opi()'s
+ * commutative branch) into a single "<commutative-op> S". R0 already
+ * holds the correct value right before "ST T" - the spill/reload
+ * exists only because the front-end's abstract value-stack still
+ * thought that value was "in R0" at codegen time, which forces our
+ * generic spill-then-load-the-other-operand machinery to run even
+ * though, for a COMMUTATIVE op, it's provably unnecessary: R0 + slot
+ * S == slot S + R0. T came from to8_temp_alloc() purely for this
+ * ST/op pair and is to8_temp_free()'d immediately after by the
+ * caller, so it is NEVER read anywhere else - recognizing the exact
+ * three consecutive lines is enough, no wider liveness analysis
+ * needed. Restricted to ADD/MUL/AND/OR/XOR (exactly the set
+ * to8_is_commutative() allows in gen_opi()) - SUB/DIV/MOD/CMP are
+ * NOT commutative and must never be touched by this pass.
+ * =================================================================== */
+static int to8_is_commutative_op(to8_opcode op)
+{
+    return op == OP_ADD || op == OP_MUL || op == OP_AND ||
+           op == OP_OR || op == OP_XOR;
+}
+
+static int to8_peephole_commute(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+    while (cur) {
+        to8_line *nxt = cur->next;
+        to8_line *third = nxt ? nxt->next : NULL;
+
+        if (cur->op == OP_ST && !cur->is_target &&
+            nxt && !nxt->is_target && nxt->op == OP_LD &&
+            third && !third->is_target &&
+            to8_is_commutative_op(third->op) &&
+            third->kind == ARG_SLOT &&
+            third->slot_a == cur->slot_a &&
+            cur->push_depth == nxt->push_depth &&
+            nxt->push_depth == third->push_depth) {
+            char desc[24];
+            to8_line *scan_from;
+
+            third->slot_a = nxt->slot_a;
+            slot_desc(desc, sizeof desc, third->slot_a);
+            slot_comment(third->comment, sizeof third->comment, third->op, desc);
+            third->has_comment = 1;
+
+            to8_unlink(cur);
+            to8_unlink(nxt);
+            scan_from = third;
+            cur = scan_from;
+            changed = 1;
+            continue;
+        }
+        cur = nxt;
+    }
+    return changed;
+}
+
 static void to8_peephole_run(void)
 {
     int changed;
@@ -1784,6 +1878,7 @@ static void to8_peephole_run(void)
         changed |= to8_peephole_mov();
         changed |= to8_peephole_dead_ld();
         changed |= to8_peephole_ld_deref();
+        changed |= to8_peephole_commute();
     } while (changed && ++guard < 256);
 }
 
