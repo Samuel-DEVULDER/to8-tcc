@@ -1,50 +1,21 @@
 /*
  * TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.21.0 (__native_asm() intrinsic - robust raw-asm
- *                   passthrough via ordinary string literals)
+ * Version: 7.23.0 (reverted __native_asm() - back to classic asm())
  * Changelog:
- * - v7.21.0: added __native_asm("text") - a plain C function call,
- *   intercepted in gfunc_call() below, that emits its single string
- *   literal argument's raw bytes VERBATIM into the pseudo-asm output,
- *   with NO real call ever generated or linked.
- *
- *   Why: asm("text") (see to8-stubs.c's asm_opcode()) reads raw
- *   bytes from file->buffer, which is fragile - proven, over a long
- *   diagnosis session (2026-08-15), to corrupt itself for certain
- *   short asm() bodies (specifically: when the second meaningful
- *   token ends exactly at the true end of the source text, with
- *   nothing - not even a trailing space - after it). No backend-only
- *   fix exists for that: the corruption happens inside common
- *   tccpp.c/tccasm.c code (the internal tokenizer's own lookahead),
- *   before asm_opcode() ever runs.
- *
- *   __native_asm("text") sidesteps the ENTIRE ":asm:" pseudo-file
- *   mechanism: "text" is parsed as an ORDINARY C string literal, by
- *   TCC's normal string tokenizer (used for every string literal in
- *   the language - completely unrelated code path, no fragility).
- *   Its bytes are read back directly from the anonymous rodata
- *   symbol tcc already created for it (same technique as
- *   to8_try_read_float_const() below), and emitted verbatim via
- *   to8_emit_raw_asm_n() - byte for byte, tabs/commas/anything
- *   included, no reformatting, works for text of ANY length
- *   including a single token.
- *
- *   The "__" prefix is deliberate: identifiers starting with two
- *   underscores are reserved to the implementation by the C standard
- *   (7.1.3) - exactly the right namespace for a compiler intrinsic
- *   like this one. The user still needs a declaration for the C
- *   parser to accept the call syntax:
- *       void __native_asm(const char *s);
- *   It is NEVER actually called at runtime or linked against; this
- *   backend swallows every call to it entirely at compile time. If
- *   called with anything other than exactly one string-literal
- *   argument, tcc_error() rejects it with a clear message instead of
- *   silently doing the wrong thing.
- *
- *   asm("text") is KEPT for GNU-inline-asm syntax compatibility, but
- *   __native_asm("text") is now the RECOMMENDED way to emit verbatim
- *   pseudo-asm text on this backend.
+ * - v7.23.0: __native_asm() (the gfunc_call()-interception compiler
+ *   intrinsic added in v7.21.0) has been REMOVED, per the 2026-08-16
+ *   testing session decision to go back to plain asm("...") as the
+ *   sole raw-text passthrough mechanism. The real duplication bug
+ *   that motivated part of the exploration turned out to be in
+ *   asm_opcode() itself (to8-stubs.c), not something inherent to
+ *   asm() - see to8-stubs.c's v7.23.0 changelog entry for the actual
+ *   fix (a precise, buffer-scoped dedup key). __native_asm() may come
+ *   back later if a genuinely global-scope (outside any function)
+ *   raw-text mechanism turns out to be needed - asm() already
+ *   supports that via asm_global_instr(), which __native_asm() could
+ *   never support since it's an ordinary function call, only legal
+ *   inside a function body.
  *
  * - v7.20.0: documented (comment only, near OP_LDF/OP_LDG/OP_STF/
  *   OP_STG below) the floating-point endianness/format architecture
@@ -193,11 +164,8 @@ enum {
  * called from common tccgen.c code assuming little-endian byte
  * order; redirected here (the ONLY part of this backend included
  * BEFORE tccgen.c in the ONESOURCE build) to big-endian-correct
- * implementations, without touching a single line of common code.
- * Forward-declared ST_FUNC here so the later ST_FUNC definitions in
- * to8-stubs.c don't clash ("static declaration follows non-static
- * declaration") with an implicit declaration created by tccgen.c's
- * macro-expanded calls.
+ * implementations, without touching a single line of common tccgen.c
+ * code.
  *
  * Does NOT cover float/double constant bytes (see the big comment
  * near OP_LDF/OP_LDG below) - those go through a completely
@@ -221,7 +189,7 @@ ST_FUNC void gen_bounds_epilog(void) {}
 #include <string.h>
 #include <math.h>
 
-#define TO8_GEN_VERSION "7.21.0"
+#define TO8_GEN_VERSION "7.23.0"
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -567,8 +535,7 @@ static int g_last_end_ind = -1;
  * pair. g_head/g_tail/to8_func_start_ind are ONLY valid while this is
  * set - a global/file-scope asm() statement executes OUTSIDE any such
  * pair, so to8_emit_raw_asm_n() must never touch g_head/g_tail when
- * this is 0 (doing so used to write into an already-freed to8_line,
- * i.e. a use-after-free heap corruption - see v7.14.3 changelog). */
+ * this is 0. */
 static int g_in_function = 0;
 
 static void to8_by_id_set(int id, to8_line *ln)
@@ -701,17 +668,15 @@ static void to8_print_banner(void)
  * Raw inline-asm passthrough: emit a NOP-carrier line whose text is
  * dumped verbatim by to8_render_line(), bypassing normal opcode/arg
  * rendering entirely. Called from asm_opcode() (to8-stubs.c) for
- * legacy asm("text"); statements, AND from the __native_asm()
- * interception in gfunc_call() below (the recommended path).
+ * asm("text"); statements.
  *
- * IMPORTANT (v7.14.4): 'text' is NOT a NUL-terminated C string, and
- * must never be scanned for a terminator of any kind - the caller
- * MUST pass the exact length, and this function copies EXACTLY that
- * many bytes, with no scanning whatsoever, into a manually
- * NUL-terminated local buffer.
+ * IMPORTANT: 'text' is NOT a NUL-terminated C string, and must never
+ * be scanned for a terminator of any kind - the caller MUST pass the
+ * exact length, and this function copies EXACTLY that many bytes,
+ * with no scanning whatsoever, into a manually NUL-terminated local
+ * buffer.
  *
- * See the v7.14.3 changelog entry for g_in_function: inside a
- * function, append normally to the function's own line list
+ * Inside a function, append normally to the function's own line list
  * (rendered later by gfunc_epilog()). At global/file scope, write
  * directly to the output stream instead, bypassing to8_append().
  * =================================================================== */
@@ -954,12 +919,11 @@ static void e_op_addr(to8_opcode op, Sym *sym, int c)
 
 static void to8_track_push(void) { cur_push_depth += PTR_SIZE; }
 
-/* v7.18.0: single point of truth for "don't emit a no-op stack
- * adjustment". Used by gfunc_call() (always n>0 there in practice,
- * guarded by "if (nb_args > 0)" at the call site already) AND by
- * gfunc_epilog()'s frame-release, which previously bypassed this
- * helper entirely and always printed "ADJi 0" for functions with no
- * locals. */
+/* single point of truth for "don't emit a no-op stack adjustment".
+ * Used by gfunc_call() (always n>0 there in practice, guarded by
+ * "if (nb_args > 0)" at the call site already) AND by gfunc_epilog()'s
+ * frame-release, so a function with no locals never prints a useless
+ * "ADJi 0". */
 static void to8_adjust(int n)
 {
     if (n == 0)
@@ -1081,10 +1045,10 @@ static int to8_swap_cmp_op(int op)
     }
 }
 
-/* v7.16.0: now takes the operand's signedness explicitly instead of
- * only its base type. VT_BOOL is special-cased: a _Bool has no signed
- * variant in C, so it always routes to the unsigned (zero-extending)
- * form regardless of what VT_UNSIGNED happens to say. */
+/* takes the operand's signedness explicitly instead of only its base
+ * type. VT_BOOL is special-cased: a _Bool has no signed variant in C,
+ * so it always routes to the unsigned (zero-extending) form
+ * regardless of what VT_UNSIGNED happens to say. */
 static to8_opcode to8_byte_suffix_ld(int bt, int is_unsigned)
 {
     if (bt == VT_BOOL) return OP_LDU1;
@@ -1157,49 +1121,6 @@ static int to8_try_read_float_const(Sym *sym, int bt, double *out_val)
 }
 
 /* ===================================================================
- * __native_asm("text") support: read the raw bytes of a string
- * literal already stored by TCC's common front-end as an anonymous
- * rodata symbol - same technique as to8_try_read_float_const() above,
- * generalized to arbitrary-length byte data instead of a fixed 4/8
- * byte float. See the v7.21.0 changelog entry at the top of this
- * file for the full rationale.
- * =================================================================== */
-
-static int to8_try_read_string_const(Sym *sym, int c_offset,
-                                      const char **out_data, int *out_len)
-{
-    ElfSym *esym;
-    Section *sec;
-    unsigned long offset;
-    int len;
-
-    if (!sym)
-        return 0;
-    esym = elfsym(sym);
-    if (!esym || esym->st_shndx == 0)
-        return 0;
-    if (!tcc_state || esym->st_shndx >= tcc_state->nb_sections)
-        return 0;
-    sec = tcc_state->sections[esym->st_shndx];
-    if (!sec || !sec->data)
-        return 0;
-
-    offset = (unsigned long)esym->st_value + (unsigned long)c_offset;
-    len = (int)esym->st_size - c_offset;
-    if (len <= 0 || offset + (unsigned long)len > sec->data_offset)
-        return 0;
-
-    /* the C string literal is always NUL-terminated in storage; we
-     * don't want that trailing byte in the emitted pseudo-asm text */
-    if (len > 0 && sec->data[offset + len - 1] == 0)
-        len--;
-
-    *out_data = (const char *)(sec->data + offset);
-    *out_len = len;
-    return 1;
-}
-
-/* ===================================================================
  * Load / Store
  * =================================================================== */
 
@@ -1215,11 +1136,6 @@ void load(int r, SValue *sv)
     v = sv->r & VT_VALMASK;
     ft &= ~(VT_VOLATILE | VT_CONSTANT);
     bt = ft & VT_BTYPE;
-    /* v7.16.0: resolve signed vs unsigned ONCE, right here, and let
-     * `ldop` carry the answer to every branch below - this is the
-     * single point of correction for the missing sign/zero-extension
-     * bug (see changelog). No call site past this point needs to
-     * change: they were already just using `ldop`. */
     is_unsigned = (sv->type.t & VT_UNSIGNED) != 0;
     ldop = to8_byte_suffix_ld(bt, is_unsigned);
 
@@ -1475,13 +1391,6 @@ void gen_opi(int op)
 
         if ((vtop->r & VT_VALMASK) == VT_CONST && !(vtop->r & VT_SYM)) {
             int c0 = vtop->c.i;
-            /* NOTE (fix, v7.14.1): vpop() below already removes the
-             * RHS constant from the stack. The v7.14.0 source had an
-             * extra "vtop--;" right before vset_VT_CMP() here, which
-             * double-decremented vtop - consuming BOTH operands with
-             * no result pushed back, hence "internal compiler error:
-             * vstack leak (-1)" on any comparison against a literal
-             * 0/const RHS. Removed the redundant decrement. */
             vpop();
             gv(RC_R0);
             if (!(c0 == 0 && tst_ok)) {
@@ -1567,12 +1476,6 @@ void gen_opi(int op)
 
 /* ===================================================================
  * Binary float operations
- *
- * v7.15.0: this function inspects the ACTUAL operand width once
- * (bt = vtop->type.t & VT_BTYPE, VT_FLOAT or VT_DOUBLE) and threads
- * that choice through EVERY path below - the comparison spill, the
- * "commutative and already sitting in a LOCAL/LLOCAL slot" fast
- * path, and the general spill-and-reload path.
  * =================================================================== */
 
 void gen_opf(int op)
@@ -1672,35 +1575,6 @@ void gfunc_call(int nb_args)
     int i, size;
     SValue *func = &vtop[-nb_args];
 
-    /* v7.21.0: intercept __native_asm("text") before ANY normal call
-     * codegen. See the big comment near to8_try_read_string_const()
-     * above and the v7.21.0 changelog entry at the top of this file.
-     * Only fires for a plain direct call by name ("func" resolved to
-     * a known symbol at compile time, VT_CONST|VT_SYM, no VT_LVAL -
-     * exactly how a bare "__native_asm(...)" call site looks) with
-     * exactly one argument that is itself a plain string-literal
-     * address (VT_CONST|VT_SYM, no VT_LVAL - how a string literal
-     * decays to pointer when passed by value). Anything else calling
-     * a function named "__native_asm" is a user error - reject it
-     * clearly instead of silently emitting a broken real call. */
-    if (nb_args == 1 &&
-        (func->r & VT_VALMASK) == VT_CONST && (func->r & VT_SYM) && func->sym) {
-        const char *fname = get_tok_str(func->sym->v, NULL);
-        if (fname && !strcmp(fname, "__native_asm")) {
-            SValue *arg = &vtop[0];
-            if ((arg->r & VT_VALMASK) == VT_CONST && (arg->r & VT_SYM) && arg->sym) {
-                const char *data;
-                int len;
-                if (to8_try_read_string_const(arg->sym, arg->c.i, &data, &len)) {
-                    to8_emit_raw_asm_n(data, (size_t)len);
-                    vtop -= nb_args + 1;
-                    return;
-                }
-            }
-            tcc_error("TO8: __native_asm() requires a single string literal argument");
-        }
-    }
-
     for (i = 0; i < nb_args; i++) {
         SValue *sv = &vtop[-i];
         int v = sv->r & VT_VALMASK;
@@ -1742,13 +1616,6 @@ void gfunc_call(int nb_args)
  * finished list, and ONLY when the user opted in via -O1 or higher.
  * Each pass returns 1 if it changed the list, 0 otherwise; the driver
  * loop re-runs all three until a full round changes nothing.
- *
- * v7.16.0 note: to8_peephole_ext() can no longer be reached by any
- * pattern this backend actually emits, since load() now bakes the
- * sign/zero-extension directly into the LD1/LDU1/LD2/LDU2 opcode
- * choice - it never emits the raw "SHLi ; SARi/SHRi" pair this pass
- * looks for. Left in place as a harmless no-op safety net (e.g. for
- * a future hand-written inline-asm producer of that raw pattern).
  * =================================================================== */
 
 static int to8_peephole_ext(void)
@@ -2110,10 +1977,6 @@ void gfunc_epilog(void)
         to8_func_adj_line->has_comment = 1;
     }
 
-    /* v7.18.0: routed through to8_adjust() instead of a hand-rolled
-     * to8_append(OP_ADJi) - to8_adjust()'s "if (n == 0) return;" guard
-     * means a function with no locals (frame_size == 0) no longer
-     * prints a useless "ADJi 0 ; sp += 0" release line. */
     to8_adjust(frame_size);
 
     e_op(OP_RET);
@@ -2168,10 +2031,6 @@ ST_FUNC int gjmp_cond(int op, int t)
 
 /* ===================================================================
  * VLA support - REMOVED (C11 optional feature, v7.17.0)
- *
- * OP_ADJr is gone: gen_vla_alloc() below always calls tcc_error()
- * before it could ever be reached from tccgen.c, so keeping it
- * around was dead code that only obscured the real, supported ISA.
  * =================================================================== */
 
 ST_FUNC void gen_vla_alloc(CType *type, int align)
@@ -2182,69 +2041,13 @@ ST_FUNC void gen_vla_alloc(CType *type, int align)
               "(C11 optional feature; define __STDC_NO_VLA__ to indicate this).");
 }
 
-/* ===================================================================
- * VLA stack-pointer bookkeeping - kept as harmless stubs.
- *
- * tccgen.c references gen_vla_sp_save()/gen_vla_sp_restore()
- * UNCONDITIONALLY at link time (vla_restore(), called from goto/label
- * handling, calls gen_vla_sp_restore() whenever a scope's
- * vla.loc_orig is nonzero, and decl_initializer_alloc() calls
- * gen_vla_sp_save() right before gen_vla_alloc() whenever a VT_VLA
- * type is declared). Removing these symbols entirely breaks the link
- * even though this backend rejects every genuine VLA: gen_vla_alloc()
- * above always tcc_error()s out immediately after gen_vla_sp_save()
- * would run, so in practice these two are dead code, but the SYMBOL
- * must exist.
- * =================================================================== */
-
 ST_FUNC void gen_vla_sp_save(int addr) { e_op_slot(OP_ST, addr); }
 ST_FUNC void gen_vla_sp_restore(int addr) { e_op_slot(OP_LD, addr); }
 
 /* ===================================================================
  * v7.18.0/7.20.0: dump rodata/data section contents as readable FCB
  * byte directives into the SAME pseudo-asm text stream that already
- * carries the code. Without this, string literals and other
- * initialized globals exist only as raw binary bytes in a section
- * nobody prints - invisible in the listing, even though code refers
- * to them by symbol (e.g. LDi _L.3).
- *
- * Called once, at end-of-compilation, from tcc_gen_finish() (see the
- * #ifdef TCC_TARGET_TO8 hook that must be added there - see the
- * integration notes for the exact one-line forward declaration +
- * call site).
- *
- * IMPORTANT: nocode_wanted is left set to DATA_ONLY_WANTED by
- * gen_function() right after the LAST function in the translation
- * unit finishes, and stays that way through tcc_elf_end_file() and
- * into tcc_gen_finish(). g() (to8-stubs.c) has an early
- * "if (nocode_wanted) return;" guard, so every out_char() call below
- * would silently no-op without the save/clear/restore dance here.
- *
- * IMPORTANT: `symtab_section`/`text_section` must be referenced BARE,
- * with no "s1->" prefix - tcc.h #defines them as convenience macros
- * expanding to "tcc_state->...", so "s1->symtab_section" literally
- * expands to "s1->tcc_state->symtab_section" (TCCState has no
- * "tcc_state" member). `s1->sections`/`s1->nb_sections` have no such
- * macro and keep their explicit "s1->" prefix.
- *
- * IMPORTANT: cur_text_section is stale/NULL by the time this runs
- * (tcc_elf_end_file() already ran) - point it at `text_section`
- * (also bare, same macro convention) and resync `ind` to its
- * data_offset before writing anything, or the writes land at the
- * wrong offset and corrupt/overwrite earlier content.
- *
- * IMPORTANT: g() advances the global `ind` on every byte written but
- * NEVER updates `sec->data_offset` itself. Without resyncing
- * `cur_text_section->data_offset = ind;` at the very end, everything
- * written here past the OLD data_offset is silently truncated at
- * final .o serialization.
- *
- * NOTE: this function does NOT and cannot know which 4/8-byte
- * symbols are float/double vs. int/pointer - it dumps whatever raw
- * bytes are there, faithfully, in whatever order TCC's common
- * front-end wrote them. See the architecture comment near OP_LDF/
- * OP_LDG above for why float/double format conversion belongs in the
- * eventual real-6809 implementation of LDF/LDG/STF/STG instead.
+ * carries the code.
  * =================================================================== */
 
 ST_FUNC void to8_flush_pending_data(TCCState *s1)
@@ -2316,14 +2119,6 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
         }
     }
 
-    /* Trailing marker: purely cosmetic, to distinguish (via `strings`)
-     * where our generated pseudo-asm listing stops and where the raw
-     * bytes of other ELF sections (rodata, symtab, etc.) begin. Does
-     * NOT remove the duplication of string literals in .data.ro
-     * (unavoidable - that's the real runtime storage), it just makes
-     * the boundary readable. Then resync data_offset (see the big
-     * comment above) so nothing written here gets truncated at final
-     * .o serialization. */
     if (!g_banner_done) { to8_print_banner(); g_banner_done = 1; }
     g_col = 0;
     out_str("; --- end of asm ---");

@@ -1,32 +1,51 @@
 /* TO8 stubs — only symbols NOT defined in to8-gen.c
  * Included after to8-gen.c from libtcc.c
  *
- * v7.22.0: asm("text"); is now REJECTED outright with a clear
- * tcc_error(), instead of attempting the fragile raw-buffer-read
- * passthrough. Root-cause diagnosis (2026-08-15 session) proved that
- * technique cannot be made reliable without patching common
- * tccpp.c/tccasm.c code (the internal tokenizer's own lookahead can
- * corrupt file->buf_end/file->buffer for certain short asm() bodies,
- * before asm_opcode() ever runs) - so rather than keep a known-buggy
- * code path around, this backend now refuses it explicitly and
- * points users at __native_asm() (to8-gen.c's gfunc_call()
- * interception), which has NO such limitation for any text length,
- * since it goes through TCC's ordinary (robust) string-literal
- * tokenizer instead of the special ":asm:" pseudo-file mechanism.
+ * v7.23.0: fixed a real duplication bug in asm_opcode() found while
+ * testing a multi-line/multi-label asm() body (2026-08-16 session):
+ *     asm("\ttest2 a,b\nlabel:\n  code 0x1111");
+ * printed its ENTIRE text TWICE. Root cause: tcc_assemble_internal()
+ * (tccasm.c) retokenizes the ":asm:" buffer as a mini multi-statement
+ * assembly file, calling asm_opcode() ONCE PER detected instruction
+ * (every IDENT not followed by ':' or '='), independently of ':'
+ * labels (handled separately via asm_new_label()). The body above
+ * has TWO such instructions ("test2 a,b" and "code 0x1111"), so
+ * asm_opcode() fired twice - and since it dumps the WHOLE buffer
+ * every time regardless of which statement triggered it, the text
+ * was emitted twice. Single-instruction, single-line bodies (the
+ * only kind tested before) never hit this: only one instruction
+ * token per buffer, hence only one call.
  *
- * Users who want to keep writing asm("...") syntax can opt back in
- * themselves, entirely from their own C source, with:
- *     void __native_asm(const char *s);
- *     #define asm __native_asm
- * (macro substitution happens before the parser ever treats "asm" as
- * the special GNU keyword, since asm is not a real C reserved word -
- * it's an extension identifier registered like any other token, so
- * ordinary #define rules apply cleanly). Extended GNU asm syntax
- * with operands ("asm("code" : "=r"(out) : ...)") is NOT covered by
- * that #define (the colons aren't valid in a function-call argument
- * list) - but that syntax never actually worked on this backend
- * anyway (asm_compute_constraints()/asm_gen_code() below are, and
- * always were, no-op stubs), so nothing of value is lost.
+ * Fix: track (bf->buffer pointer, length) of the last buffer we
+ * actually dumped in g_asm_dump_key/g_asm_dump_len, and skip the
+ * dump if the CURRENT call's buffer matches - but ONLY for as long
+ * as that specific buffer is still open. Right after the token-
+ * consuming loop, if `file` no longer equals `bf` (i.e. the
+ * tokenizer has moved past this :asm: buffer entirely, either via a
+ * real pop-to-parent or by exhausting it), the key is immediately
+ * invalidated. This is what makes it safe against the EXACT failure
+ * mode that got the old static "last_file" guard removed in v7.18.0
+ * (a later, UNRELATED :asm: buffer coincidentally reusing the same
+ * freed heap address, and getting wrongly treated as a repeat): the
+ * key can never survive past the lifetime of the specific buffer it
+ * was recorded for, so it can never alias a future, different one.
+ *
+ * v7.20.0: asm_opcode() rewritten to walk the file->prev chain
+ * looking for the ":asm:" pseudo-file, instead of trusting the
+ * CURRENT file pointer blindly. For a single-token asm body with no
+ * operand characters at all (e.g. asm("test");), tcc_assemble_
+ * internal()'s own one-token lookahead (checking whether ':' or '='
+ * follows an identifier) EXHAUSTS the entire virtual :asm: buffer
+ * before asm_opcode() ever runs. That triggers the same pop-to-
+ * parent mechanism used for ordinary include exhaustion, so `file`
+ * no longer points at the :asm: pseudo-file by the time this
+ * function executes - it points at the REAL enclosing source file
+ * instead. tcc_assemble_inline() (tccasm.c) only tcc_close()s the
+ * :asm: BufferedFile AFTER tcc_assemble_internal() fully returns, so
+ * even once popped off `file`, that struct is still alive in memory,
+ * reachable via file->prev. This version walks that chain looking
+ * for the ":asm:" name set by tcc_open_bf(s1, ":asm:", len) in
+ * tcc_assemble_inline(), instead of assuming `file` itself is it.
  *
  * v7.19.0: gen_le16/gen_le32 replaced by gen_be16_impl/gen_be32_impl,
  * redirected via a macro defined in to8-gen.c's TARGET_DEFS_ONLY
@@ -42,6 +61,24 @@
  * those bytes are written by a completely different, common-code
  * path (gv()'s float-constant materialization -> init_put_v()) that
  * never calls gen_le16/gen_le32 at all.
+ *
+ * v7.18.0: removed the "static void *last_file" dedup guard in
+ * asm_opcode() - it caused every asm() statement AFTER THE FIRST ONE
+ * in a whole compilation unit to be silently dropped, as soon as a
+ * later :asm: pseudo-file's BufferedFile allocation happened to reuse
+ * the exact heap address of an earlier one.
+ *
+ * IMPORTANT: 'buffer' is NOT a NUL-terminated C string, and must
+ * never be scanned for a terminator of any kind. The exact length is
+ * computed as (buf_end - buffer) and passed to to8_emit_raw_asm_n(),
+ * which memcpy()s exactly that many bytes - no scanning whatsoever.
+ *
+ * KNOWN LIMITATION (unchanged since v7.14.4, not fixed here): a
+ * multi-STATEMENT asm() body (embedded labels, multiple leading
+ * identifiers) is dumped as ONE opaque blob, verbatim, exactly as
+ * written - this backend does NOT parse/relocate/rewrite any of it.
+ * That's by design (raw passthrough, no operand substitution), just
+ * worth remembering when reading a generated listing.
  */
 #ifndef TO8_STUBS_INCLUDED
 #define TO8_STUBS_INCLUDED
@@ -85,22 +122,61 @@ ST_FUNC void gen_be32_impl(int v)
 #ifdef CONFIG_TCC_ASM
 
 /* ===================================================================
- * v7.22.0: asm("text"); is REJECTED. Use __native_asm("text") (see
- * to8-gen.c's gfunc_call()) instead - it is strictly more robust and
- * has no known limitation. See the file-level changelog above for
- * the full rationale and the #define asm __native_asm opt-in for
- * anyone who still wants the asm(...) spelling.
+ * Minimal inline-asm support for TO8: asm("text"); is dumped VERBATIM
+ * into the pseudo-ASM output. No operands (":"), no constraints, no
+ * clobbers, no GAS-style opcode parsing - just raw text passthrough.
+ *
+ * See the v7.23.0/v7.20.0/v7.18.0 changelog entries above for the
+ * full history of why this needs the file->prev walk AND the
+ * (pointer, length) dedup key.
  * =================================================================== */
+
+static const uint8_t *g_asm_dump_key;
+static size_t g_asm_dump_len;
+
 ST_FUNC void asm_opcode(TCCState *s1, int opcode)
 {
+    BufferedFile *bf;
     (void)s1;
     (void)opcode;
-    tcc_error("TO8: asm(\"...\") is not supported by this backend - "
-              "use __native_asm(\"...\") instead (declare it as "
-              "'void __native_asm(const char *s);' - it is a compiler "
-              "intrinsic, never actually linked). If you need the "
-              "asm(...) spelling, add '#define asm __native_asm' to "
-              "your own source.");
+
+    bf = file;
+    while (bf && strcmp(bf->filename, ":asm:") != 0)
+        bf = bf->prev;
+
+    if (bf) {
+        size_t len = (size_t)(bf->buf_end - bf->buffer);
+        /* v7.23.0: only dump if this SPECIFIC still-open buffer
+         * hasn't already been dumped by an earlier asm_opcode() call
+         * for the SAME asm("...") statement (multi-instruction body -
+         * see changelog). Comparing both pointer AND length, and
+         * invalidating the key the moment we leave this buffer
+         * (below), means this can never alias a later, unrelated
+         * :asm: buffer that happens to reuse the same freed address -
+         * that was the exact failure mode that got the old blanket
+         * "last_file" guard removed in v7.18.0. */
+        if (bf->buffer != g_asm_dump_key || len != g_asm_dump_len) {
+            to8_emit_raw_asm_n((const char *)bf->buffer, len);
+            g_asm_dump_key = bf->buffer;
+            g_asm_dump_len = len;
+        }
+    }
+
+    /* consume the rest of this statement so tcc_assemble_internal's
+     * "expect end of line" check right after this call succeeds */
+    while (tok != ';' && tok != TOK_LINEFEED && tok != CH_EOF)
+        next();
+
+    /* v7.23.0: if `file` no longer points at the :asm: buffer we
+     * just processed, the tokenizer has moved past it for good
+     * (either a real pop-to-parent, or it was exhausted) - no more
+     * asm_opcode() calls will ever come in for it. Invalidate the
+     * dedup key immediately so it can't collide with a later,
+     * unrelated :asm: buffer at the same heap address. */
+    if (file != bf) {
+        g_asm_dump_key = NULL;
+        g_asm_dump_len = 0;
+    }
 }
 
 ST_FUNC void gen_expr32(ExprValue *pe)
@@ -123,9 +199,7 @@ ST_FUNC void asm_compute_constraints(ASMOperand *operands, int nb_operands,
     (void)nb_outputs;
     (void)clobber_regs;
     (void)pout_reg;
-    /* no operands handled: nothing to compute. Extended GNU asm
-     * syntax never worked on this backend regardless of the v7.22.0
-     * asm_opcode() rejection above - this stub predates it. */
+    /* no operands handled: nothing to compute */
 }
 
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
@@ -137,8 +211,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
     (void)is_output;
     (void)clobber_regs;
     (void)out_reg;
-    /* no-op: asm_opcode() now always tcc_error()s before this could
-     * matter for any real asm() statement. */
+    /* the text was already emitted in asm_opcode() */
 }
 
 ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
