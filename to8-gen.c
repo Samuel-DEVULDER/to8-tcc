@@ -1,8 +1,36 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.31.1 (BUGFIX in to8_peephole_mov())
+ * Version: 7.32.0 (source-line markers are now instruction metadata rendered only at final listing time under -g.)
  *
  * Changelog:
+ * - v7.32.0: source-line markers are now stored as metadata on each
+ *   real instruction and emitted only during final listing rendering
+ *   when -g is enabled. Previously, each marker was inserted as a
+ *   synthetic raw-text/OP_NOP line while the instruction list was
+ *   being built.
+ *
+ *   This removes the possibility for source comments to affect
+ *   peephole passes, instruction IDs, label numbering, target
+ *   resolution, or final instruction counts. The optimized instruction
+ *   list is therefore identical with and without -g; -g changes only
+ *   the rendered listing.
+ *
+ *   Source markers are emitted when the source line changes and are
+ *   reset at the beginning of every function. The source text is read
+ *   at render time from the original source file. If the file or line
+ *   cannot be read, rendering degrades gracefully to "; L<n>".
+ *
+ *   A source marker belongs to the first surviving instruction associated
+ *   with that source line. If peephole optimization removes or fuses
+ *   instructions, the marker follows the surviving instruction naturally
+ *   because it is attached to the instruction metadata rather than to a
+ *   separate list node.
+ *
+ *   Also fixed the LD/ST-to-MOV peephole representation: fused MOV
+ *   instructions now retain the correct two-slot representation and
+ *   regenerated comment, so listings show both operands and the correct
+ *   destination/source description.
+ *
  * - v7.31.1: BUGFIX in to8_peephole_mov() - removed the overly
  *   conservative !cur->is_target guard that silently blocked the
  *   LD/ST -> MOV fusion (and the LD X;ST X redundant-store removal)
@@ -381,7 +409,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.31.1"
+#define TO8_GEN_VERSION "7.32.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -731,6 +759,7 @@ typedef struct to8_line {
     int has_comment;
     int is_target;
     int id;
+    int src_line; 
     struct to8_line *redirect;
     struct to8_line *prev, *next;
     /* --- raw inline-asm passthrough (asm("text");) --- */
@@ -793,12 +822,8 @@ static void to8_list_reset(void)
     g_pending_target_id = -1;
 }
 
-static void to8_maybe_emit_source_line(void);
-
 static to8_line *to8_append(to8_opcode op)
 {
-    to8_maybe_emit_source_line();		
-	
     to8_line *ln = tcc_mallocz(sizeof(to8_line));
     ln->op = op;
     ln->id = ++g_next_id;
@@ -810,6 +835,14 @@ static to8_line *to8_append(to8_opcode op)
         ln->is_target = 1;
         g_pending_target_id = -1;
     }
+
+    /*
+     * Store source information on the real instruction itself.
+     * No synthetic comment node is inserted into the instruction list.
+     */
+    if (tcc_state && tcc_state->do_debug && g_in_function && file)
+        ln->src_line = file->line_num;
+
     ind = to8_func_start_ind + ln->id + 1;
     return ln;
 }
@@ -963,15 +996,7 @@ ST_FUNC void to8_emit_raw_asm_n(const char *text, size_t len)
  *     with no text - never a hard error
  * =================================================================== */
 
-static int to8_last_marked_line = -1;
-
-/* Reset per function, so the very first statement of a new function
- * always gets a marker, even if its line number happens to collide
- * with the last line marked in a PREVIOUS function. */
-static void to8_reset_source_line_tracking(void)
-{
-    to8_last_marked_line = -1;
-}
+static int g_last_printed_line = -1;
 
 /* Reads physical line `line_num` (1-based) from `filename` into
  * `out` (leading whitespace trimmed, trailing newline stripped).
@@ -1011,39 +1036,6 @@ static int to8_read_source_line(const char *filename, int line_num,
     }
     fclose(f);
     return 0;
-}
-
-/* Called from to8_append(), before a new real instruction is
- * created. Emits a raw-text marker line if the current source line
- * differs from the last one we marked. Cheap in the common case
- * (one int compare) since file->line_num changes far less often
- * than instructions are emitted. */
-static void to8_maybe_emit_source_line(void)
-{
-    int line_num;
-    char text[512];
-    char marker[600];
-
-    /* Gated behind -g (tcc_state->do_debug), like any other debug-info
-     * feature - no new command-line flag needed. Without -g, the
-     * listing stays exactly as before this feature was added. */
-    if (!tcc_state || !tcc_state->do_debug)
-        return;
-
-    if (!g_in_function || !file)
-        return;
-
-    line_num = file->line_num;
-    if (line_num == to8_last_marked_line)
-        return;
-    to8_last_marked_line = line_num;
-
-    if (to8_read_source_line(file->filename, line_num, text, sizeof text) && text[0])
-        snprintf(marker, sizeof marker, "; L%d: %s", line_num, text);
-    else
-        snprintf(marker, sizeof marker, "; L%d", line_num);
-
-    to8_emit_raw_asm_n(marker, strlen(marker));
 }
 
 /* ===================================================================
@@ -2078,11 +2070,12 @@ static int to8_peephole_mov(void)
         to8_line *nxt = cur->next;
         if (cur->op == OP_LD &&
             nxt && !nxt->is_target && nxt->op == OP_ST) {
-            if (cur->slot_a == nxt->slot_a && cur->push_depth == nxt->push_depth) {
-                /* LD X ; ST X - pure no-op on memory. Can't always
-                 * delete cur if it's a jump target: turn it into a
-                 * harmless OP_NOP placeholder instead, so the label
-                 * still has somewhere valid to land. */
+            if (cur->slot_a == nxt->slot_a &&
+                cur->push_depth == nxt->push_depth) {
+                /*
+                 * LD X; ST X is a redundant self-store.
+                 * Keep a target line alive when necessary.
+                 */
                 if (cur->is_target) {
                     cur->op = OP_NOP;
                     cur->kind = ARG_NONE;
@@ -2097,21 +2090,31 @@ static int to8_peephole_mov(void)
                     continue;
                 }
             } else {
-                /* LD A ; ST B (A != B) -> MOV B,A, IN PLACE on cur -
-                 * same precedent as to8_peephole_ld_deref() v7.24.0:
-                 * whatever label was attached to cur stays attached
-                 * to the same id, now performing the MOV. */
+                int src_slot = cur->slot_a;
+                int dst_slot = nxt->slot_a;
+                char dst_desc[24];
+                char src_desc[24];
+            
+                /*
+                 * LD A; ST B becomes MOV B,A.
+                 * Mutate cur in place so its id, label, and list position survive.
+                 */
                 cur->op = OP_MOV;
-                cur->slot_b = nxt->slot_a;   /* adapte au champ exact
-                                                utilisé par ta branche
-                                                MOV existante */
-                /* recalcule cur->comment ici avec le même format que
-                 * la création de MOV déjà en place plus bas */
+                cur->kind = ARG_SLOT2;
+                cur->slot_a = dst_slot;
+                cur->slot_b = src_slot;
+            
+                slot_desc(dst_desc, sizeof dst_desc, dst_slot);
+                slot_desc(src_desc, sizeof src_desc, src_slot);
+                snprintf(cur->comment, sizeof cur->comment,
+                         "%s = %s", dst_desc, src_desc);
+                cur->has_comment = 1;
+            
                 to8_unlink(nxt);
             }
+            
             changed = 1;
-            cur = cur->next;
-            continue;
+            nxt = cur->next;
         }
         cur = nxt;
     }
@@ -2506,6 +2509,19 @@ static int to8_final_slot(int raw_slot, int push_depth)
 
 static void to8_render_line(to8_line *ln)
 {
+    if (tcc_state && tcc_state->do_debug && ln->src_line
+        && ln->src_line != g_last_printed_line) {
+        char text[512], marker[600];
+        g_last_printed_line = ln->src_line;
+        if (to8_read_source_line(file->filename, ln->src_line, text, sizeof text) && text[0])
+            snprintf(marker, sizeof marker, "; L%d: %s", ln->src_line, text);
+        else
+            snprintf(marker, sizeof marker, "; L%d", ln->src_line);
+        g_col = 0;
+        out_str(marker);
+        out_char('\n');
+    }
+    
     if (ln->is_target) {
         g_col = 0;
         out_char('@'); out_char('l'); out_int(ln->id); out_char(':'); out_char('\n');
@@ -2610,8 +2626,6 @@ void gfunc_prolog(Sym *func_sym)
     Sym *sym;
     int addr, size, align;
 
-    to8_reset_source_line_tracking();
-
     loc = 0;
     to8_list_reset();
     to8_temp_pool_reset();
@@ -2691,6 +2705,7 @@ void gfunc_epilog(void)
     to8_peephole_run();
     g_count_after = to8_count_lines();
 
+    g_last_printed_line = -1;
     to8_render_function();
     g_last_end_ind = ind;
     to8_free_list();
