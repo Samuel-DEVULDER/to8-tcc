@@ -1,8 +1,29 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.30.0 (peephole optim for jump inversions)
+ * Version: 7.31.0 (adds C source in asm when compiling with -g)
  *
  * Changelog:
+ * - v7.31.0: new source-line comment markers, gated behind -g. When the
+ *   user passes -g, to8_maybe_emit_source_line() - called from
+ *   to8_append() (the single choke point for every emitted instruction) -
+ *   prints "; L<n>: <source text>" whenever file->line_num changes since
+ *   the last marker, reusing the EXISTING to8_emit_raw_asm() raw-text
+ *   passthrough (no new rendering code). Without -g, behavior is
+ *   UNCHANGED - listings look exactly as before this feature existed.
+ *   Deliberately reuses tcc_state->do_debug rather than introducing a
+ *   new backend-specific command-line flag: source-line correlation is
+ *   conceptually debug info, and -g is the standard, already-documented
+ *   way to ask a compiler for it.
+ *   Source text is read fresh from disk on each line change (fopen+
+ *   fgets, no caching) - this is a debug listing tool, not a hot path,
+ *   so simplicity was chosen over performance. Tracking resets per
+ *   function (gfunc_prolog) so the first statement of a new function
+ *   always gets its own marker.
+ *   Known limitations, all accepted: one marker per physical source
+ *   line (not per C statement); macro-expanded lines report the macro
+ *   USE site; a moved/deleted source file degrades gracefully to
+ *   "; L<n>" with no text, never a hard error.
+ *
  * - v7.30.0: new peephole to8_peephole_jump_inversion(). Collapses the
  *   common "JCC label1 ; JMP label2 ; label1:" pattern into a single
  *   inverted branch "J!CC label2", dropping the now-redundant JMP and
@@ -325,7 +346,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.30.0"
+#define TO8_GEN_VERSION "7.31.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -737,8 +758,12 @@ static void to8_list_reset(void)
     g_pending_target_id = -1;
 }
 
+static void to8_maybe_emit_source_line(void);
+
 static to8_line *to8_append(to8_opcode op)
 {
+    to8_maybe_emit_source_line();		
+	
     to8_line *ln = tcc_mallocz(sizeof(to8_line));
     ln->op = op;
     ln->id = ++g_next_id;
@@ -874,6 +899,116 @@ ST_FUNC void to8_emit_raw_asm_n(const char *text, size_t len)
     }
     out_char('\n');
     g_last_end_ind = ind;
+}
+
+/* ===================================================================
+ * Source-line comment markers.
+ *
+ * Prints the current C source line right before the block of asm
+ * instructions it produced, e.g.:
+ *
+ *   ; L6: *d = *s;
+ *           MOV     4,16
+ *           LDU1    12
+ *           ...
+ *
+ * Design: track the last line number we already marked. At the
+ * single choke point to8_append(), before creating any real
+ * instruction, check if file->line_num changed. If so, read that
+ * line straight from the source file (no caching - this is a debug
+ * listing tool, not a hot path) and emit it as a raw-text line,
+ * reusing the SAME mechanism already used for asm() passthrough.
+ *
+ * Limitations (accepted, not bugs):
+ *   - one marker per PHYSICAL line, not per C statement (several
+ *     asm blocks on the same source line only get the first marker)
+ *   - macro-expanded code reports the line of the macro USE
+ *   - if the source file can't be reopened (moved/deleted since
+ *     compilation started), markers silently show just "; L<n>"
+ *     with no text - never a hard error
+ * =================================================================== */
+
+static int to8_last_marked_line = -1;
+
+/* Reset per function, so the very first statement of a new function
+ * always gets a marker, even if its line number happens to collide
+ * with the last line marked in a PREVIOUS function. */
+static void to8_reset_source_line_tracking(void)
+{
+    to8_last_marked_line = -1;
+}
+
+/* Reads physical line `line_num` (1-based) from `filename` into
+ * `out` (leading whitespace trimmed, trailing newline stripped).
+ * Returns 1 on success, 0 if the file could not be opened or the
+ * line does not exist (out is left as an empty string in that case -
+ * callers must never treat this as a fatal error). */
+static int to8_read_source_line(const char *filename, int line_num,
+                                 char *out, size_t outsz)
+{
+    FILE *f;
+    char buf[512];
+    int n = 0;
+
+    out[0] = 0;
+    if (line_num < 1 || !filename)
+        return 0;
+
+    f = fopen(filename, "r");
+    if (!f)
+        return 0;
+
+    while (fgets(buf, sizeof buf, f)) {
+        n++;
+        if (n == line_num) {
+            size_t len = strlen(buf);
+            const char *p = buf;
+
+            while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+                buf[--len] = 0;
+            while (*p == ' ' || *p == '\t')
+                p++;
+
+            snprintf(out, outsz, "%s", p);
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+/* Called from to8_append(), before a new real instruction is
+ * created. Emits a raw-text marker line if the current source line
+ * differs from the last one we marked. Cheap in the common case
+ * (one int compare) since file->line_num changes far less often
+ * than instructions are emitted. */
+static void to8_maybe_emit_source_line(void)
+{
+    int line_num;
+    char text[512];
+    char marker[600];
+
+    /* Gated behind -g (tcc_state->do_debug), like any other debug-info
+     * feature - no new command-line flag needed. Without -g, the
+     * listing stays exactly as before this feature was added. */
+    if (!tcc_state || !tcc_state->do_debug)
+        return;
+
+    if (!g_in_function || !file)
+        return;
+
+    line_num = file->line_num;
+    if (line_num == to8_last_marked_line)
+        return;
+    to8_last_marked_line = line_num;
+
+    if (to8_read_source_line(file->filename, line_num, text, sizeof text) && text[0])
+        snprintf(marker, sizeof marker, "; L%d: %s", line_num, text);
+    else
+        snprintf(marker, sizeof marker, "; L%d", line_num);
+
+    to8_emit_raw_asm_n(marker, strlen(marker));
 }
 
 /* ===================================================================
@@ -2434,6 +2569,8 @@ void gfunc_prolog(Sym *func_sym)
     CType *func_type = &func_sym->type;
     Sym *sym;
     int addr, size, align;
+
+    to8_reset_source_line_tracking();
 
     loc = 0;
     to8_list_reset();
