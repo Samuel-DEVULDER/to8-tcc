@@ -1,8 +1,43 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.31.0 (adds C source in asm when compiling with -g)
+ * Version: 7.31.1 (BUGFIX in to8_peephole_mov())
  *
  * Changelog:
+ * - v7.31.1: BUGFIX in to8_peephole_mov() - removed the overly
+ *   conservative !cur->is_target guard that silently blocked the
+ *   LD/ST -> MOV fusion (and the LD X;ST X redundant-store removal)
+ *   on every loop header, since a do-while-style loop's back-edge
+ *   target always lands on the FIRST instruction of the loop body -
+ *   exactly the cur position this pass wants to fuse. Confirmed via
+ *   a controlled test: reverting the unrelated -g source-line-marker
+ *   changes made NO difference, isolating the real cause to this
+ *   single guard, unrelated to the source-marker investigation of
+ *   v7.30.0/v7.31.0.
+ *   Fix: jump targets are resolved by id via to8_by_id(), never by
+ *   opcode or content, so a label attached to cur's id stays valid
+ *   no matter what instruction ends up AT that id. Same precedent
+ *   already established by to8_peephole_ld_deref() in v7.24.0 -
+ *   fuse IN PLACE on cur (reusing its id/is_target) instead of
+ *   allocating a new line and discarding cur:
+ *     - LD A;ST B, A!=B -> cur becomes MOV B,A directly, nxt (the ST)
+ *       is unlinked. cur's label, if any, now correctly marks the
+ *       MOV instead of the LD it replaced.
+ *     - LD X;ST X (pure redundant self-store) -> if cur is a jump
+ *       target it cannot simply be deleted (nothing would be left
+ *       to land on), so cur is turned into a harmless OP_NOP
+ *       placeholder instead, and only nxt is unlinked. Still saves
+ *       one instruction (the ST) even in the labeled case, rather
+ *       than skipping the optimization entirely.
+ *   !nxt->is_target is UNCHANGED and remains required: a jump landing
+ *   directly on the ST (skipping the LD) relies on R0 already holding
+ *   the right value at that entry point - fusing away nxt in that
+ *   case would leave the jump with nowhere valid to land.
+ *   Net effect: MOV fusion and redundant-store elimination now fire
+ *   correctly on loop headers (while/do-while bodies), a very common
+ *   shape (_f, _g, _copy, _puts all have this exact pattern) that was
+ *   silently missing this optimization since to8_peephole_mov() was
+ *   introduced.
+ *
  * - v7.31.0: new source-line comment markers, gated behind -g. When the
  *   user passes -g, to8_maybe_emit_source_line() - called from
  *   to8_append() (the single choke point for every emitted instruction) -
@@ -346,7 +381,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.31.0"
+#define TO8_GEN_VERSION "7.31.1"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -2041,8 +2076,7 @@ static int to8_peephole_mov(void)
     to8_line *cur = g_head;
     while (cur) {
         to8_line *nxt = cur->next;
-        if (cur->op == OP_LD && !cur->is_target &&
-            nxt && !nxt->is_target && nxt->op == OP_ST) {
+        if (cur->op == OP_LD && nxt && !nxt->is_target && nxt->op == OP_ST) {
             if (cur->slot_a == nxt->slot_a && cur->push_depth == nxt->push_depth) {
                 to8_line *scan_from = nxt->next;
                 to8_unlink(cur);
