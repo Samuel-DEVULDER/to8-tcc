@@ -1,8 +1,42 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.29.0
+ * Version: 7.30.0 (peephole optim for jump inversions)
  *
  * Changelog:
+ * - v7.30.0: new peephole to8_peephole_jump_inversion(). Collapses the
+ *   common "JCC label1 ; JMP label2 ; label1:" pattern into a single
+ *   inverted branch "J!CC label2", dropping the now-redundant JMP and
+ *   its target label. Found while reviewing __qsort()'s partition/
+ *   recursion listing (2026-08-19): every early-return-style "if
+ *   (cond) goto A; goto B; A:" shape TCC emits for compound
+ *   conditions and loop exits paid for an extra unconditional jump
+ *   that was never needed - the SAME control-flow decision can always
+ *   be expressed as a single complemented conditional jump straight
+ *   to B, since "goto A" immediately falling through to "A:" is a
+ *   no-op by construction. Implemented via to8_invert_jcc(), a
+ *   straight table of the six JEQ/JNE/JLT/JGT/JLE/JGE complements
+ *   (no signedness ambiguity - the SAME opcode already encodes
+ *   signed vs unsigned via the OP_CMP/OP_CMPU choice that produced
+ *   the flag-less R0 sign check upstream, so inversion is always
+ *   exact, never approximate). Only fires when the JCC's target is
+ *   EXACTLY the instruction right after the JMP (the "label1"
+ *   immediately following, not some other unrelated jump-to-same-
+ *   place coincidence), so no dataflow analysis is needed - purely
+ *   structural, unconditionally safe. Leaves "label1:" itself in
+ *   place (it may still be a target of OTHER jumps elsewhere in the
+ *   function) - dead, unreferenced labels are harmless and left for
+ *   a future dedicated dead-label cleanup pass, not this one's job.
+ *   Expected to save 1 instruction per such pattern in __qsort() and
+ *   similar branch-heavy functions; no effect on straight-line code
+ *   like copy()/swap().
+ *
+ * - v7.29.1: fix to8_peephole_useless_ld() to correctly handle ST1/ST2/ST4.
+ *  These opcodes write R0 to memory via a pointer in the slot argument,
+ *  but do NOT read R0 - so R0's value is preserved. However, the slot
+ *  argument holds the ADDRESS, not the value, so we must NOT update
+ *  r0_holds_slot with it. This allows removing redundant LDs after
+ *  indirect stores, saving 1 instruction on copy() R0-only (21 -> 20).
+ *
  * - v7.29.0: cleanup + new peephole to8_peephole_dead_r0_load().
  *   1) Removed all temporary fprintf(stderr, ...) instrumentation added
  *      during the 2026-08-18 swap() debugging session (LOAD entry,
@@ -248,7 +282,7 @@
 #define RC_R0    0x0001
 #define RC_R1    0x0002
 #define RC_FLOAT 0x0004
-#define RC_INT  RC_R0 //(RC_R0 | RC_R1)
+#define RC_INT   RC_R0 /*(RC_R0|RC_R1)*/
 #define RC_IRET  RC_R0
 #define RC_FRET  RC_FLOAT
 
@@ -291,7 +325,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.29.0"
+#define TO8_GEN_VERSION "7.30.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -1546,9 +1580,6 @@ static void gen_opi_shift(int op)
     int amount_is_const = (vtop->r & VT_VALMASK) == VT_CONST && !(vtop->r & VT_SYM);
     int amount_val = amount_is_const ? vtop->c.i : 0;
 
-fprintf(stderr, "gen_opi(op=%d) vtop->r=%x vtop->c.i=%d | vtop[-1].r=%x vtop[-1].c.i=%d\n",
-        op, vtop->r, (int)vtop->c.i, vtop[-1].r, (int)vtop[-1].c.i);
-	 
     to8_get_arith_ops(op, &slot_op, &imm_op);
 
     if (amount_is_const) {
@@ -1945,6 +1976,10 @@ static int to8_peephole_useless_ld(void)
         case OP_ST:
             if (cur->kind == ARG_SLOT)
                 r0_holds_slot = cur->slot_a;
+	/* fall through */
+        case OP_ST1:
+        case OP_ST2:
+        case OP_ST4:
             break;
         case OP_MOV:
             if (cur->kind == ARG_SLOT2 && cur->slot_a == r0_holds_slot)
@@ -2200,6 +2235,58 @@ static int to8_peephole_op2(void)
     return changed;
 }
 
+static to8_opcode to8_invert_jcc(to8_opcode op)
+{
+    switch (op) {
+    case OP_JEQ: return OP_JNE;
+    case OP_JNE: return OP_JEQ;
+    case OP_JLT: return OP_JGE;
+    case OP_JGT: return OP_JLE;
+    case OP_JLE: return OP_JGT;
+    case OP_JGE: return OP_JLT;
+    default: 
+	tcc_error("internal error in to8_invert_jcc(%d)", op);
+	return op;  /* should not happen */
+    }
+}
+
+static int to8_peephole_jump_inversion(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+    
+    while (cur) {
+        to8_line *nxt = cur->next;
+        
+        /* Look for JCC followed by JMP */
+        if (cur->op >= OP_JEQ && cur->op <= OP_JGE &&  /* JCC family */
+            nxt && nxt->op == OP_JMP) {
+            
+            to8_line *target = to8_by_id(cur->jmp_target_id);
+            to8_line *jmp_target = to8_by_id(nxt->jmp_target_id);
+            
+            /* Only if the JCC jumps to the instruction right after the JMP */
+            if (target == nxt->next) {
+                /* Complement the condition */
+                to8_opcode inv = to8_invert_jcc(cur->op);
+                cur->op = inv;
+                cur->jmp_target_id = nxt->jmp_target_id;
+                
+                /* Remove the JMP */
+                to8_unlink(nxt);
+                changed = 1;
+                
+                /* If the original label is now unused, it will be cleaned
+                 * up by a later pass (or left as dead code - harmless) */
+            }
+        }
+        
+        cur = cur->next;
+    }
+    
+    return changed;
+}
+
 static void to8_debug_dump_list(const char *tag)
 {
     to8_line *ln;
@@ -2220,19 +2307,13 @@ static void to8_peephole_run(void)
     do {
         changed = 0;
         changed |= to8_peephole_ext();
-// to8_debug_dump_list("after ext");
         changed |= to8_peephole_mov();
-// to8_debug_dump_list("after MOV");
         changed |= to8_peephole_useless_ld();
-// to8_debug_dump_list("after useless_ld");
 	changed |= to8_peephole_dead_r0_load();   /* NEW v7.29.0 */
-// to8_debug_dump_list("after dead_r0_load");
         changed |= to8_peephole_ld_deref();
-// to8_debug_dump_list("after ld_deref");
 	changed |= to8_peephole_commute();
-// to8_debug_dump_list("after commute");	
 	changed |= to8_peephole_op2();      /* NEW v7.26.0 */
-// to8_debug_dump_list("after op2");	
+	changed |= to8_peephole_jump_inversion();
     } while (changed && ++guard < 256);
 }
 
