@@ -2076,36 +2076,42 @@ static int to8_peephole_mov(void)
     to8_line *cur = g_head;
     while (cur) {
         to8_line *nxt = cur->next;
-        if (cur->op == OP_LD && nxt && !nxt->is_target && nxt->op == OP_ST) {
+        if (cur->op == OP_LD &&
+            nxt && !nxt->is_target && nxt->op == OP_ST) {
             if (cur->slot_a == nxt->slot_a && cur->push_depth == nxt->push_depth) {
-                to8_line *scan_from = nxt->next;
-                to8_unlink(cur);
+                /* LD X ; ST X - pure no-op on memory. Can't always
+                 * delete cur if it's a jump target: turn it into a
+                 * harmless OP_NOP placeholder instead, so the label
+                 * still has somewhere valid to land. */
+                if (cur->is_target) {
+                    cur->op = OP_NOP;
+                    cur->kind = ARG_NONE;
+                    cur->has_comment = 0;
+                    to8_unlink(nxt);
+                } else {
+                    to8_line *scan_from = nxt->next;
+                    to8_unlink(cur);
+                    to8_unlink(nxt);
+                    cur = scan_from;
+                    changed = 1;
+                    continue;
+                }
+            } else {
+                /* LD A ; ST B (A != B) -> MOV B,A, IN PLACE on cur -
+                 * same precedent as to8_peephole_ld_deref() v7.24.0:
+                 * whatever label was attached to cur stays attached
+                 * to the same id, now performing the MOV. */
+                cur->op = OP_MOV;
+                cur->slot_b = nxt->slot_a;   /* adapte au champ exact
+                                                utilisé par ta branche
+                                                MOV existante */
+                /* recalcule cur->comment ici avec le même format que
+                 * la création de MOV déjà en place plus bas */
                 to8_unlink(nxt);
-                cur = scan_from;
-                changed = 1;
-                continue;
             }
-            {
-                to8_line *mov = tcc_mallocz(sizeof(to8_line));
-                to8_line *scan_from;
-                char desc_dst[24], desc_src[24];
-                mov->op = OP_MOV;
-                mov->kind = ARG_SLOT2;
-                mov->slot_a = nxt->slot_a;
-                mov->slot_b = cur->slot_a;
-                mov->push_depth = nxt->push_depth;
-                slot_desc(desc_dst, sizeof desc_dst, mov->slot_a);
-                slot_desc(desc_src, sizeof desc_src, mov->slot_b);
-                snprintf(mov->comment, sizeof mov->comment, "%s = %s", desc_dst, desc_src);
-                mov->has_comment = 1;
-                to8_insert_after(cur, mov);
-                to8_unlink(cur);
-                to8_unlink(nxt);
-                scan_from = mov->next;
-                cur = scan_from;
-                changed = 1;
-                continue;
-            }
+            changed = 1;
+            cur = cur->next;
+            continue;
         }
         cur = nxt;
     }
