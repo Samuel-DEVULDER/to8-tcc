@@ -1,8 +1,31 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.32.0 (source-line markers are now instruction metadata rendered only at final listing time under -g.)
+ * Version: 7.33.0 (try to use real variable names when compiling with -g.)
  *
  * Changelog:
+ * - v7.33.0: variable name recovery for slot_desc(), gated behind -g.
+ *   Without -g, listings are byte-for-byte identical to before this
+ *   feature existed ("local[N]"/"param[N]").
+ *
+ *   With -g, slot_desc() resolves the real declared name of a local
+ *   variable or parameter when available, by walking local_stack for
+ *   a matching Sym (matched on Sym.c, the same stack offset used by
+ *   SValue for VT_LOCAL/VT_LLOCAL access; named via Sym.v through
+ *   get_tok_str()). Compiler-generated temporaries (to8_temp_alloc)
+ *   have no matching Sym and fall back gracefully to the previous
+ *   "local[N]"/"param[N]" text.
+ *
+ *   Lookups go through a fixed 32-entry LRU cache (to8_slot_cache)
+ *   rather than a bounded pre-built table, so there is no cap on the
+ *   number of distinct variables a function can have - only the cache
+ *   hit rate varies with locality, never coverage. The cache is reset
+ *   once per function in gfunc_prolog(), since slot numbers are reused
+ *   across functions (loc starts at 0 each time).
+ *
+ *   This is a debug-listing convenience only: it never affects
+ *   optimization, instruction selection, or generated code, exactly
+ *   like the -g source-line markers it complements.
+ *
  * - v7.32.0: source-line markers are now stored as metadata on each
  *   real instruction and emitted only during final listing rendering
  *   when -g is enabled. Previously, each marker was inserted as a
@@ -409,7 +432,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.32.0"
+#define TO8_GEN_VERSION "7.33.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -421,6 +444,7 @@ ST_FUNC void gen_bounds_epilog(void) {}
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
 
 ST_DATA const char * const target_machine_defs =
     "__TO8__\0"
@@ -1039,13 +1063,165 @@ static int to8_read_source_line(const char *filename, int line_num,
 }
 
 /* ===================================================================
+ * Code to obtain real param/argument name
+ * ===================================================================*/
+
+#define TO8_SLOT_NAME_CACHE_SIZE 32
+
+typedef struct to8_slot_cache_entry {
+    struct to8_slot_cache_entry *prev;
+    struct to8_slot_cache_entry *next;
+    int slot;
+    char name[64];
+    bool in_use;     /* pool slot currently holds a live entry */
+    bool has_name;   /* true = name[] is valid, false = cached "no name found" */
+} to8_slot_cache_entry;
+
+typedef struct to8_slot_cache {
+    to8_slot_cache_entry pool[TO8_SLOT_NAME_CACHE_SIZE];
+    to8_slot_cache_entry *head;   /* most recently used */
+    to8_slot_cache_entry *tail;   /* least recently used */
+    int count;                    /* number of pool slots currently in use */
+} to8_slot_cache;
+
+static to8_slot_cache g_slot_cache;
+
+static void to8_slot_cache_unlink(to8_slot_cache *c, to8_slot_cache_entry *e)
+{
+    if (e->prev) e->prev->next = e->next; else c->head = e->next;
+    if (e->next) e->next->prev = e->prev; else c->tail = e->prev;
+}
+
+static void to8_slot_cache_push_front(to8_slot_cache *c, to8_slot_cache_entry *e)
+{
+    e->prev = NULL;
+    e->next = c->head;
+    if (c->head)
+        c->head->prev = e;
+    c->head = e;
+    if (!c->tail)
+        c->tail = e;
+}
+
+static void to8_slot_cache_reset(to8_slot_cache *c)
+{
+    int i;
+    for (i = 0; i < TO8_SLOT_NAME_CACHE_SIZE; i++) {
+        c->pool[i].in_use = false;
+        c->pool[i].has_name = false;
+        c->pool[i].prev = NULL;
+        c->pool[i].next = NULL;
+    }
+    c->head = NULL;
+    c->tail = NULL;
+    c->count = 0;
+}
+
+static to8_slot_cache_entry *to8_slot_cache_find(to8_slot_cache *c, int slot)
+{
+    to8_slot_cache_entry *e;
+
+    for (e = c->head; e; e = e->next) {
+        if (e->slot == slot) {
+            if (e != c->head) {
+                to8_slot_cache_unlink(c, e);
+                to8_slot_cache_push_front(c, e);
+            }
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static to8_slot_cache_entry *to8_slot_cache_acquire(to8_slot_cache *c)
+{
+    to8_slot_cache_entry *e;
+
+    if (c->count < TO8_SLOT_NAME_CACHE_SIZE) {
+        e = &c->pool[c->count++];
+    } else {
+        e = c->tail;
+        to8_slot_cache_unlink(c, e);
+    }
+    e->in_use = true;
+    return e;
+}
+
+static void to8_slot_cache_insert(to8_slot_cache *c, int slot, const char *name)
+{
+    to8_slot_cache_entry *e = to8_slot_cache_acquire(c);
+
+    e->slot = slot;
+    if (name && name[0]) {
+        snprintf(e->name, sizeof e->name, "%s", name);
+        e->has_name = true;
+    } else {
+        e->name[0] = '\0';
+        e->has_name = false;
+    }
+    to8_slot_cache_push_front(c, e);
+}
+
+/*
+ * Look up slot -> variable name, through an LRU cache backed by a
+ * linear local_stack scan on miss. Debug-listing helper, not a hot
+ * path - the fallback scan is O(n) in the number of active locals,
+ * but rendering accesses are highly localized, so a modest cache
+ * absorbs almost all repeat lookups. No cap on the number of
+ * DISTINCT variables a function can have - only cache hit rate
+ * varies with locality, never coverage.
+ */
+static const char *to8_slot_name(int slot)
+{
+    to8_slot_cache_entry *e;
+    Sym *s;
+    const char *found_name;
+
+    /*
+     * Variable-name recovery is a debug-info feature like the
+     * source-line markers - gated behind -g so it costs nothing
+     * (no local_stack scan, no cache lookup) unless the user asked
+     * for it. Without -g, listings render exactly as before this
+     * feature existed: "local[N]" / "param[N]".
+     */
+    if (!tcc_state || !tcc_state->do_debug)
+        return NULL;
+	
+    e = to8_slot_cache_find(&g_slot_cache, slot);
+    if (e)
+        return e->has_name ? e->name : NULL;
+
+    found_name = NULL;
+    for (s = local_stack; s; s = s->prev) {
+        if ((s->r & VT_VALMASK) != VT_LOCAL && (s->r & VT_VALMASK) != VT_LLOCAL)
+            continue;
+        if (!s->v || s->v >= SYM_FIRST_ANOM)
+            continue;
+        if (s->c != slot)
+            continue;
+        found_name = get_tok_str(s->v, NULL);
+        break;
+    }
+
+    to8_slot_cache_insert(&g_slot_cache, slot, found_name);
+
+    return found_name && found_name[0] ? found_name : NULL;
+}
+
+/* ===================================================================
  * Comment templates - switch on the enum, computed eagerly.
  * =================================================================== */
 
 static void slot_desc(char *out, size_t outsz, int slot)
 {
-    if (slot < 0) snprintf(out, outsz, "local[%d]", -slot);
-    else snprintf(out, outsz, "param[%d]", slot);
+    const char *name = to8_slot_name(slot);
+
+    if (name)
+        snprintf(out, outsz, "%s", name);
+    else if (slot < 0)
+        snprintf(out, outsz, "local[%d]", -slot-4);
+    else
+        snprintf(out, outsz, "param[%d]", slot);
 }
 
 static const char *to8_size_name(to8_opcode op)
@@ -2629,6 +2805,7 @@ void gfunc_prolog(Sym *func_sym)
     loc = 0;
     to8_list_reset();
     to8_temp_pool_reset();
+    to8_slot_cache_reset(&g_slot_cache);
     r1_shadow_valid = 0;
     cur_push_depth = 0;
     g_in_function = 1;
