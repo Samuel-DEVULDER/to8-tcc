@@ -1,8 +1,29 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.33.1 (bugfix in line numbering)
+ * Version: 7.34.0 (bugfix in param index)
  *
  * Changelog:
+ * - v7.34.0: CORRECTNESS FIX in gfunc_prolog()'s parameter address
+ *   computation. The loop over function parameters did
+ *   `addr += size; sym_push(..., addr);` - incrementing addr by the
+ *   CURRENT parameter's own size BEFORE recording its offset, so
+ *   every parameter's stored address pointed past its own storage
+ *   instead of at its start. For f(char *s, char *d), s was recorded
+ *   at offset 8 instead of 4, and d at offset 12 instead of 8 - each
+ *   parameter shifted upward by its own width, cumulatively across
+ *   all parameters of a function.
+ *
+ *   Fix: swap the two statements so sym_push() records addr BEFORE
+ *   it is advanced for the next parameter - the standard "use, then
+ *   advance" pattern, matching the stack layout at function entry
+ *   (<return address> <1st arg> <2nd arg> ..., all on 4-byte slots,
+ *   no saved frame pointer since this backend never pushes one).
+ *
+ *   This changes every displayed parameter slot number and every
+ *   ADD/LD/ST/MOV instruction referencing a parameter across all
+ *   existing listings - expected, since the old addresses were wrong,
+ *   not just displayed differently.
+ *
  * - v7.33.1: fixed a real bug in source-line tracking (introduced in
  *   v7.32.0's metadata refactor) affecting every to8_line created
  *   from inline asm() text. to8_append() read file->line_num to
@@ -460,7 +481,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.33.1"
+#define TO8_GEN_VERSION "7.34.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -2882,8 +2903,8 @@ void gfunc_prolog(Sym *func_sym)
     while ((sym = sym->next) != NULL) {
         size = type_size(&sym->type, &align);
         size = (size + TO8_STACK_ALIGN - 1) & ~(TO8_STACK_ALIGN - 1);
-        addr += size;
-        sym_push(sym->v & ~SYM_FIELD, &sym->type, VT_LOCAL | VT_LVAL, addr);
+        sym_push(sym->v & ~SYM_FIELD, &sym->type, VT_LOCAL | VT_LVAL, addr);  /* utilise D'ABORD */
+        addr += size;                                                        /* puis incrémente */
     }
 
 #ifdef CONFIG_TCC_BCHECK
