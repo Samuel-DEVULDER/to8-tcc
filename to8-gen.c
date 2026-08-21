@@ -1,8 +1,20 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.34.0 (bugfix in param index)
+ * Version: 7.35.0 (local[] and param[] indices in listing comments are now
+ *   plain slot counts)
  *
  * Changelog:
+ * - v7.35.0: local[] and param[] indices in listing comments are now
+ *   plain slot counts (byte offset / TO8_STACK_ALIGN), 0-based,
+ *   instead of raw byte offsets. The first local (slot == -4) shows
+ *   as local[0]; the first parameter (slot == PTR_SIZE, right after
+ *   the return address) shows as param[0]. Gaps in the sequence are
+ *   accepted wherever a value wider than one 4-byte slot is involved
+ *   (a double/long long local, or a hidden struct-return pointer
+ *   reserving param slot 0) - the goal is only to avoid showing raw
+ *   multiples of TO8_STACK_ALIGN in the comment text, not to
+ *   guarantee a gap-free sequence.
+ *
  * - v7.34.0: CORRECTNESS FIX in gfunc_prolog()'s parameter address
  *   computation. The loop over function parameters did
  *   `addr += size; sym_push(..., addr);` - incrementing addr by the
@@ -481,7 +493,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.34.0"
+#define TO8_GEN_VERSION "7.35.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -1277,12 +1289,13 @@ static void slot_desc(char *out, size_t outsz, int slot)
 {
     const char *name = to8_slot_name(slot);
 
-    if (name)
+    if (name) {
         snprintf(out, outsz, "%s", name);
-    else if (slot < 0)
-        snprintf(out, outsz, "local[%d]", -slot/4-1);
-    else
-        snprintf(out, outsz, "param[%d]", slot/4);
+    } else if (slot < 0) {
+        snprintf(out, outsz, "local[%d]", (-slot) / TO8_STACK_ALIGN - 1);
+    } else {
+        snprintf(out, outsz, "param[%d]", slot / TO8_STACK_ALIGN - 1);
+    }
 }
 
 static const char *to8_size_name(to8_opcode op)
