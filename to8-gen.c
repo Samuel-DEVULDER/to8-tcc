@@ -1,8 +1,36 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.33.0 (try to use real variable names when compiling with -g.)
+ * Version: 7.33.1 (bugfix in line numbering)
  *
  * Changelog:
+ * - v7.33.1: fixed a real bug in source-line tracking (introduced in
+ *   v7.32.0's metadata refactor) affecting every to8_line created
+ *   from inline asm() text. to8_append() read file->line_num to
+ *   stamp ln->src_line, but for lines created via
+ *   to8_emit_raw_asm_n() (called from asm_opcode() in to8-stubs.c),
+ *   file could still point at the ":asm:" pseudo-BufferedFile opened
+ *   by tcc_assemble_inline() - a fresh buffer whose line_num starts
+ *   at 1, unrelated to the real source line of the asm() call.
+ *
+ *   Symptom: the first raw-text line of any asm()-only function (or
+ *   the first asm() statement in a function) got src_line = 1. At
+ *   render time, file had already moved back to the real source file,
+ *   so to8_read_source_line() correctly read ITS line 1 - producing a
+ *   plausible-looking but completely wrong marker (verbatim text from
+ *   the first line of the file, e.g. another function's declaration).
+ *
+ *   Fix: when computing ln->src_line in to8_append(), walk file->prev
+ *   past any BufferedFile named ":asm:" before reading line_num -
+ *   the exact same defensive pattern asm_opcode() itself has used
+ *   since v7.20.0, for the identical underlying reason (tcc_assemble_
+ *   inline()'s virtual :asm: buffer is not the real enclosing file
+ *   and must never be trusted blindly for position information).
+ *
+ *   Verified: _putc and _test_asm (both asm()-only bodies) now show
+ *   their correct source lines (L111/L112, L116-L119) with the actual
+ *   __native_asm(...) call text, instead of a stale line 1 marker
+ *   borrowed from an unrelated earlier function.
+ *
  * - v7.33.0: variable name recovery for slot_desc(), gated behind -g.
  *   Without -g, listings are byte-for-byte identical to before this
  *   feature existed ("local[N]"/"param[N]").
@@ -432,7 +460,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.33.0"
+#define TO8_GEN_VERSION "7.33.1"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -862,11 +890,23 @@ static to8_line *to8_append(to8_opcode op)
 
     /*
      * Store source information on the real instruction itself.
-     * No synthetic comment node is inserted into the instruction list.
+     *
+     * file may still point at the ":asm:" pseudo-BufferedFile opened by
+     * tcc_assemble_inline() when this line is created from inline asm
+     * text (see asm_opcode() in to8-stubs.c) - that buffer's line_num
+     * starts fresh at 1 and has nothing to do with the real source line
+     * of the asm() call. Walk file->prev past any such pseudo-buffers to
+     * reach the real enclosing file before reading line_num, exactly
+     * like asm_opcode() already does for the SAME reason (see its
+     * v7.20.0 changelog entry).
      */
-    if (tcc_state && tcc_state->do_debug && g_in_function && file)
-        ln->src_line = file->line_num;
-
+    if (tcc_state && tcc_state->do_debug && g_in_function && file) {
+        BufferedFile *bf = file;
+        while (bf && strcmp(bf->filename, ":asm:") == 0)
+            bf = bf->prev;
+        if (bf)
+            ln->src_line = bf->line_num;
+    }
     ind = to8_func_start_ind + ln->id + 1;
     return ln;
 }
@@ -1219,9 +1259,9 @@ static void slot_desc(char *out, size_t outsz, int slot)
     if (name)
         snprintf(out, outsz, "%s", name);
     else if (slot < 0)
-        snprintf(out, outsz, "local[%d]", -slot-4);
+        snprintf(out, outsz, "local[%d]", -slot/4-1);
     else
-        snprintf(out, outsz, "param[%d]", slot);
+        snprintf(out, outsz, "param[%d]", slot/4);
 }
 
 static const char *to8_size_name(to8_opcode op)
