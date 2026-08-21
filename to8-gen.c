@@ -1,9 +1,16 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.35.0 (local[] and param[] indices in listing comments are now
- *   plain slot counts)
+ * Version: 7.36.0 (fix gfunc_prolog() struct-return test.)
  *
  * Changelog:
+ * - v7.36.0: fix gfunc_prolog() struct-return test. VT_STRUCT (7) is a
+ *   VT_BTYPE enum value, not an isolated bit - "t & VT_STRUCT" matched
+ *   any return type whose low bits overlap 0b111 (int, char, short,
+ *   ptr...), reserving a bogus extra PTR_SIZE before the first param
+ *   and shifting every param[] index by one. void-returning functions
+ *   (VT_VOID=0) were immune, which is why _copy/_swap looked fine while
+ *   _h/_f/_g/mul_simple didn't. Fixed: (func_vt.t & VT_BTYPE) == VT_STRUCT.
+ * 
  * - v7.35.0: local[] and param[] indices in listing comments are now
  *   plain slot counts (byte offset / TO8_STACK_ALIGN), 0-based,
  *   instead of raw byte offsets. The first local (slot == -4) shows
@@ -493,7 +500,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.35.0"
+#define TO8_GEN_VERSION "7.36.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -2907,7 +2914,7 @@ void gfunc_prolog(Sym *func_sym)
 
     addr = PTR_SIZE;
 
-    if (func_vt.t & VT_STRUCT) {
+    if ((func_vt.t & VT_BTYPE) == VT_STRUCT) {
         func_vc = addr;
         addr += PTR_SIZE;
     }
