@@ -1,8 +1,16 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.36.0 (fix gfunc_prolog() struct-return test.)
+ * Version: 7.37.0 (uses PUSHi to push adresses)
  *
  * Changelog:
+ * - v7.37.0: gfunc_call() argument-pushing loop - the VT_SYM branch
+ *   (pure symbol-address argument, e.g. &L.3 for a string literal)
+ *   used to materialize the address in R0 via eop_addr(OP_LDi, ...)
+ *   then push_r0(). Replaced with a direct e_push_addr(sym, c) call,
+ *   saving 1 instruction per call site (puts("...") and any &symbol
+ *   argument). to8_render_line()'s ARG_SYM case already renders any
+ *   opcode generically, including PUSHi - no rendering change needed.
+ *
  * - v7.36.0: fix gfunc_prolog() struct-return test. VT_STRUCT (7) is a
  *   VT_BTYPE enum value, not an isolated bit - "t & VT_STRUCT" matched
  *   any return type whose low bits overlap 0b111 (int, char, short,
@@ -500,7 +508,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.36.0"
+#define TO8_GEN_VERSION "7.37.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -1557,6 +1565,24 @@ static void e_push_slot(int slot)
     to8_track_push();
 }
 
+static void e_push_addr(Sym *sym, int c)
+{
+    to8_line *ln = to8_append(OP_PUSHi);
+    char desc[32];
+    ln->kind = ARG_SYM;
+    ln->sym = sym;
+    ln->sym_addend = c;
+    if (sym) {
+        const char *name = get_tok_str(sym->v, NULL);
+        snprintf(desc, sizeof desc, "%s", name ? name : "?");
+    } else {
+        snprintf(desc, sizeof desc, "%d", c);
+    }
+    snprintf(ln->comment, sizeof ln->comment, "push %s", desc);
+    ln->has_comment = 1;
+    to8_track_push();
+}
+
 static void e_push_r0(void) { e_op(OP_PUSHr); to8_track_push(); }
 
 /* ===================================================================
@@ -2249,8 +2275,7 @@ void gfunc_call(int nb_args)
         } else if (v == VT_LOCAL || v == VT_LLOCAL) {
             e_push_slot(sv->c.i);
         } else if (sv->r & VT_SYM) {
-            e_op_addr(OP_LDi, sv->sym, sv->c.i);
-            e_push_r0();
+            e_push_addr(sv->sym, sv->c.i);
         } else {
             load(TREG_R0, sv);
             e_push_r0();
