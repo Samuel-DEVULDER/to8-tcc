@@ -1,8 +1,13 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.38.0 (removed all dead code related to the virtual R1 register)
+ * Version: 7.39.0 (optim  for variable <non-commutative-op> const)
  *
  * Changelog:
+ * - v7.39.0: new fast path in gen_opi() for non-commutative ops (SUB,
+ *   DIV, MOD, and their unsigned UDIV/UMOD variants) with a constant
+ *   RIGHT-hand operand - the extremely common "variable - constant"
+ *   shape (e.g. "d - 1", "p - 1", "i % 10", "return d-1;").
+ *
  * - v7.38.0: removed all dead code related to the virtual R1 register.
  *   RC_INT has been #define'd to RC_R0 alone since early on, which means
  *   gv(RC_INT) can never return TREG_R1 - no caller of load()/store()
@@ -536,7 +541,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.38.0"
+#define TO8_GEN_VERSION "7.39.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -2019,7 +2024,8 @@ static void gen_opi_shift(int op)
         int v1, c1, temp;
         v1 = vtop[-1].r & VT_VALMASK;
         c1 = vtop[-1].c.i;
-	
+
+
         if (v1 == TREG_R0) {
             int pre_spill = to8_temp_alloc(4, 4);
             e_op_slot(OP_ST, pre_spill);
@@ -2094,6 +2100,36 @@ void gen_opi(int op)
 
     v1 = vtop[-1].r & VT_VALMASK;
     c1 = vtop[-1].c.i;
+    
+    /*
+     * v7.39.0: capture whether the RIGHT operand (top of stack) is a
+     * plain constant BEFORE gv(RC_INT) materializes it into R0 and
+     * destroys that information. Needed for the fast path below, which
+     * handles the extremely common "variable - constant" shape (SUB/
+     * DIV/MOD with a constant right-hand side, e.g. "d - 1", "p - 1",
+     * "i % 10") without spilling the constant to a temp slot first.
+     *
+     * The existing code only special-cased a constant LEFT operand
+     * (e.g. "1 - d"); a constant RIGHT operand with SUB/DIV/MOD fell
+     * through to the generic to8_spill_and_reload() dance instead,
+     * wasting one instruction: LDi <const> ; ST <temp> ; LD <left> ;
+     * <op> <temp> (the last two fused into <op>2 by the peephole),
+     * instead of the two-instruction LD <left> ; <op>i <const>.
+     */
+    int v0_is_const = (vtop->r & VT_VALMASK) == VT_CONST && !(vtop->r & VT_SYM);
+    int c0 = v0_is_const ? vtop->c.i : 0;
+    
+    if (!to8_is_commutative(op) && v0_is_const && v1 != VT_CONST) {
+        to8_opcode slot_op, imm_op;
+        if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) { vpop(); return; }
+        vpop();                 /* drop the constant right operand */
+        gv(RC_INT);             /* materialize the LEFT operand into R0 */
+        e_op_imm(imm_op, c0);   /* R0 = R0 op constant, one instruction, no spill */
+        vtop->r = TREG_R0;
+        vtop->r2 = VT_CONST;
+        return;
+    }
+
 
     if (v1 == TREG_R0) {
         int pre_spill = to8_temp_alloc(4, 4);
