@@ -1,8 +1,38 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.37.0 (uses PUSHi to push adresses)
+ * Version: 7.38.0 (removed all dead code related to the virtual R1 register)
  *
  * Changelog:
+ * - v7.38.0: removed all dead code related to the virtual R1 register.
+ *   RC_INT has been #define'd to RC_R0 alone since early on, which means
+ *   gv(RC_INT) can never return TREG_R1 - no caller of load()/store()
+ *   ever forces r == TREG_R1 explicitly either. Every branch conditioned
+ *   on TREG_R1 was therefore unreachable dead code, confirmed by
+ *   re-testing swap()/copy()/f()/g()/h()/mul_complex2()/__qsort(): all
+ *   listings are byte-for-byte identical before and after this cleanup.
+ *
+ *   Removed:
+ *   - RC_R1 and the TREG_R1 enum value (NB_REGS: 3 -> 2, reg_classes[]
+ *     now holds only RC_R0/RC_FLOAT).
+ *   - to8_r1_slot() and its backing r1_shadow_slot/r1_shadow_valid
+ *     shadow-slot machinery.
+ *   - load()'s TREG_R0<->TREG_R1 short-circuit pair, and its whole
+ *     save_slot mechanism (it existed solely to preserve R0 across the
+ *     r == TREG_R1 case at function exit).
+ *   - store()'s three "if (r == TREG_R1) e_op_slot(OP_LD, ...)" reload
+ *     guards, and the from_pool/addr_slot ternaries in both the float
+ *     store branch and the fr != TREG_R0 indirect-store branch.
+ *   - gen_opi_shift()/gen_opi(): four "(v1 == TREG_R1) ? to8_r1_slot()
+ *     : c1" ternaries collapsed to plain "c1", since v1 can only ever
+ *     be TREG_R0 or a VT_CONST/slot value at those points.
+ *
+ *   Purely a simplification/readability pass - zero effect on emitted
+ *   code, since none of this logic was ever exercised. R1 remains
+ *   documented in the "Architecture" note below purely as a historical
+ *   marker of the original two-integer-register design that was never
+ *   completed; a future backend revision may either resurrect it as a
+ *   real second register or drop the architecture comment entirely.
+ *
  * - v7.37.0: gfunc_call() argument-pushing loop - the VT_SYM branch
  *   (pure symbol-address argument, e.g. &L.3 for a string literal)
  *   used to materialize the address in R0 via eop_addr(OP_LDi, ...)
@@ -458,21 +488,19 @@
 
 #ifdef TARGET_DEFS_ONLY
 
-#define NB_REGS 3
+#define NB_REGS 2
 #define NB_ASM_REGS 0
 #define CONFIG_TCC_ASM
 
 #define RC_R0    0x0001
-#define RC_R1    0x0002
 #define RC_FLOAT 0x0004
-#define RC_INT   RC_R0 /*(RC_R0|RC_R1)*/
+#define RC_INT   RC_R0
 #define RC_IRET  RC_R0
 #define RC_FRET  RC_FLOAT
 
 enum {
     TREG_R0 = 0,
     TREG_F0 = 1,
-    TREG_R1 = 2,
     TREG_MEM = 0x20
 };
 
@@ -508,7 +536,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.37.0"
+#define TO8_GEN_VERSION "7.38.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -530,7 +558,6 @@ ST_DATA const char * const target_machine_defs =
 ST_DATA const int reg_classes[NB_REGS] = {
     RC_R0,
     RC_FLOAT,
-    RC_R1,
 };
 
 /* ===================================================================
@@ -781,9 +808,9 @@ static const char *to8_opcode_name(to8_opcode op)
 
 /* ===================================================================
  * Temp-slot management: a strictly-monotonic base allocator (used for
- * genuinely function-lifetime slots, like r1_shadow_slot) plus a
- * size-keyed LIFO free-list pool for ephemeral temps that this
- * backend can PROVE are dead right after their next use.
+ * genuinely function-lifetime slots plus a size-keyed LIFO free-list
+ * pool for ephemeral temps that this backend can PROVE are dead right
+ * after their next use.
  * =================================================================== */
 
 static int to8_new_temp(int size, int align)
@@ -823,18 +850,6 @@ static void to8_temp_free(int slot, int size, int align)
         }
         free8_stack[free8_n++] = slot;
     }
-}
-
-static int r1_shadow_slot;
-static int r1_shadow_valid;
-
-static int to8_r1_slot(void)
-{
-    if (!r1_shadow_valid) {
-        r1_shadow_slot = to8_new_temp(4, 4);
-        r1_shadow_valid = 1;
-    }
-    return r1_shadow_slot;
 }
 
 static int cur_push_depth;
@@ -1776,7 +1791,6 @@ void load(int r, SValue *sv)
 {
     int v, ft, fc, bt;
     int is_unsigned;
-    int save_slot;
     to8_opcode ldop;
 
     ft = sv->type.t & ~VT_DEFSIGN;
@@ -1804,12 +1818,10 @@ void load(int r, SValue *sv)
                     else
                         e_op_addr(ld4or8, sv->sym, fc);
                 } else if (v < VT_CONST) {
-                    int temp;
-                    int from_pool = (v != TREG_R1);
-                    if (v == TREG_R1) temp = to8_r1_slot();
-                    else { temp = to8_temp_alloc(4, 4); e_op_slot(OP_ST, temp); }
+                    int temp = to8_temp_alloc(4, 4);
+                    e_op_slot(OP_ST, temp);
                     e_op_slot(ld4or8, temp);
-                    if (from_pool) to8_temp_free(temp, 4, 4);
+                    to8_temp_free(temp, 4, 4);
                 } else {
                     tcc_error("TO8: unsupported float load addressing mode (v=%#x)", v);
                 }
@@ -1828,14 +1840,6 @@ void load(int r, SValue *sv)
     if (!(sv->r & VT_LVAL) && v < TREG_MEM && v != VT_CONST && v != VT_LOCAL &&
         v != VT_LLOCAL && v != VT_CMP && v != VT_JMP && v != VT_JMPI) {
         if (v == r) return;
-        if (v == TREG_R1 && r == TREG_R0) { e_op_slot(OP_LD, to8_r1_slot()); return; }
-        if (v == TREG_R0 && r == TREG_R1) { e_op_slot(OP_ST, to8_r1_slot()); return; }
-    }
-
-    save_slot = -1;
-    if (r == TREG_R1) {
-        save_slot = to8_temp_alloc(4, 4);
-        e_op_slot(OP_ST, save_slot);
     }
 
     if (sv->r & VT_LVAL) {
@@ -1848,12 +1852,10 @@ void load(int r, SValue *sv)
         } else if (v == TREG_R0) {
             e_op(to8_byte_suffix_ld_r(bt, is_unsigned));
         } else if (v < VT_CONST) {
-            int temp;
-            int from_pool = (v != TREG_R1);
-            if (v == TREG_R1) temp = to8_r1_slot();
-            else { temp = to8_temp_alloc(4, 4); e_op_slot(OP_ST, temp); }
+            int temp = to8_temp_alloc(4, 4);
+            e_op_slot(OP_ST, temp);
             e_op_slot(ldop, temp);
-            if (from_pool) to8_temp_free(temp, 4, 4);
+            to8_temp_free(temp, 4, 4);
         } else {
             tcc_error("TO8: unsupported load addressing mode (v=%#x)", v);
         }
@@ -1885,21 +1887,12 @@ void load(int r, SValue *sv)
             e_op_imm(OP_LDi, 0);
             break;
         default:
-            if (v == r) {
-                if (save_slot >= 0) e_op_slot(OP_LD, save_slot);
-                return;
-            }
+            if (v == r) return;
             if (v >= TREG_MEM) {
                 e_op_slot(ldop, fc);
             }
             break;
         }
-    }
-
-    if (r == TREG_R1) {
-        e_op_slot(OP_ST, to8_r1_slot());
-        e_op_slot(OP_LD, save_slot);
-        to8_temp_free(save_slot, 4, 4);
     }
 }
 
@@ -1930,12 +1923,10 @@ void store(int r, SValue *v)
         } else if (fr == VT_CONST) {
             e_op_addr(st4or8, v->sym, fc);
         } else if (fr < VT_CONST) {
-            int temp;
-            int from_pool = (fr != TREG_R1);
-            if (fr == TREG_R1) temp = to8_r1_slot();
-            else { temp = to8_temp_alloc(4, 4); e_op_slot(OP_ST, temp); }
+            int temp = to8_temp_alloc(4, 4);
+            e_op_slot(OP_ST, temp);
             e_op_slot(st4or8, temp);
-            if (from_pool) to8_temp_free(temp, 4, 4);
+            to8_temp_free(temp, 4, 4);
         } else {
             tcc_error("TO8: unsupported float store addressing mode (fr=%#x)", fr);
         }
@@ -1943,13 +1934,10 @@ void store(int r, SValue *v)
     }
 
     if (fr == VT_LOCAL) {
-        if (r == TREG_R1) e_op_slot(OP_LD, to8_r1_slot());
         e_op_slot(OP_ST, fc);
     } else if (fr == VT_LLOCAL) {
-        if (r == TREG_R1) e_op_slot(OP_LD, to8_r1_slot());
         e_op_slot(stop, fc);
     } else if (fr == VT_CONST && (v->r & VT_SYM)) {
-        if (r == TREG_R1) e_op_slot(OP_LD, to8_r1_slot());
         e_op_addr(stop, v->sym, fc);
     } else if (v->r & VT_LVAL) {
         /*
@@ -1972,18 +1960,12 @@ void store(int r, SValue *v)
              */
             e_op_slot(stop, fc);
         } else {
-            int addr_slot;
-            int from_pool = (fr != TREG_R1);
-            if (fr == TREG_R1) addr_slot = to8_r1_slot();
-            else { addr_slot = to8_temp_alloc(4, 4); e_op_slot(OP_ST, addr_slot); }
-
-            if (r == TREG_R1) {
-                e_op_slot(OP_LD, to8_r1_slot());
-            }
-
+            int addr_slot = to8_temp_alloc(4, 4);
+            e_op_slot(OP_ST, addr_slot);
+        
             e_op_slot(stop, addr_slot);
-
-            if (from_pool) to8_temp_free(addr_slot, 4, 4);
+        
+            to8_temp_free(addr_slot, 4, 4);
         }
     }
 }
@@ -2037,6 +2019,7 @@ static void gen_opi_shift(int op)
         int v1, c1, temp;
         v1 = vtop[-1].r & VT_VALMASK;
         c1 = vtop[-1].c.i;
+	
         if (v1 == TREG_R0) {
             int pre_spill = to8_temp_alloc(4, 4);
             e_op_slot(OP_ST, pre_spill);
@@ -2048,7 +2031,7 @@ static void gen_opi_shift(int op)
             c1 = vtop[-1].c.i;
         }
         /* v7.28.1 fix: pass the EXACT left operand slot, handling TREG_R1 too */
-        int left_slot = (v1 == TREG_R1) ? to8_r1_slot() : c1;
+        int left_slot = c1;
         temp = to8_spill_and_reload(left_slot);
         e_op_slot(slot_op, temp);
         to8_temp_free(temp, 4, 4);
@@ -2098,7 +2081,7 @@ void gen_opi(int op)
         c1 = vtop[-1].c.i;
 
         {
-            int left_slot = (v1 == TREG_R1) ? to8_r1_slot() : c1;
+            int left_slot = c1;
             int temp = to8_spill_and_reload(left_slot);
 	    e_op_slot(is_unsigned_cmp ? OP_CMPU : OP_CMP, temp);
             to8_temp_free(temp, 4, 4);
@@ -2134,10 +2117,9 @@ void gen_opi(int op)
         if (to8_is_commutative(op)) {
             if (v1 == VT_CONST) {
                 e_op_imm(imm_op, c1);
-            } else if (v1 == TREG_R0 || v1 == TREG_R1) {
-                /* v1 is in a register: spill R0, reload left operand from its slot. */
-                int left_slot = (v1 == TREG_R1) ? to8_r1_slot() : c1;
-                int temp = to8_spill_and_reload(left_slot);
+            } else if (v1 == TREG_R0) {
+                /* v1 is in R0: spill R0, reload left operand from its slot. */
+                int temp = to8_spill_and_reload(c1);
                 e_op_slot(slot_op, temp);
                 to8_temp_free(temp, 4, 4);
             } else {
@@ -2153,8 +2135,7 @@ void gen_opi(int op)
                 e_op_slot(slot_op, temp);    /* R0 = const OP spilled_right */
                 to8_temp_free(temp, 4, 4);
             } else {
-                int left_slot = (v1 == TREG_R1) ? to8_r1_slot() : c1;
-                int temp = to8_spill_and_reload(left_slot);
+               int temp = to8_spill_and_reload(c1);
                 e_op_slot(slot_op, temp);
                 to8_temp_free(temp, 4, 4);
             }
@@ -2912,7 +2893,6 @@ void gfunc_prolog(Sym *func_sym)
     to8_list_reset();
     to8_temp_pool_reset();
     to8_slot_cache_reset(&g_slot_cache);
-    r1_shadow_valid = 0;
     cur_push_depth = 0;
     g_in_function = 1;
 
