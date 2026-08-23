@@ -1,8 +1,76 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.40.0 (imm always 2 words; fimm 2 words for float, 4 for double)
+ * Version: 8.0.0 (new float ISA)
  *
  * Changelog:
+ * - v8.0.0: MAJOR BREAKING CHANGE - the single shared float accumulator
+ * F0 (width tracked externally by the caller) is replaced by two
+ * dedicated registers, F and G, on three orthogonal axes: register
+ * (F/G), width (4=float/8=double), addressing mode (i=immediate,
+ * plain=own-slot value, m=pointer/symbol dereference). All binary
+ * arithmetic is now pure register-to-register: F = G op F, result
+ * always landing in F. G is write-only from this backend's
+ * perspective - loadable from immediate/slot/pointer, but never
+ * storable back to memory and never a result destination.
+ *
+ * Motivation: reviewing a generated mandel() listing (2026-08-21)
+ * found two classes of redundant instructions inherent to the old
+ * single-accumulator design: (1) spilling a literal constant to a
+ * temp slot purely to satisfy CMPF/CMPG's slot-only comparison
+ * operand, and (2) spilling a just-loaded value to a temp slot
+ * purely to re-read it as the second operand of ADDF/MULF/etc. in
+ * self-combining expressions like x*x. Both patterns are structurally
+ * impossible once the two operands live in independent registers.
+ *
+ * Immediates are now 32-bit float only (OP_LDFi/OP_LDGi) - there is
+ * no 8-byte immediate form. This backend's F/G registers are 32-bit
+ * only; "double" only ever exists in memory. A double C constant is
+ * never baked into an instruction: it is always read through memory
+ * (OP_LDF8m/OP_LDG8m) and narrowed to the register's actual 32-bit
+ * representation by the eventual real 6809 implementation of those
+ * opcodes, symmetric to the existing IEEE<->EXTRAMON conversion
+ * already documented at OP_LDF4/OP_LDF8 above. OP_STF8/OP_STF8m widen
+ * back to 8-byte IEEE on the way out. to8_render_line()'s ARG_FIMM
+ * case is simplified accordingly: it always renders a 2-word float
+ * (out_float()), never the old 4-word out_double() path, since
+ * ARG_FIMM is now exclusively used by OP_LDFi/OP_LDGi.
+ *
+ * OP_TSTF (R0 = sign(F)) is reserved in the ISA for a future
+ * peephole/codegen shortcut on the extremely common x==0/x>0/x<0 and
+ * if(x) idioms; gen_opf() does not emit it yet in this revision.
+ *
+ * G is deliberately kept OUT of TCC's register-class system (no
+ * TREG_G, no RC_G bit in reg_classes[]) - TCC's binary-op codegen
+ * never materializes the LEFT operand into a register before calling
+ * gen_opf() (only the RIGHT operand, via gv(RC_FLOAT)), so a TCC-
+ * visible G would gain nothing; worse, G's write-only/non-storable
+ * nature would violate the symmetry TCC's generic allocator assumes
+ * of any register class it manages, echoing the R1 lesson from
+ * v7.38.0 (a second integer register that was fully wired into the
+ * class system and turned out to be entirely dead code in practice).
+ *
+ * Real correctness fix folded into this rewrite: the old gen_opf()'s
+ * comparison branch only reloaded the LEFT operand into the register
+ * when it was VT_LOCAL/VT_LLOCAL - a left operand that was itself a
+ * VT_CONST (e.g. "3.0 < x") silently compared the RIGHT operand
+ * against itself, since no reload ever happened. The new
+ * to8_load_fg() helper (shared with load()) handles VT_LOCAL/
+ * VT_LLOCAL/VT_CONST uniformly, so this gap no longer exists.
+ *
+ * to8_peephole_dead_r0_load()'s whitelist is updated to the new F/G
+ * opcode names. OP_CMPF and OP_TSTF remain deliberately EXCLUDED from
+ * it, exactly like the old OP_CMPF/OP_CMPG were - both write a signed
+ * result into R0 and must stop the dead-load scan like any other
+ * R0-writing instruction.
+ *
+ * BREAKING: every previously generated listing is invalid under this
+ * revision - OP_LDF/OP_LDG/OP_STF/OP_STG/OP_ADDG/OP_SUBG/OP_MULG/
+ * OP_DIVG/OP_CMPG no longer exist, and OP_LDF4/OP_LDF8/OP_STF4/OP_STF8
+ * change MEANING (own-slot value instead of pointer dereference - the
+ * old dereference role moves to the new *m-suffixed opcodes). This is
+ * why this revision bumps the MAJOR version instead of a patch/minor
+ * bump.
+ * 
  * - v7.40.0: imm/fimm operand rendering now splits into 16-bit words
  *   instead of printing a single decimal number, matching the target's
  *   native word size. ARG_IMM (plain int immediates, e.g. OP_LDi,
@@ -572,7 +640,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "7.39.0"
+#define TO8_GEN_VERSION "8.0.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -609,8 +677,6 @@ ST_DATA const int reg_classes[NB_REGS] = {
 
 typedef enum {
     OP_NOP,   /* no-op */
-    OP_RET,   /* return from the current function */
-    OP_ADJi,  /* SP -= n if n<0 (allocate), SP += n if n>=0 (release) */
 
     OP_LD,    /* R0 = slot (4-byte load) */
     OP_ST,    /* slot = R0 (4-byte store) */
@@ -675,9 +741,6 @@ typedef enum {
     OP_EXT1U, /* R0 = (int)(unsigned char)R0 */
     OP_EXT2U, /* R0 = (int)(unsigned short)R0 */
 
-    OP_ITOF,  /* F0 = (float/double)R0 */
-    OP_FTOI,  /* R0 = (int)F0 */
-
     /* ===============================================================
      * ARCHITECTURE NOTE - floating-point storage format:
      *
@@ -728,44 +791,49 @@ typedef enum {
      * zero integration cost (no library to link) wins for now.
      * =============================================================== */
 
-    OP_LDF,   /* F0 = slot (own-slot value, as float, 4 bytes) */
-    OP_LDG,   /* F0 = slot (own-slot value, as double, 8 bytes) */
-    OP_STF,   /* slot = F0 (own-slot value, as float) */
-    OP_STG,   /* slot = F0 (own-slot value, as double) */
-    OP_LDF4,  /* F0 = *(float*)slot-or-symbol - dereference a
-                 slot-held pointer, OR read a REAL (possibly
-                 mutable) global float variable by symbol. */
-    OP_LDF8,  /* F0 = *(double*)slot-or-symbol */
-    OP_STF4,  /* *(float*)slot-or-symbol = F0 */
-    OP_STF8,  /* *(double*)slot-or-symbol = F0 */
-    OP_LDFi,  /* F0 = <float-immediate>, baked directly into the
-                 instruction - no memory access at all. Only used
-                 for compiler-generated anonymous constants that
-                 can never change. */
-    OP_LDGi,  /* F0 = <double-immediate>, same idea. */
+    OP_FTOI,  /* R0 = (int)F0 */
+    OP_ITOF,  /* F0 = (float/double)R0 */
 
-    OP_CMPF,  /* R0 = sign(F0 - slot), comparing as FLOAT (4-byte
-                 slot). Consumed by the SAME SEQ/SNE/SLT/SGT/SLE/
-                 SGE and JEQ/JNE/... families integers use. */
-    OP_CMPG,  /* R0 = sign(F0 - slot), comparing as DOUBLE (8-byte
-                 slot). */
-    OP_ADDF,  /* F0 += slot (as float, 4-byte slot) */
-    OP_SUBF,  /* F0 -= slot (as float) */
-    OP_MULF,  /* F0 *= slot (as float) */
-    OP_DIVF,  /* F0 /= slot (as float) */
-    OP_ADDG,  /* F0 += slot (as double, 8-byte slot) */
-    OP_SUBG,  /* F0 -= slot (as double) */
-    OP_MULG,  /* F0 *= slot (as double) */
-    OP_DIVG,  /* F0 /= slot (as double) */
+    OP_FMOV,  /* G = F (register-to-register transfer, no memory access) */
 
+    OP_LDFi,  /* F = <float literal>, baked directly into the instruction */
+    OP_LDGi,  /* G = <float literal>, baked directly into the instruction */
+    OP_LDF4,  /* F = slot (own-slot value, as float, 4 bytes) */
+    OP_LDG4,  /* G = slot (own-slot value, as float, 4 bytes) */
+    OP_LDF8,  /* F = slot (own-slot value, as double, 8 bytes; narrowed) */
+    OP_LDG8,  /* G = slot (own-slot value, as double, 8 bytes; narrowed) */
+    OP_LDF4m, /* F = *(float*)slot-or-symbol */
+    OP_LDG4m, /* G = *(float*)slot-or-symbol */
+    OP_LDF8m, /* F = *(double*)slot-or-symbol (narrowed) */
+    OP_LDG8m, /* G = *(double*)slot-or-symbol (narrowed) */
+    
+    OP_STF4,  /* slot = F (own-slot value, as float) */
+    OP_STF8,  /* slot = F (own-slot value, as double; widened) */
+    OP_STF4m, /* *(float*)slot-or-symbol = F */
+    OP_STF8m, /* *(double*)slot-or-symbol = F (widened) */
+    
+    /* opertions */
+    OP_FADD,     /* F = G + F */
+    OP_FSUB,     /* F = G - F */
+    OP_FMUL,     /* F = G * F */
+    OP_FDIV,     /* F = G / F */
+    OP_FSCALEi,  /* F = F * 2^n */
+    OP_FCMP,     /* R0 = sign(G - F) (F and G both survive) */
+    OP_FSGN,     /* R0 = sign(F) (F survives; reserved, not yet emitted) */
+
+    /* stack */
+    OP_ADJi,  /* SP += n if n<0 => allocate otherwise release */
     OP_PUSH,  /* push slot's value onto the call-argument stack */
     OP_PUSHi, /* push an immediate onto the call-argument stack */
     OP_PUSHr, /* push R0 onto the call-argument stack */
 
+    /*  call */
+    OP_RET,   /* return from the current function */
     OP_JSR,   /* call the function pointer held in slot */
     OP_JSRi,  /* call the function named by symbol */
     OP_JSRr,  /* call the function pointer held in R0 */
 
+    /* jump */
     OP_JMP,   /* unconditional: goto target */
     OP_JEQ,   /* if (R0 == 0) goto target */
     OP_JNE,   /* if (R0 != 0) goto target */
@@ -790,6 +858,7 @@ static const char *to8_opcode_name(to8_opcode op)
     switch (op) {
     case OP_NOP: return "NOP"; case OP_RET: return "RET";
     case OP_ADJi: return "ADJi";
+    
     case OP_LD: return "LD"; case OP_ST: return "ST"; case OP_LEA: return "LEA";
     case OP_LD1: return "LD1"; case OP_LDU1: return "LDU1";
     case OP_LD2: return "LD2"; case OP_LDU2: return "LDU2";
@@ -799,37 +868,47 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_LD4r: return "LD4r";
     case OP_ST1: return "ST1"; case OP_ST2: return "ST2"; case OP_ST4: return "ST4";
     case OP_LDi: return "LDi";
+    
     case OP_ADD: return "ADD"; case OP_SUB: return "SUB"; case OP_AND: return "AND";
     case OP_OR: return "OR"; case OP_XOR: return "XOR"; case OP_MUL: return "MUL";
     case OP_DIV: return "DIV"; case OP_MOD: return "MOD";
     case OP_SHL: return "SHL"; case OP_SHR: return "SHR"; case OP_SAR: return "SAR";
     case OP_CMP: return "CMP"; case OP_CMPU: return "CMPU";
+    
     case OP_ADDi: return "ADDi"; case OP_SUBi: return "SUBi"; case OP_ANDi: return "ANDi";
     case OP_ORi: return "ORi"; case OP_XORi: return "XORi"; case OP_MULi: return "MULi";
     case OP_DIVi: return "DIVi"; case OP_MODi: return "MODi";
     case OP_SHLi: return "SHLi"; case OP_SHRi: return "SHRi"; case OP_SARi: return "SARi";
     case OP_CMPi: return "CMPi"; case OP_CMPUi: return "CMPUi";
+    
     case OP_SEQ: return "SEQ"; case OP_SNE: return "SNE"; case OP_SLT: return "SLT"; case OP_SGT: return "SGT";
     case OP_SLE: return "SLE"; case OP_SGE: return "SGE";
     case OP_SNZ: return "SNZ";
-    case OP_MOV: return "MOV";
+ 
     case OP_EXT1S: return "EXT1S"; case OP_EXT2S: return "EXT2S";
     case OP_EXT1U: return "EXT1U"; case OP_EXT2U: return "EXT2U";
     case OP_ITOF: return "ITOF"; case OP_FTOI: return "FTOI";
-    case OP_LDF: return "LDF"; case OP_LDG: return "LDG";
-    case OP_STF: return "STF"; case OP_STG: return "STG";
-    case OP_LDF4: return "LDF4"; case OP_LDF8: return "LDF8";
-    case OP_STF4: return "STF4"; case OP_STF8: return "STF8";
+
     case OP_LDFi: return "LDFi"; case OP_LDGi: return "LDGi";
-    case OP_CMPF: return "CMPF"; case OP_CMPG: return "CMPG";
-    case OP_ADDF: return "ADDF"; case OP_SUBF: return "SUBF";
-    case OP_MULF: return "MULF"; case OP_DIVF: return "DIVF";
-    case OP_ADDG: return "ADDG"; case OP_SUBG: return "SUBG";
-    case OP_MULG: return "MULG"; case OP_DIVG: return "DIVG";
+    case OP_LDF4: return "LDF4"; case OP_LDG4: return "LDG4";
+    case OP_LDF8: return "LDF8"; case OP_LDG8: return "LDG8";
+    case OP_LDF4m: return "LDF4m"; case OP_LDG4m: return "LDG4m";
+    case OP_LDF8m: return "LDF8m"; case OP_LDG8m: return "LDG8m";
+    case OP_STF4: return "STF4"; case OP_STF8: return "STF8";
+    case OP_STF4m: return "STF4m"; case OP_STF8m: return "STF8m";
+    
+    case OP_FMOV: return "FMOV";
+    case OP_FSCALEi: return "FSCALEi";
+    case OP_FADD: return "FADD"; case OP_FSUB: return "FSUB";
+    case OP_FMUL: return "FMUL"; case OP_FDIV: return "FDIV";  
+    case OP_FCMP: return "FCMP"; case OP_FSGN: return "FSGN";
+
     case OP_PUSH: return "PUSH"; case OP_PUSHi: return "PUSHi"; case OP_PUSHr: return "PUSHr";
     case OP_JSR: return "JSR"; case OP_JSRi: return "JSRi"; case OP_JSRr: return "JSRr";
     case OP_JMP: return "JMP"; case OP_JEQ: return "JEQ"; case OP_JNE: return "JNE";
     case OP_JLT: return "JLT"; case OP_JGT: return "JGT"; case OP_JLE: return "JLE"; case OP_JGE: return "JGE";
+    
+    case OP_MOV:   return "MOV";
     case OP_ADD2:  return "ADD2";
     case OP_SUB2:  return "SUB2";
     case OP_MUL2:  return "MUL2";
@@ -1429,20 +1508,12 @@ static void slot_comment(char *out, size_t outsz, to8_opcode op, const char *des
     case OP_SAR: snprintf(out, outsz, "R0 >>= %s (arith)", desc); return;
     case OP_CMP: snprintf(out, outsz, "R0 = sign(R0 - %s)", desc); return;
     case OP_CMPU: snprintf(out, outsz, "R0 = sign(R0 -u %s)", desc); return;
-    case OP_CMPF: snprintf(out, outsz, "R0 = sign(F0 - %s) (float)", desc); return;
-    case OP_CMPG: snprintf(out, outsz, "R0 = sign(F0 - %s) (double)", desc); return;
-    case OP_ADDF: snprintf(out, outsz, "F0 += %s (float)", desc); return;
-    case OP_SUBF: snprintf(out, outsz, "F0 -= %s (float)", desc); return;
-    case OP_MULF: snprintf(out, outsz, "F0 *= %s (float)", desc); return;
-    case OP_DIVF: snprintf(out, outsz, "F0 /= %s (float)", desc); return;
-    case OP_ADDG: snprintf(out, outsz, "F0 += %s (double)", desc); return;
-    case OP_SUBG: snprintf(out, outsz, "F0 -= %s (double)", desc); return;
-    case OP_MULG: snprintf(out, outsz, "F0 *= %s (double)", desc); return;
-    case OP_DIVG: snprintf(out, outsz, "F0 /= %s (double)", desc); return;
-    case OP_STF: case OP_STG: snprintf(out, outsz, "%s = F0", desc); return;
-    case OP_LDF: case OP_LDG: snprintf(out, outsz, "F0 = %s", desc); return;
-    case OP_STF4: case OP_STF8: snprintf(out, outsz, "*%s = F0", desc); return;
-    case OP_LDF4: case OP_LDF8: snprintf(out, outsz, "F0 = *%s", desc); return;
+    case OP_LDF4: case OP_LDF8: snprintf(out, outsz, "F = %s", desc); return;
+    case OP_LDG4: case OP_LDG8: snprintf(out, outsz, "G = %s", desc); return;
+    case OP_LDF4m: case OP_LDF8m: snprintf(out, outsz, "F = *%s", desc); return;
+    case OP_LDG4m: case OP_LDG8m: snprintf(out, outsz, "G = *%s", desc); return;
+    case OP_STF4: case OP_STF8: snprintf(out, outsz, "%s = F", desc); return;
+    case OP_STF4m: case OP_STF8m: snprintf(out, outsz, "*%s = F", desc); return;
     case OP_PUSH: snprintf(out, outsz, "push %s", desc); return;
     case OP_JSR: snprintf(out, outsz, "call *%s", desc); return;
     case OP_LD1: case OP_LDU1: case OP_LD2: case OP_LDU2: case OP_LD4:
@@ -1474,6 +1545,7 @@ static void imm_comment(char *out, size_t outsz, to8_opcode op, int v)
     case OP_CMPUi: snprintf(out, outsz, "R0 = sign(R0 -u %s)", num); return;
     case OP_ADJi: snprintf(out, outsz, v < 0 ? "sp -= %s" : "sp += %s", v < 0 ? num + 1 : num); return;
     case OP_PUSHi: snprintf(out, outsz, "push %s", num); return;
+    case OP_FSCALEi: snprintf(out, outsz, "F *= 2^%s", num); return;
     default: snprintf(out, outsz, "%s", num); return;
     }
 }
@@ -1483,8 +1555,9 @@ static void addr_comment(char *out, size_t outsz, to8_opcode op, const char *des
     switch (op) {
     case OP_LDi: snprintf(out, outsz, "R0 = &%s", desc); return;
     case OP_JSRi: snprintf(out, outsz, "call %s", desc); return;
-    case OP_LDF4: case OP_LDF8: snprintf(out, outsz, "F0 = %s", desc); return;
-    case OP_STF4: case OP_STF8: snprintf(out, outsz, "%s = F0", desc); return;
+    case OP_LDF4m: case OP_LDF8m: snprintf(out, outsz, "F = %s", desc); return;
+    case OP_LDG4m: case OP_LDG8m: snprintf(out, outsz, "G = %s", desc); return;
+    case OP_STF4m: case OP_STF8m: snprintf(out, outsz, "%s = F", desc); return;
     default: snprintf(out, outsz, "%s", desc); return;
     }
 }
@@ -1514,6 +1587,13 @@ static const char *bare_comment(to8_opcode op)
     case OP_EXT1U: return "R0 = (int)(unsigned char)R0";
     case OP_EXT2U: return "R0 = (int)(unsigned short)R0";
     case OP_NOP: return "no-op";
+    case OP_FMOV: return "G = F";
+    case OP_FADD: return "F = G + F";
+    case OP_FSUB: return "F = G - F";
+    case OP_FMUL: return "F = G * F";
+    case OP_FDIV: return "F = G / F";
+    case OP_FCMP: return "R0 = sign(G - F)";
+    case OP_FSGN: return "R0 = sign(F)";
     default: return NULL;
     }
 }
@@ -1575,7 +1655,8 @@ static to8_line *e_op_fimm(to8_opcode op, double v)
     to8_line *ln = to8_append(op);
     ln->kind = ARG_FIMM;
     ln->f_val = v;
-    snprintf(ln->comment, sizeof ln->comment, "F0 = %g", v);
+    snprintf(ln->comment, sizeof ln->comment, "%s = %g",
+             (op == OP_LDGi) ? "G" : "F", v);
     ln->has_comment = 1;
     return ln;
 }
@@ -1856,7 +1937,66 @@ static int to8_try_read_float_const(Sym *sym, int bt, double *out_val)
 /* ===================================================================
  * Load / Store
  * =================================================================== */
+/* Loads a float/double SValue's addressing mode (VT_LOCAL / VT_LLOCAL /
+ * VT_CONST) into either F (want_g=0) or G (want_g=1). Shared by
+ * load()'s TREG_F0 branch and gen_opf()'s left-operand load - the
+ * "not VT_LVAL" fallback (symbol/local address-of quirk, and the
+ * OP_ITOF int->float conversion path) only ever applies to F: G is
+ * populated exclusively from a genuine memory value, since gen_opf()
+ * only ever calls this on an already float-typed operand's location,
+ * never a bare register/conversion case. */
+static void to8_load_fg(SValue *sv, int bt, int want_g)
+{
+    int v = sv->r & VT_VALMASK;
+    int fc = sv->c.i;
+    to8_opcode own   = want_g ? (bt == VT_FLOAT ? OP_LDG4  : OP_LDG8)
+                               : (bt == VT_FLOAT ? OP_LDF4  : OP_LDF8);
+    to8_opcode deref = want_g ? (bt == VT_FLOAT ? OP_LDG4m : OP_LDG8m)
+                               : (bt == VT_FLOAT ? OP_LDF4m : OP_LDF8m);
+    to8_opcode imm   = want_g ? OP_LDGi : OP_LDFi;
 
+    if (sv->r & VT_LVAL) {
+        if (v == VT_LOCAL) {
+            e_op_slot(own, fc);
+        } else if (v == VT_LLOCAL) {
+            e_op_slot(deref, fc);
+        } else if (v == VT_CONST) {
+            if (bt == VT_FLOAT) {
+                double fval;
+                if (to8_try_read_float_const(sv->sym, bt, &fval))
+                    e_op_fimm(imm, fval);
+                else
+                    e_op_addr(deref, sv->sym, fc);
+            } else {
+                e_op_addr(deref, sv->sym, fc);
+            }
+        } else if (v < VT_CONST) {
+            int temp = to8_temp_alloc(4, 4);
+            e_op_slot(OP_ST, temp);
+            e_op_slot(deref, temp);
+            to8_temp_free(temp, 4, 4);
+        } else {
+            tcc_error("TO8: unsupported float load addressing mode (v=%#x)", v);
+        }
+    } else if (v == VT_CONST) {
+        /* Bare compile-time constant, NO VT_LVAL: TCC carries the
+         * literal directly in sv->c, no data-section symbol involved
+         * at all - a different case from VT_LVAL+VT_CONST above.
+         * Narrowed to float precision either way - this backend's
+         * F/G registers are 32-bit only, same end result a memory-
+         * backed double constant would get on load. */
+        double fval = (bt == VT_FLOAT) ? (double)sv->c.f : sv->c.d;
+        e_op_fimm(imm, fval);
+    } else if (!want_g) {
+        if (v == VT_LOCAL)
+            e_op_slot(own, fc);
+        else
+            e_op(OP_ITOF);
+    } else {
+        tcc_error("TO8: internal error - to8_load_fg(want_g=1) called "
+                  "on an unsupported non-lvalue operand (v=%#x)", v);
+    }
+}
 
 void load(int r, SValue *sv)
 {
@@ -1874,36 +2014,10 @@ void load(int r, SValue *sv)
 
     if (r == TREG_F0) {
         if (bt == VT_FLOAT || bt == VT_DOUBLE) {
-            to8_opcode ld = (bt == VT_FLOAT) ? OP_LDF : OP_LDG;
-            to8_opcode ld4or8 = (bt == VT_FLOAT) ? OP_LDF4 : OP_LDF8;
-            to8_opcode ldi = (bt == VT_FLOAT) ? OP_LDFi : OP_LDGi;
-            if (sv->r & VT_LVAL) {
-                if (v == VT_LOCAL) {
-                    e_op_slot(ld, fc);
-                } else if (v == VT_LLOCAL) {
-                    e_op_slot(ld4or8, fc);
-                } else if (v == VT_CONST) {
-                    double fval;
-                    if (to8_try_read_float_const(sv->sym, bt, &fval))
-                        e_op_fimm(ldi, fval);
-                    else
-                        e_op_addr(ld4or8, sv->sym, fc);
-                } else if (v < VT_CONST) {
-                    int temp = to8_temp_alloc(4, 4);
-                    e_op_slot(OP_ST, temp);
-                    e_op_slot(ld4or8, temp);
-                    to8_temp_free(temp, 4, 4);
-                } else {
-                    tcc_error("TO8: unsupported float load addressing mode (v=%#x)", v);
-                }
-            } else {
-                if (v == VT_CONST)
-                    e_op_addr(ld, sv->sym, fc);
-                else if (v == VT_LOCAL)
-                    e_op_slot(ld, fc);
-                else
-                    e_op(OP_ITOF);
-            }
+            to8_load_fg(sv, bt, 0);
+        } else {
+            tcc_error("TO8: internal error - load(TREG_F0, ...) called with "
+                      "non-float/double type (bt=%#x)", bt);
         }
         return;
     }
@@ -1985,18 +2099,18 @@ void store(int r, SValue *v)
     stop = to8_byte_suffix_st(bt);
 
     if (r == TREG_F0) {
-        to8_opcode st = (bt == VT_FLOAT) ? OP_STF : OP_STG;
-        to8_opcode st4or8 = (bt == VT_FLOAT) ? OP_STF4 : OP_STF8;
+        to8_opcode st = (bt == VT_FLOAT) ? OP_STF4 : OP_STF8;
+        to8_opcode stm = (bt == VT_FLOAT) ? OP_STF4m : OP_STF8m;
         if (fr == VT_LOCAL) {
             e_op_slot(st, fc);
         } else if (fr == VT_LLOCAL) {
-            e_op_slot(st4or8, fc);
+            e_op_slot(stm, fc);
         } else if (fr == VT_CONST) {
-            e_op_addr(st4or8, v->sym, fc);
+            e_op_addr(stm, v->sym, fc);
         } else if (fr < VT_CONST) {
             int temp = to8_temp_alloc(4, 4);
             e_op_slot(OP_ST, temp);
-            e_op_slot(st4or8, temp);
+            e_op_slot(stm, temp);
             to8_temp_free(temp, 4, 4);
         } else {
             tcc_error("TO8: unsupported float store addressing mode (fr=%#x)", fr);
@@ -2253,28 +2367,125 @@ void gen_opi(int op)
  * Binary float operations
  * =================================================================== */
 
+/* If sv is a compile-time float/double constant - either a bare
+ * literal carried directly in sv->c, or a reference to an anonymous
+ * data-section symbol - returns its value in *out and 1. Returns 0
+ * otherwise, examining sv for nothing beyond its addressing mode. */
+static int to8_float_const_value(SValue *sv, int bt, double *out)
+{
+    int v = sv->r & VT_VALMASK;
+    if (v != VT_CONST)
+        return 0;
+    if (sv->r & VT_LVAL)
+        return to8_try_read_float_const(sv->sym, bt, out);
+    *out = (bt == VT_FLOAT) ? (double)sv->c.f : sv->c.d;
+    return 1;
+}
+
+/* v == 2^n for some integer n? Exact test via frexp(): v = m * 2^e
+ * with 0.5 <= m < 1 for any normal positive v; v is an exact power
+ * of two iff m == 0.5 exactly, in which case v == 2^(e-1). Negative
+ * v is rejected here - a negated power of two (e.g. "-2.0 * x") is a
+ * known, deliberately unhandled case for now. */
+static int to8_pow2_exponent(double v, int *out_n)
+{
+    int e;
+    double m;
+    if (v <= 0.0)
+        return 0;
+    m = frexp(v, &e);
+    if (m != 0.5)
+        return 0;
+    *out_n = e - 1;
+    return 1;
+}
+
+
 void gen_opf(int op)
 {
     int bt;
+    int left_was_f0 = (vtop[-1].r & VT_VALMASK) == TREG_F0;
+    int is_commutative = (op == '+' || op == '*');
+    int is_cmp = (op == TOK_LT || op == TOK_GT || op == TOK_LE ||
+                  op == TOK_GE || op == TOK_EQ || op == TOK_NE);
 
-    gv(RC_FLOAT);
-    bt = vtop->type.t & VT_BTYPE; /* VT_FLOAT or VT_DOUBLE - width of THIS operation */
+    /* try to use FSCALE */
+    if (op == '*') {
+        int n;
+        double cval;
 
-    if (op == TOK_LT || op == TOK_GT || op == TOK_LE || op == TOK_GE ||
-        op == TOK_EQ || op == TOK_NE) {
-        to8_opcode own_st = (bt == VT_FLOAT) ? OP_STF : OP_STG;
-        to8_opcode own_ld = (bt == VT_FLOAT) ? OP_LDF : OP_LDG;
-        to8_opcode cmp_op = (bt == VT_FLOAT) ? OP_CMPF : OP_CMPG;
-        int tsize = (bt == VT_FLOAT) ? 4 : 8;
-        int fv1 = vtop[-1].r & VT_VALMASK;
-        int fc1 = vtop[-1].c.i;
-        int temp = to8_temp_alloc(tsize, 4);
-        e_op_slot(own_st, temp);
-        if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
-            e_op_slot(own_ld, fc1);
-        e_op_slot(cmp_op, temp);
-        to8_temp_free(temp, tsize, 4);
+        /* Right operand is a power-of-two constant - drop it, scale
+         * the left operand directly. Covers "x * 2.0". */
+        bt = vtop->type.t & VT_BTYPE;
+        if (to8_float_const_value(vtop, bt, &cval) && to8_pow2_exponent(cval, &n)) {
+            vpop();
+            gv(RC_FLOAT);
+            if (n != 0) /* n==0 means "* 1" - nothing to emit at all */
+                e_op_imm(OP_FSCALEi, n);
+            vtop->r = TREG_F0;
+            vtop->r2 = VT_CONST;
+            return;
+        }
 
+        /* Left operand is a power-of-two constant - the mandel()
+         * shape, "2 * x". Swap first so the SAME logic above applies
+         * uniformly, then fall through the swapped positions. */
+        bt = vtop[-1].type.t & VT_BTYPE;
+        if (to8_float_const_value(&vtop[-1], bt, &cval) && to8_pow2_exponent(cval, &n)) {
+            vswap();
+            vpop();
+            gv(RC_FLOAT);
+            if (n != 0)
+                e_op_imm(OP_FSCALEi, n);
+            vtop->r = TREG_F0;
+            vtop->r2 = VT_CONST;
+            return;
+        }
+    }
+    
+    /*
+     * Fast path: left operand already in F, and we can avoid ever
+     * materializing the right operand into F at all - thanks to
+     * commutativity for +/*, or a free operator inversion for
+     * comparisons. This bypasses gv(RC_FLOAT) entirely for the right
+     * operand, which also bypasses TCC's own save_reg()-driven spill
+     * of the left operand that gv() would otherwise trigger (see
+     * v8.0.1 changelog: confirmed empirically on mandel() - a
+     * redundant STF4 appeared right after FMOV precisely because
+     * gv() has no way to know the left operand was already safely
+     * copied to G).
+     */
+    if (left_was_f0 && (is_commutative || is_cmp)) {
+        bt = vtop->type.t & VT_BTYPE;
+        to8_load_fg(vtop, bt, 1); /* G = right operand; F untouched (= left) */
+
+        if (is_cmp) {
+            e_op(OP_FCMP); /* R0 = sign(G - F) = sign(right - left) */
+            vtop--;
+            vset_VT_CMP(to8_swap_cmp_op(op)); /* corrects the flipped sign */
+            return;
+        }
+
+        e_op(op == '+' ? OP_FADD : OP_FMUL); /* F = G op F = right op left */
+        vtop--;
+        vtop->r = TREG_F0;
+        vtop->r2 = VT_CONST;
+        return;
+    }
+
+    /* FSUB/FDIV (or a comparison whose left wasn't in F to begin with)
+     * cannot use the trick above - preserve the left operand via
+     * FMOV before it gets clobbered by gv() below. */
+    if (left_was_f0)
+        e_op(OP_FMOV);
+
+    gv(RC_FLOAT); /* forces the RIGHT operand (vtop) into F */
+    bt = vtop->type.t & VT_BTYPE;
+
+    if (is_cmp) {
+        if (!left_was_f0)
+            to8_load_fg(&vtop[-1], bt, 1);
+        e_op(OP_FCMP);
         vtop--;
         vset_VT_CMP(op);
         return;
@@ -2282,36 +2493,18 @@ void gen_opf(int op)
 
     {
         to8_opcode fop;
-        to8_opcode own_st = (bt == VT_FLOAT) ? OP_STF : OP_STG;
-        to8_opcode own_ld = (bt == VT_FLOAT) ? OP_LDF : OP_LDG;
-        int tsize = (bt == VT_FLOAT) ? 4 : 8;
-        int fv1 = vtop[-1].r & VT_VALMASK;
-        int fc1 = vtop[-1].c.i;
-        int commutative;
-
         switch (op) {
-        case '+': fop = (bt == VT_FLOAT) ? OP_ADDF : OP_ADDG; break;
-        case '-': fop = (bt == VT_FLOAT) ? OP_SUBF : OP_SUBG; break;
-        case '*': fop = (bt == VT_FLOAT) ? OP_MULF : OP_MULG; break;
-        case '/': fop = (bt == VT_FLOAT) ? OP_DIVF : OP_DIVG; break;
+        case '+': fop = OP_FADD; break;
+        case '-': fop = OP_FSUB; break;
+        case '*': fop = OP_FMUL; break;
+        case '/': fop = OP_FDIV; break;
         default: fop = OP_NOP; break;
         }
-
-        commutative = (op == '+' || op == '*');
-
         if (fop != OP_NOP) {
-            if (commutative && (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)) {
-                e_op_slot(fop, fc1);
-            } else {
-                int temp = to8_temp_alloc(tsize, 4);
-                e_op_slot(own_st, temp);
-                if (fv1 == VT_LOCAL || fv1 == VT_LLOCAL)
-                    e_op_slot(own_ld, fc1);
-                e_op_slot(fop, temp);
-                to8_temp_free(temp, tsize, 4);
-            }
+            if (!left_was_f0)
+                to8_load_fg(&vtop[-1], bt, 1);
+            e_op(fop);
         }
-
         vtop--;
         vtop->r = TREG_F0;
         vtop->r2 = VT_CONST;
@@ -2581,16 +2774,21 @@ static int to8_peephole_dead_r0_load(void)
             if (scan->op == OP_MOV || scan->op == OP_NOP ||
                 scan->op == OP_ADJi || scan->op == OP_PUSH ||
                 scan->op == OP_PUSHi ||
-                scan->op == OP_LDF || scan->op == OP_LDG ||
-                scan->op == OP_STF || scan->op == OP_STG ||
-                scan->op == OP_LDF4 || scan->op == OP_LDF8 ||
-                scan->op == OP_STF4 || scan->op == OP_STF8 ||
                 scan->op == OP_LDFi || scan->op == OP_LDGi ||
-                scan->op == OP_ADDF || scan->op == OP_SUBF ||
-                scan->op == OP_MULF || scan->op == OP_DIVF ||
-                scan->op == OP_ADDG || scan->op == OP_SUBG ||
-                scan->op == OP_MULG || scan->op == OP_DIVG)
+                scan->op == OP_LDF4 || scan->op == OP_LDG4 ||
+                scan->op == OP_LDF8 || scan->op == OP_LDG8 ||
+                scan->op == OP_LDF4m || scan->op == OP_LDG4m ||
+                scan->op == OP_LDF8m || scan->op == OP_LDG8m ||
+                scan->op == OP_STF4 || scan->op == OP_STF8 ||
+                scan->op == OP_STF4m || scan->op == OP_STF8m ||
+                scan->op == OP_FMOV || scan->op == OP_FSCALEi ||
+                scan->op == OP_FADD || scan->op == OP_FSUB ||
+                scan->op == OP_FMUL || scan->op == OP_FDIV)
                 continue;
+            /* OP_FCMP and OP_FSGN are deliberately EXCLUDED - both write a
+             * signed result into R0, exactly like the old OP_FCMP/OP_CMPG they
+             * replace, so they must stop the scan like any other R0-writing
+             * instruction. */
 
             if (scan->kind == ARG_SLOT &&
                 (scan->op == OP_LD || scan->op == OP_LD1 ||
@@ -2830,6 +3028,101 @@ static int to8_peephole_jump_inversion(void)
     return changed;
 }
 
+static int to8_same_float_load(const to8_line *a, const to8_line *b)
+{
+    if (!a || !b || a->op != b->op || a->kind != b->kind)
+        return 0;
+
+    switch (a->kind) {
+    case ARG_FIMM:
+        return a->f_val == b->f_val;
+
+    case ARG_SLOT:
+        return a->slot_a == b->slot_a &&
+               a->push_depth == b->push_depth;
+
+    case ARG_SYM:
+        return a->sym == b->sym &&
+               a->sym_addend == b->sym_addend;
+
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Remove a redundant repeated load into F or G when the same register
+ * still contains the identical value and no intervening instruction
+ * can alter that register or make the previous value unreachable.
+ *
+ * This pass deliberately tracks only exact repeated loads. It does not
+ * perform general floating-point liveness analysis.
+ */
+static int to8_peephole_useless_ldf(void)
+{
+    int changed = 0;
+    to8_line *cur;
+    to8_line *last_f_load = NULL;
+    to8_line *last_g_load = NULL;
+
+    for (cur = g_head; cur; ) {
+        to8_line *next = cur->next;
+
+        if (cur->is_target) {
+            last_f_load = NULL;
+            last_g_load = NULL;
+        }
+
+        if (cur->op == OP_LDFi || cur->op == OP_LDF4 ||
+            cur->op == OP_LDF8 || cur->op == OP_LDF4m ||
+            cur->op == OP_LDF8m) {
+            if (last_f_load && to8_same_float_load(cur, last_f_load)) {
+                to8_unlink(cur);
+                changed = 1;
+                cur = next;
+                continue;
+            }
+            last_f_load = cur;
+            cur = next;
+            continue;
+        }
+
+        if (cur->op == OP_LDGi || cur->op == OP_LDG4 ||
+            cur->op == OP_LDG8 || cur->op == OP_LDG4m ||
+            cur->op == OP_LDG8m) {
+            if (last_g_load && to8_same_float_load(cur, last_g_load)) {
+                to8_unlink(cur);
+                changed = 1;
+                cur = next;
+                continue;
+            }
+            last_g_load = cur;
+            cur = next;
+            continue;
+        }
+
+        switch (cur->op) {
+        case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
+        case OP_ITOF: case OP_FSCALEi:
+            last_f_load = NULL;
+            break;
+        case OP_FMOV:
+            last_g_load = NULL;
+            break;
+        case OP_JSR: case OP_JSRi: case OP_JSRr:
+            last_f_load = NULL;
+            last_g_load = NULL;
+            break;
+        default:
+            break;
+        }
+
+        cur = next;
+    }
+
+    return changed;
+}
+
 static void to8_debug_dump_list(const char *tag)
 {
     to8_line *ln;
@@ -2852,6 +3145,7 @@ static void to8_peephole_run(void)
         changed |= to8_peephole_ext();
         changed |= to8_peephole_mov();
         changed |= to8_peephole_useless_ld();
+	changed |= to8_peephole_useless_ldf(); /* NEW v8.0.1 */
 	changed |= to8_peephole_dead_r0_load();   /* NEW v7.29.0 */
         changed |= to8_peephole_ld_deref();
 	changed |= to8_peephole_commute();
@@ -2918,7 +3212,7 @@ static void to8_render_line(to8_line *ln)
         break;
     case ARG_IMM:
         out_tab();
-	if(ln->op==OP_ADJi) {
+	if(ln->op==OP_ADJi || ln->op==OP_FSCALEi) {
 	    out_int(ln->imm_val);
 	} else {
             out_int16(ln->imm_val>>16);
@@ -2928,10 +3222,10 @@ static void to8_render_line(to8_line *ln)
         break;
     case ARG_FIMM:
         out_tab();
-	if(ln->op==OP_LDFi)
-	    out_float(ln->f_val);
-        else
-            out_double(ln->f_val);
+	/* v8.0.0: ARG_FIMM is exclusively a 32-bit float immediate now -
+         * OP_LDFi and OP_LDGi both target it (F or G). out_double() is
+         * no longer reachable from here. */
+        out_float(ln->f_val);
         break;
     case ARG_SYM:
         out_tab();
