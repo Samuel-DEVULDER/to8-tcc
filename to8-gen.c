@@ -1,8 +1,39 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 7.39.0 (optim  for variable <non-commutative-op> const)
+ * Version: 7.40.0 (imm always 2 words; fimm 2 words for float, 4 for double)
  *
  * Changelog:
+ * - v7.40.0: imm/fimm operand rendering now splits into 16-bit words
+ *   instead of printing a single decimal number, matching the target's
+ *   native word size. ARG_IMM (plain int immediates, e.g. OP_LDi,
+ *   OP_ADDi) always renders as 2 words (a C int is 32 bits = 2*16).
+ *   ARG_FIMM renders as 2 words for float (OP_LDFi, 32 bits) or 4
+ *   words for double (OP_LDGi, 64 bits) - the word count follows the
+ *   operand's own width, not a fixed rule.
+ *
+ *   Each word is extracted via mask/shift on a fixed-width unsigned
+ *   integer obtained through memcpy(&bits, &v, sizeof bits) - not
+ *   through raw byte-pointer arithmetic - to make the extraction
+ *   itself trivially correct and self-documenting (bits & 0xFFFF,
+ *   bits >> 16, etc.), regardless of host byte order.
+ *
+ *   For float/double specifically, the byte SEQUENCE deliberately
+ *   matches the host's native layout (see the ARCHITECTURE NOTE above:
+ *   float/double constants stay little-endian on this backend, byte-
+ *   order conversion is punted to the real 6809 LDF/LDG/STF/STG). The
+ *   two/four words are built from consecutive byte PAIRS taken in
+ *   host memory order (first pair -> first word, etc.), each pair
+ *   read as a big-endian 16-bit value. Since a real 6809 assembler's
+ *   FDB directive stores each word big-endian (high byte, then low
+ *   byte) at consecutive addresses, printing the words in this order
+ *   reproduces the EXACT SAME byte sequence in 6809 memory as in host
+ *   memory - verified on 1.0f (0x3F800000): host bytes are
+ *   00,00,80,3F; FDB $0000,$803F stores 00,00,80,3F - identical.
+ *
+ *   out_int16() picks decimal or $hex per-word, whichever renders
+ *   SHORTER (both candidates are formatted and compared by string
+ *   length, not a fixed magnitude threshold - see its own comment).
+ *
  * - v7.39.0: new fast path in gen_opi() for non-commutative ops (SUB,
  *   DIV, MOD, and their unsigned UDIV/UMOD variants) with a constant
  *   RIGHT-hand operand - the extremely common "variable - constant"
@@ -1013,7 +1044,42 @@ static int g_col;
 static void out_char(int c) { g((unsigned char)c); if (c == '\n') g_col = 0; else g_col++; }
 static void out_str(const char *s) { while (*s) out_char((unsigned char)*s++); }
 static void out_int(int v) { char buf[16]; snprintf(buf, sizeof buf, "%d", v); out_str(buf); }
-static void out_double(double v) { char buf[32]; snprintf(buf, sizeof buf, "%g", v); out_str(buf); }
+/*
+ * Render one 16-bit word as decimal or $hex, whichever produces the
+ * SHORTER text - not a fixed magnitude threshold. Both candidate
+ * strings are actually formatted and their lengths compared, so this
+ * stays correct regardless of how many hex digits get printed (no
+ * zero-padding assumed) or how the negative/decimal side behaves.
+ * Ties go to decimal (equally short, but more readable at a glance).
+ */
+static void out_int16(int v)
+{
+    char dec[8], hex[8];
+    unsigned short uv = (unsigned short)v;   /* two's complement for hex */
+    int dec_len, hex_len;
+
+    snprintf(dec, sizeof dec, "%d", v);
+    snprintf(hex, sizeof hex, "$%x", uv);
+
+    dec_len = (int)strlen(dec);
+    hex_len = (int)strlen(hex);
+
+    out_str(hex_len < dec_len || hex_len == dec_len && (uv&0x8000) ? hex : dec);
+}
+/* render little-endian float with 2 big-endian words */
+static void out_float(float v) {
+    unsigned char *t = (unsigned char*)&v;
+    out_int16(t[0]*256+t[1]); out_char(',');
+    out_int16(t[2]*256+t[3]);
+}
+/* render little-endian double with 4 big-endian words */
+static void out_double(double v) {
+    unsigned char *t = (unsigned char*)&v;
+    out_int16(t[0]*256+t[1]); out_char(',');
+    out_int16(t[2]*256+t[3]); out_char(',');
+    out_int16(t[4]*256+t[5]); out_char(',');
+    out_int16(t[6]*256+t[7]);
+}	
 static void out_tab(void)
 {
     int next = ((g_col / 8) + 1) * 8;
@@ -2823,7 +2889,7 @@ static void to8_render_line(to8_line *ln)
     
     if (ln->is_target) {
         g_col = 0;
-        out_char('@'); out_char('l'); out_int(ln->id); out_char(':'); out_char('\n');
+        out_char('@'); out_int(ln->id); out_char(':'); out_char('\n');
     }
 
     /* --- raw inline-asm passthrough: bypass ALL normal rendering --- */
@@ -2852,17 +2918,26 @@ static void to8_render_line(to8_line *ln)
         break;
     case ARG_IMM:
         out_tab();
-        out_int(ln->imm_val);
+	if(ln->op==OP_ADJi) {
+	    out_int(ln->imm_val);
+	} else {
+            out_int16(ln->imm_val>>16);
+	    out_char(',');
+            out_int16((short)ln->imm_val);
+	}
         break;
     case ARG_FIMM:
         out_tab();
-        out_double(ln->f_val);
+	if(ln->op==OP_LDFi)
+	    out_float(ln->f_val);
+        else
+            out_double(ln->f_val);
         break;
     case ARG_SYM:
         out_tab();
         if (ln->sym) {
             const char *name = get_tok_str(ln->sym->v, NULL);
-            out_char('_');
+	    out_str("_");
             out_str(name ? name : "?");
         } else {
             out_int(ln->sym_addend);
@@ -2870,7 +2945,7 @@ static void to8_render_line(to8_line *ln)
         break;
     case ARG_JMP:
         out_tab();
-        out_char('@'); out_char('l');
+	out_str("@");
         out_int(to8_by_id(ln->jmp_target_id)->id);
         break;
     }
@@ -2879,7 +2954,7 @@ static void to8_render_line(to8_line *ln)
     out_char(';'); out_char(' ');
     if (ln->kind == ARG_JMP) {
         out_str(ln->jump_prefix);
-        out_str(" @l");
+        out_str(" @");
         out_int(to8_by_id(ln->jmp_target_id)->id);
     } else if (ln->has_comment) {
         out_str(ln->comment);
