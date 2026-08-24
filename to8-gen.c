@@ -1,8 +1,12 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.0.0 (new float ISA)
+ * Version: v8.2.0 (replaces STF4 by the faster MOV where possible).
  *
  * Changelog:
+ * - v8.2.0: Peephole optim to replace STF4 by the faster MOV.
+ *
+ * - v8.1.0: Added FSCALEi.
+ *
  * - v8.0.0: MAJOR BREAKING CHANGE - the single shared float accumulator
  * F0 (width tracked externally by the caller) is replaced by two
  * dedicated registers, F and G, on three orthogonal axes: register
@@ -640,7 +644,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.0.0"
+#define TO8_GEN_VERSION "8.2.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3123,6 +3127,52 @@ static int to8_peephole_useless_ldf(void)
     return changed;
 }
 
+/*
+ * Two consecutive own-slot float stores (STF4 A ; STF4 B) write the
+ * SAME F value to two different slots with no instruction in between
+ * that could change F. The second store is replaced by a plain word
+ * copy (MOV B,A) instead of re-running the float store - on the real
+ * 6809 target, STF4 performs a register-to-IEEE conversion (see the
+ * ARCHITECTURE NOTE above OP_LDF4/OP_STF4); paying that conversion
+ * cost twice for an identical value is wasteful. A raw 4-byte copy of
+ * already-converted bytes is unconditionally cheaper and correct.
+ *
+ * !nxt->is_target is required: if something jumps directly to the
+ * second store, F may hold an unrelated value at that entry point,
+ * and mutating it into "copy from slot A" would silently substitute
+ * the wrong value - same precedent as to8_peephole_mov()/
+ * to8_peephole_ld_deref().
+ */
+static int to8_peephole_float_store_dup(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+
+    while (cur) {
+        to8_line *nxt = cur->next;
+
+        if (cur->op == OP_STF4 && cur->kind == ARG_SLOT &&
+            nxt && !nxt->is_target &&
+            nxt->op == OP_STF4 && nxt->kind == ARG_SLOT &&
+            cur->push_depth == nxt->push_depth &&
+            cur->slot_a != nxt->slot_a) {
+            char dst_desc[24], src_desc[24];
+
+            nxt->op = OP_MOV;
+            nxt->kind = ARG_SLOT2;
+            nxt->slot_b = cur->slot_a; /* source = first store's slot */
+            /* nxt->slot_a already holds the destination */
+            slot_desc(dst_desc, sizeof dst_desc, nxt->slot_a);
+            slot_desc(src_desc, sizeof src_desc, nxt->slot_b);
+            snprintf(nxt->comment, sizeof nxt->comment, "%s = %s", dst_desc, src_desc);
+            nxt->has_comment = 1;
+            changed = 1;
+        }
+        cur = nxt;
+    }
+    return changed;
+}
+
 static void to8_debug_dump_list(const char *tag)
 {
     to8_line *ln;
@@ -3146,6 +3196,7 @@ static void to8_peephole_run(void)
         changed |= to8_peephole_mov();
         changed |= to8_peephole_useless_ld();
 	changed |= to8_peephole_useless_ldf(); /* NEW v8.0.1 */
+	changed |= to8_peephole_float_store_dup(); /* NEW v8.0.2 */
 	changed |= to8_peephole_dead_r0_load();   /* NEW v7.29.0 */
         changed |= to8_peephole_ld_deref();
 	changed |= to8_peephole_commute();
