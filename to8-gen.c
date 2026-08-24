@@ -1,8 +1,39 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.4.0 (new peephole to8_peephole_fmov())
+ * Version: 8.5.0 (to8_peephole_fmov() now scans past F-transparent ops)
  *
  * Changelog:
+ * - v8.5.0: to8_peephole_fmov() now performs a real forward scan
+ *   instead of firing only on strictly adjacent lines. The v8.4.0
+ *   version required "LDF* X ; LDG* X" back-to-back; any intervening
+ *   instruction - even a plain integer comparison or a conditional
+ *   jump with no side effect on F - silently defeated the fusion.
+ *
+ *   Reuses the same "does this opcode write F" classification already
+ *   established in to8_peephole_useless_fload() (v8.1.x), factored out
+ *   as to8_stops_fmov_scan(): LDF* /FADD/FSUB/FMUL/FDIV/FSCALEi/ITOF (all
+ *   redefine F) and JSR/JSRi/JSRr (opaque - the callee may use F/G
+ *   arbitrarily) stop the scan. Everything else - STF4/STF8/STF4m/
+ *   STF8m (read F, never write it), FCMP/FSGN/FTOI (read F, write only
+ *   R0), all integer instructions, and every jump (reads only R0's
+ *   sign) - is transparent and the scan continues through it.
+ *
+ *   !scan->is_target stops the scan for the usual reason: a jump
+ *   landing directly on the G-load may arrive with F holding a value
+ *   unrelated to the LDF* this pass is tracking.
+ *
+ *   Example:
+ *       LDF4    24      ; F = x
+ *       CMP2    8,4     ; unrelated integer comparison
+ *       JGE     @47     ; unrelated conditional jump
+ *       LDG4    24      ; G = x
+ *   becomes:
+ *       LDF4    24      ; F = x
+ *       CMP2    8,4
+ *       JGE     @47
+ *       FMOV            ; G = F
+ *   a fusion the strictly-adjacent v8.4.0 version could never reach.
+ *
  * - v8.4.0: new peephole to8_peephole_fmov(). Collapses "LDF* X ;
  *   LDG* X" (F loaded first, then G loaded with the IDENTICAL address
  *   or immediate value right after) into "LDF* X ; FMOV" - the second
@@ -699,7 +730,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.4.0"
+#define TO8_GEN_VERSION "8.5.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3278,6 +3309,20 @@ static to8_opcode to8_g_counterpart(to8_opcode f_op)
     }
 }
 
+static int to8_stops_fmov_scan(to8_opcode op)
+{
+    switch (op) {
+    case OP_LDFi: case OP_LDF4: case OP_LDF8: case OP_LDF4m: case OP_LDF8m:
+    case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
+    case OP_FSCALEi: case OP_ITOF:
+    case OP_JSR: case OP_JSRi: case OP_JSRr:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+
 /*
  * "LDF* X ; LDG* X" (identical address/value, F loaded first) becomes
  * "LDF* X ; FMOV" - the second memory load is replaced by a register-
@@ -3292,41 +3337,51 @@ static int to8_peephole_fmov(void)
     to8_line *cur = g_head;
 
     while (cur) {
-        to8_line *nxt = cur->next;
+        to8_line *cur_next = cur->next;
         to8_opcode g_equiv = to8_g_counterpart(cur->op);
 
-        if (g_equiv != OP_NOP &&
-            nxt && !nxt->is_target &&
-            nxt->op == g_equiv &&
-            cur->kind == nxt->kind &&
-            cur->push_depth == nxt->push_depth) {
-            int same_operand = 0;
+        if (g_equiv != OP_NOP) {
+            to8_line *scan;
 
-            switch (cur->kind) {
-            case ARG_SLOT:
-                same_operand = (cur->slot_a == nxt->slot_a);
-                break;
-            case ARG_SYM:
-                same_operand = (cur->sym == nxt->sym &&
-                                 cur->sym_addend == nxt->sym_addend);
-                break;
-            case ARG_FIMM:
-                same_operand = (cur->f_val == nxt->f_val);
-                break;
-            default:
-                break;
-            }
+            for (scan = cur->next; scan; scan = scan->next) {
+                if (scan->is_target)
+                    break;
 
-            if (same_operand) {
-                nxt->op = OP_FMOV;
-                nxt->kind = ARG_NONE;
-                snprintf(nxt->comment, sizeof nxt->comment, "G = F");
-                nxt->has_comment = 1;
-                changed = 1;
+                if (scan->op == g_equiv && scan->kind == cur->kind) {
+                    int same_operand = 0;
+
+                    switch (cur->kind) {
+                    case ARG_SLOT:
+                        same_operand = (cur->slot_a == scan->slot_a &&
+                                         cur->push_depth == scan->push_depth);
+                        break;
+                    case ARG_SYM:
+                        same_operand = (cur->sym == scan->sym &&
+                                         cur->sym_addend == scan->sym_addend);
+                        break;
+                    case ARG_FIMM:
+                        same_operand = (cur->f_val == scan->f_val);
+                        break;
+                    default:
+                        break;
+                    }
+
+                    if (same_operand) {
+                        scan->op = OP_FMOV;
+                        scan->kind = ARG_NONE;
+                        snprintf(scan->comment, sizeof scan->comment, "G = F");
+                        scan->has_comment = 1;
+                        changed = 1;
+                    }
+                    break;
+                }
+
+                if (to8_stops_fmov_scan(scan->op))
+                    break;
             }
         }
 
-        cur = nxt;
+        cur = cur_next;
     }
     return changed;
 }
