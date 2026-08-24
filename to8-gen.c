@@ -1,8 +1,10 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: v8.2.0 (replaces STF4 by the faster MOV where possible).
+ * Version: 8.3.0 (Extended optim to replace STF8 by the two MOV.)
  *
  * Changelog:
+ * - v8.3.0: Extended optim to replace STF8 by the two MOV.
+ *
  * - v8.2.0: Peephole optim to replace STF4 by the faster MOV.
  *
  * - v8.1.0: Added FSCALEi.
@@ -644,7 +646,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.2.0"
+#define TO8_GEN_VERSION "8.3.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3168,6 +3170,44 @@ static int to8_peephole_float_store_dup(void)
             nxt->has_comment = 1;
             changed = 1;
         }
+	
+	if (cur->op == OP_STF8 && cur->kind == ARG_SLOT &&
+            nxt && !nxt->is_target &&
+            nxt->op == OP_STF8 && nxt->kind == ARG_SLOT &&
+            cur->push_depth == nxt->push_depth &&
+            cur->slot_a != nxt->slot_a) {
+            to8_line *second = tcc_mallocz(sizeof(to8_line));
+            char dst_desc[24], src_desc[24];
+            int dst = nxt->slot_a, src = cur->slot_a;
+         
+            /* Mutate nxt in place into the first (low-word) MOV - same
+             * technique as to8_peephole_mov()'s LD/ST fusion. */
+            nxt->op = OP_MOV;
+            nxt->kind = ARG_SLOT2;
+            nxt->slot_b = src;
+            slot_desc(dst_desc, sizeof dst_desc, dst);
+            slot_desc(src_desc, sizeof src_desc, src);
+            snprintf(nxt->comment, sizeof nxt->comment, "%s = %s", dst_desc, src_desc);
+            nxt->has_comment = 1;
+         
+            /* Splice a second, freshly synthesized MOV right after it for
+             * the high word - same precedent as to8_peephole_ext(): never
+             * registered by id, never a jump target. */
+            second->op = OP_MOV;
+            second->kind = ARG_SLOT2;
+            second->slot_a = dst + 4;
+            second->slot_b = src + 4;
+            second->push_depth = nxt->push_depth;
+            slot_desc(dst_desc, sizeof dst_desc, second->slot_a);
+            slot_desc(src_desc, sizeof src_desc, second->slot_b);
+            snprintf(second->comment, sizeof second->comment, "%s = %s", dst_desc, src_desc);
+            second->has_comment = 1;
+            to8_insert_after(nxt, second);
+         
+            changed = 1;
+            nxt = second->next;
+        }
+         
         cur = nxt;
     }
     return changed;
