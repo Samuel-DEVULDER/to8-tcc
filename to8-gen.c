@@ -1,8 +1,42 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.5.0 (to8_peephole_fmov() now scans past F-transparent ops)
+ * Version: 8.6.0 (to8_peephole_float_store_dup() now scans past F-transparent ops)
  *
  * Changelog:
+ * - v8.6.0: to8_peephole_float_store_dup() now performs a real forward
+ *   scan instead of firing only on strictly adjacent STF4/STF8 pairs -
+ *   same limitation and same fix as v8.5.0's to8_peephole_fmov()
+ *   extension, reusing the identical to8_stops_fmov_scan() helper.
+ *  
+ *   Found while reviewing mandel3()'s chained assignment
+ *   "x = y = x2 = y2 = 0;": the front-end emits four consecutive STF4
+ *   stores, but to8_peephole_mov()'s own LD/ST fusion had already
+ *   turned "x2 = y2" into a MOV between the first and third STF4,
+ *   breaking the strict adjacency the old store-dup pass required.
+ *   "STF4 8 (y2) ; MOV 12,8 (x2) ; STF4 16 (y) ; MOV 20,16 (x)" left
+ *   the second STF4 (slot 16) unconverted, since its only adjacent
+ *   neighbor going backward was a MOV, not a STF4.
+ *  
+ *   With the scan, "STF4 16" now finds "STF4 8" past the intervening
+ *   MOV (transparent - it never touches F) and becomes "MOV 16,8".
+ *   The existing do/while in to8_peephole_run() converges this over
+ *   two internal iterations: pass 1 still only catches the directly-
+ *   reachable STF4 for a given cur; pass 2, run because pass 1 already
+ *   reported changed=1, resumes from the same cur with the newly-
+ *   created MOV now transparent, reaching the next STF4 in the chain.
+ *   No changes needed to the driver loop itself.
+ *  
+ *   Example (mandel3(), x=y=x2=y2=0):
+ *       STF4    8       ; y2 = F
+ *       MOV     12,8    ; x2 = y2
+ *       STF4    16      ; y = F
+ *       MOV     20,16   ; x = y
+ *   becomes:
+ *       STF4    8       ; y2 = F
+ *       MOV     12,8    ; x2 = y2
+ *       MOV     16,8    ; y = y2
+ *       MOV     20,16   ; x = y
+ *
  * - v8.5.0: to8_peephole_fmov() now performs a real forward scan
  *   instead of firing only on strictly adjacent lines. The v8.4.0
  *   version required "LDF* X ; LDG* X" back-to-back; any intervening
@@ -3140,6 +3174,31 @@ static int to8_same_float_load(const to8_line *a, const to8_line *b)
     }
 }
 
+static to8_opcode to8_g_counterpart(to8_opcode f_op)
+{
+    switch (f_op) {
+    case OP_LDFi:  return OP_LDGi;
+    case OP_LDF4:  return OP_LDG4;
+    case OP_LDF8:  return OP_LDG8;
+    case OP_LDF4m: return OP_LDG4m;
+    case OP_LDF8m: return OP_LDG8m;
+    default:       return OP_NOP; /* not an F-load opcode */
+    }
+}
+
+static int to8_stops_fmov_scan(to8_opcode op)
+{
+    switch (op) {
+    case OP_LDFi: case OP_LDF4: case OP_LDF8: case OP_LDF4m: case OP_LDF8m:
+    case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
+    case OP_FSCALEi: case OP_ITOF:
+    case OP_JSR: case OP_JSRi: case OP_JSRr:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /*
  * Remove a redundant repeated load into F or G when the same register
  * still contains the identical value and no intervening instruction
@@ -3235,93 +3294,83 @@ static int to8_peephole_float_store_dup(void)
     to8_line *cur = g_head;
 
     while (cur) {
-        to8_line *nxt = cur->next;
+        to8_line *cur_next = cur->next;
 
-        if (cur->op == OP_STF4 && cur->kind == ARG_SLOT &&
-            nxt && !nxt->is_target &&
-            nxt->op == OP_STF4 && nxt->kind == ARG_SLOT &&
-            cur->push_depth == nxt->push_depth &&
-            cur->slot_a != nxt->slot_a) {
-            char dst_desc[24], src_desc[24];
+        if (cur->op == OP_STF4 && cur->kind == ARG_SLOT) {
+            to8_line *scan;
 
-            nxt->op = OP_MOV;
-            nxt->kind = ARG_SLOT2;
-            nxt->slot_b = cur->slot_a; /* source = first store's slot */
-            /* nxt->slot_a already holds the destination */
-            slot_desc(dst_desc, sizeof dst_desc, nxt->slot_a);
-            slot_desc(src_desc, sizeof src_desc, nxt->slot_b);
-            snprintf(nxt->comment, sizeof nxt->comment, "%s = %s", dst_desc, src_desc);
-            nxt->has_comment = 1;
-            changed = 1;
+            for (scan = cur->next; scan; scan = scan->next) {
+                if (scan->is_target)
+                    break;
+
+                if (scan->op == OP_STF4 && scan->kind == ARG_SLOT &&
+                    scan->push_depth == cur->push_depth) {
+                    if (scan->slot_a != cur->slot_a) {
+                        char dst_desc[24], src_desc[24];
+                        scan->op = OP_MOV;
+                        scan->kind = ARG_SLOT2;
+                        scan->slot_b = cur->slot_a;
+                        slot_desc(dst_desc, sizeof dst_desc, scan->slot_a);
+                        slot_desc(src_desc, sizeof src_desc, scan->slot_b);
+                        snprintf(scan->comment, sizeof scan->comment, "%s = %s", dst_desc, src_desc);
+                        scan->has_comment = 1;
+                        changed = 1;
+                    }
+                    break;
+                }
+
+                if (to8_stops_fmov_scan(scan->op))
+                    break;
+            }
         }
-	
-	if (cur->op == OP_STF8 && cur->kind == ARG_SLOT &&
-            nxt && !nxt->is_target &&
-            nxt->op == OP_STF8 && nxt->kind == ARG_SLOT &&
-            cur->push_depth == nxt->push_depth &&
-            cur->slot_a != nxt->slot_a) {
-            to8_line *second = tcc_mallocz(sizeof(to8_line));
-            char dst_desc[24], src_desc[24];
-            int dst = nxt->slot_a, src = cur->slot_a;
-         
-            /* Mutate nxt in place into the first (low-word) MOV - same
-             * technique as to8_peephole_mov()'s LD/ST fusion. */
-            nxt->op = OP_MOV;
-            nxt->kind = ARG_SLOT2;
-            nxt->slot_b = src;
-            slot_desc(dst_desc, sizeof dst_desc, dst);
-            slot_desc(src_desc, sizeof src_desc, src);
-            snprintf(nxt->comment, sizeof nxt->comment, "%s = %s", dst_desc, src_desc);
-            nxt->has_comment = 1;
-         
-            /* Splice a second, freshly synthesized MOV right after it for
-             * the high word - same precedent as to8_peephole_ext(): never
-             * registered by id, never a jump target. */
-            second->op = OP_MOV;
-            second->kind = ARG_SLOT2;
-            second->slot_a = dst + 4;
-            second->slot_b = src + 4;
-            second->push_depth = nxt->push_depth;
-            slot_desc(dst_desc, sizeof dst_desc, second->slot_a);
-            slot_desc(src_desc, sizeof src_desc, second->slot_b);
-            snprintf(second->comment, sizeof second->comment, "%s = %s", dst_desc, src_desc);
-            second->has_comment = 1;
-            to8_insert_after(nxt, second);
-         
-            changed = 1;
-            nxt = second->next;
+
+        if (cur->op == OP_STF8 && cur->kind == ARG_SLOT) {
+            to8_line *scan;
+
+            for (scan = cur->next; scan; scan = scan->next) {
+                if (scan->is_target)
+                    break;
+
+                if (scan->op == OP_STF8 && scan->kind == ARG_SLOT &&
+                    scan->push_depth == cur->push_depth) {
+                    if (scan->slot_a != cur->slot_a) {
+                        to8_line *second = tcc_mallocz(sizeof(to8_line));
+                        char dst_desc[24], src_desc[24];
+                        int dst = scan->slot_a, src = cur->slot_a;
+
+                        scan->op = OP_MOV;
+                        scan->kind = ARG_SLOT2;
+                        scan->slot_b = src;
+                        slot_desc(dst_desc, sizeof dst_desc, dst);
+                        slot_desc(src_desc, sizeof src_desc, src);
+                        snprintf(scan->comment, sizeof scan->comment, "%s = %s", dst_desc, src_desc);
+                        scan->has_comment = 1;
+
+                        second->op = OP_MOV;
+                        second->kind = ARG_SLOT2;
+                        second->slot_a = dst + 4;
+                        second->slot_b = src + 4;
+                        second->push_depth = scan->push_depth;
+                        slot_desc(dst_desc, sizeof dst_desc, second->slot_a);
+                        slot_desc(src_desc, sizeof src_desc, second->slot_b);
+                        snprintf(second->comment, sizeof second->comment, "%s = %s", dst_desc, src_desc);
+                        second->has_comment = 1;
+                        to8_insert_after(scan, second);
+
+                        changed = 1;
+                    }
+                    break;
+                }
+
+                if (to8_stops_fmov_scan(scan->op))
+                    break;
+            }
         }
-         
-        cur = nxt;
+
+        cur = cur_next;
     }
     return changed;
 }
-
-static to8_opcode to8_g_counterpart(to8_opcode f_op)
-{
-    switch (f_op) {
-    case OP_LDFi:  return OP_LDGi;
-    case OP_LDF4:  return OP_LDG4;
-    case OP_LDF8:  return OP_LDG8;
-    case OP_LDF4m: return OP_LDG4m;
-    case OP_LDF8m: return OP_LDG8m;
-    default:       return OP_NOP; /* not an F-load opcode */
-    }
-}
-
-static int to8_stops_fmov_scan(to8_opcode op)
-{
-    switch (op) {
-    case OP_LDFi: case OP_LDF4: case OP_LDF8: case OP_LDF4m: case OP_LDF8m:
-    case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
-    case OP_FSCALEi: case OP_ITOF:
-    case OP_JSR: case OP_JSRi: case OP_JSRr:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
 
 /*
  * "LDF* X ; LDG* X" (identical address/value, F loaded first) becomes
