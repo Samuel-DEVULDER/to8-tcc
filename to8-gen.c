@@ -1,8 +1,61 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.3.0 (Extended optim to replace STF8 by the two MOV.)
+ * Version: 8.4.0 (new peephole to8_peephole_fmov())
  *
  * Changelog:
+ * - v8.4.0: new peephole to8_peephole_fmov(). Collapses "LDF* X ;
+ *   LDG* X" (F loaded first, then G loaded with the IDENTICAL address
+ *   or immediate value right after) into "LDF* X ; FMOV" - the second
+ *   memory load is replaced by a cheap register-to-register copy
+ *   (G := F), avoiding a redundant memory access for a value F already
+ *   holds.
+ *   
+ *   Found while reviewing mandel()'s self-multiply pattern (x*x, y*y):
+ *   gen_opf()'s left-operand loading (to8_load_fg) has no way to know,
+ *   at codegen time, that the left and right operands of an expression
+ *   like "x*x" happen to be the exact same slot - it loads each
+ *   occurrence independently, once into F (the right operand, via
+ *   gv(RC_FLOAT)) and once into G (the left operand). The two loads are
+ *   structurally identical (same opcode family, same slot/symbol/
+ *   immediate), and F already holds the value the second load would
+ *   fetch again from memory.
+ *   
+ *   Implemented via to8_g_counterpart(), a small table pairing each F
+ *   load opcode with its G equivalent (OP_LDFi/OP_LDGi, OP_LDF4/OP_LDG4,
+ *   OP_LDF8/OP_LDG8, OP_LDF4m/OP_LDG4m, OP_LDF8m/OP_LDG8m). The pass only
+ *   fires on DIRECTLY ADJACENT lines (nxt == cur->next) - unlike most
+ *   other peepholes in this file, no scanning loop is needed, since
+ *   adjacency alone guarantees nothing else could have touched F in
+ *   between. The only remaining hazard is a jump landing directly on
+ *   the second load (skipping the first): guarded by the usual
+ *   !nxt->is_target check, same precedent as to8_peephole_mov()/
+ *   to8_peephole_ld_deref().
+ *   
+ *   One-directional by construction: OP_FMOV only ever computes
+ *   G := F, never the reverse, so "LDG* X ; LDF* X" (G loaded first)
+ *   is NOT touched by this pass - there is no "F := G" opcode to
+ *   express that direction, consistent with G being write-only/never a
+ *   result destination throughout this backend's F/G design (see the
+ *   v8.0.0 changelog entry above).
+ *   
+ *   Example (mandel(), x*x):
+ *       LDF4    24      ; F = x
+ *       LDG4    24      ; G = x
+ *       FMUL            ; F = G * F
+ *   becomes:
+ *       LDF4    24      ; F = x
+ *       FMOV            ; G = F
+ *       FMUL            ; F = G * F
+ *   trading one memory read for one register-to-register copy.
+ *   
+ *   Runs under -O only, like every other peephole pass in this file
+ *   (gated by tcc_state->optimize via to8_peephole_run()'s early
+ *   return). Complementary to, not overlapping with,
+ *   to8_peephole_useless_fload() (v8.1.x): that pass removes a
+ *   redundant RELOAD into the SAME register that already holds the
+ *   value; this one propagates a value ALREADY in F across to G
+ *   instead of re-fetching it from memory.
+ *
  * - v8.3.0: Extended optim to replace STF8 by the two MOV.
  *
  * - v8.2.0: Peephole optim to replace STF4 by the faster MOV.
@@ -646,7 +699,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.3.0"
+#define TO8_GEN_VERSION "8.4.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3213,6 +3266,71 @@ static int to8_peephole_float_store_dup(void)
     return changed;
 }
 
+static to8_opcode to8_g_counterpart(to8_opcode f_op)
+{
+    switch (f_op) {
+    case OP_LDFi:  return OP_LDGi;
+    case OP_LDF4:  return OP_LDG4;
+    case OP_LDF8:  return OP_LDG8;
+    case OP_LDF4m: return OP_LDG4m;
+    case OP_LDF8m: return OP_LDG8m;
+    default:       return OP_NOP; /* not an F-load opcode */
+    }
+}
+
+/*
+ * "LDF* X ; LDG* X" (identical address/value, F loaded first) becomes
+ * "LDF* X ; FMOV" - the second memory load is replaced by a register-
+ * to-register copy. Adjacency (nxt == cur->next) means there is
+ * nothing "in between" to invalidate F by construction - the only
+ * remaining hazard is a jump landing directly on the second load,
+ * hence !nxt->is_target.
+ */
+static int to8_peephole_fmov(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+
+    while (cur) {
+        to8_line *nxt = cur->next;
+        to8_opcode g_equiv = to8_g_counterpart(cur->op);
+
+        if (g_equiv != OP_NOP &&
+            nxt && !nxt->is_target &&
+            nxt->op == g_equiv &&
+            cur->kind == nxt->kind &&
+            cur->push_depth == nxt->push_depth) {
+            int same_operand = 0;
+
+            switch (cur->kind) {
+            case ARG_SLOT:
+                same_operand = (cur->slot_a == nxt->slot_a);
+                break;
+            case ARG_SYM:
+                same_operand = (cur->sym == nxt->sym &&
+                                 cur->sym_addend == nxt->sym_addend);
+                break;
+            case ARG_FIMM:
+                same_operand = (cur->f_val == nxt->f_val);
+                break;
+            default:
+                break;
+            }
+
+            if (same_operand) {
+                nxt->op = OP_FMOV;
+                nxt->kind = ARG_NONE;
+                snprintf(nxt->comment, sizeof nxt->comment, "G = F");
+                nxt->has_comment = 1;
+                changed = 1;
+            }
+        }
+
+        cur = nxt;
+    }
+    return changed;
+}
+
 static void to8_debug_dump_list(const char *tag)
 {
     to8_line *ln;
@@ -3236,6 +3354,7 @@ static void to8_peephole_run(void)
         changed |= to8_peephole_mov();
         changed |= to8_peephole_useless_ld();
 	changed |= to8_peephole_useless_ldf(); /* NEW v8.0.1 */
+	changed |= to8_peephole_fmov(); /* v8.4.0 */
 	changed |= to8_peephole_float_store_dup(); /* NEW v8.0.2 */
 	changed |= to8_peephole_dead_r0_load();   /* NEW v7.29.0 */
         changed |= to8_peephole_ld_deref();
