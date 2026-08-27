@@ -1,8 +1,10 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.6.0 (to8_peephole_float_store_dup() now scans past F-transparent ops)
+ * Version: 8.6.1 (adaptation to c6809)
  *
  * Changelog:
+ * - v8.6.1: use '*' for comments instead of ';'
+ *
  * - v8.6.0: to8_peephole_float_store_dup() now performs a real forward
  *   scan instead of firing only on strictly adjacent STF4/STF8 pairs -
  *   same limitation and same fix as v8.5.0's to8_peephole_fmov()
@@ -764,7 +766,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.5.0"
+#define TO8_GEN_VERSION "8.6.1"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -1028,8 +1030,8 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_FCMP: return "FCMP"; case OP_FSGN: return "FSGN";
 
     case OP_PUSH: return "PUSH"; case OP_PUSHi: return "PUSHi"; case OP_PUSHr: return "PUSHr";
-    case OP_JSR: return "JSR"; case OP_JSRi: return "JSRi"; case OP_JSRr: return "JSRr";
-    case OP_JMP: return "JMP"; case OP_JEQ: return "JEQ"; case OP_JNE: return "JNE";
+    case OP_JSR: return "CALL"; case OP_JSRi: return "CALLi"; case OP_JSRr: return "CALLr";
+    case OP_JMP: return "JRA"; case OP_JEQ: return "JEQ"; case OP_JNE: return "JNE";
     case OP_JLT: return "JLT"; case OP_JGT: return "JGT"; case OP_JLE: return "JLE"; case OP_JGE: return "JGE";
     
     case OP_MOV:   return "MOV";
@@ -1303,9 +1305,9 @@ static void out_pad_to(int col)
 static void to8_print_banner(void)
 {
     g_col = 0;
-    out_str("; TO8 backend "); out_str(TO8_GEN_VERSION); out_char('\n');
+    out_str("* TO8 backend "); out_str(TO8_GEN_VERSION); out_char('\n');
 
-    out_str("; out: ");
+    out_str("* out: ");
     out_str((tcc_state && tcc_state->outfile) ? tcc_state->outfile : "(unknown)");
     out_str(" src: ");
     out_str((file && file->filename[0]) ? file->filename : "(unknown)");
@@ -3487,9 +3489,9 @@ static void to8_render_line(to8_line *ln)
         char text[512], marker[600];
         g_last_printed_line = ln->src_line;
         if (to8_read_source_line(file->filename, ln->src_line, text, sizeof text) && text[0])
-            snprintf(marker, sizeof marker, "; L%d: %s", ln->src_line, text);
+            snprintf(marker, sizeof marker, "* %d: %s", ln->src_line, text);
         else
-            snprintf(marker, sizeof marker, "; L%d", ln->src_line);
+            snprintf(marker, sizeof marker, "* %d", ln->src_line);
         g_col = 0;
         out_str(marker);
         out_char('\n');
@@ -3497,7 +3499,7 @@ static void to8_render_line(to8_line *ln)
     
     if (ln->is_target) {
         g_col = 0;
-        out_char('@'); out_int(ln->id); out_char(':'); out_char('\n');
+        out_char('_'); out_int(ln->id);out_char('\n');
     }
 
     /* --- raw inline-asm passthrough: bypass ALL normal rendering --- */
@@ -3546,14 +3548,15 @@ static void to8_render_line(to8_line *ln)
         if (ln->sym) {
             const char *name = get_tok_str(ln->sym->v, NULL);
 	    out_str("_");
-            out_str(name ? name : "?");
+            //out_str(name ? name : "?");
+	    {char  *s=name ? name : "?"; while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
         } else {
             out_int(ln->sym_addend);
         }
         break;
     case ARG_JMP:
         out_tab();
-	out_str("@");
+	out_char('_');
         out_int(to8_by_id(ln->jmp_target_id)->id);
         break;
     }
@@ -3562,7 +3565,7 @@ static void to8_render_line(to8_line *ln)
     out_char(';'); out_char(' ');
     if (ln->kind == ARG_JMP) {
         out_str(ln->jump_prefix);
-        out_str(" @");
+        out_str(" _");
         out_int(to8_by_id(ln->jmp_target_id)->id);
     } else if (ln->has_comment) {
         out_str(ln->comment);
@@ -3576,7 +3579,11 @@ static void to8_render_function(void)
     ind = to8_func_start_ind;
     g_col = 0;
 
-    out_char('_'); out_str(to8_func_name); out_char(':');
+    out_char('_'); out_str(to8_func_name);
+    out_tab();
+    out_str("set");
+    out_tab();
+    out_char('*');
     out_pad_to(TO8_COMMENT_COL);
     out_char(';'); out_char(' ');
     out_int(g_count_after);
@@ -3800,7 +3807,12 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
             if (!g_banner_done) { to8_print_banner(); g_banner_done = 1; }
 
             g_col = 0;
-            out_char('_'); out_str(name); out_char(':');
+            out_char('_'); //out_str(name);
+	    {char  *s=name;while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
+	    out_tab();
+	    out_str("set");
+	    out_tab();
+	    out_str("*");
             out_pad_to(TO8_COMMENT_COL);
             out_char(';'); out_char(' ');
             out_int((int)n); out_str(" bytes (data)");
@@ -3824,8 +3836,7 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
 
     if (!g_banner_done) { to8_print_banner(); g_banner_done = 1; }
     g_col = 0;
-    out_str("; --- end of asm ---");
-    out_char('\n');
+    out_str("* --- end of asm ---\n");
 
     cur_text_section->data_offset = ind;
     nocode_wanted = save_nocode_wanted;
