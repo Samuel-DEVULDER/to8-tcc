@@ -6,7 +6,7 @@ BANKING set	0
 init	bra	crt0
 
 R0	FDB	0,0
-TMP4	FDB	0,0
+R1	FDB	0,0
        
 crt0	pshs	d,x,y,u,dp,cc
 	ldd	#R0&$FF00

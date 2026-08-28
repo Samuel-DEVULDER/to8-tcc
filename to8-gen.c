@@ -1,8 +1,24 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.6.1 (adaptation to c6809)
+ * Version: 8.7.0 (better local labels and better to8_peep_hole_ext)
  *
  * Changelog:
+ * - v8.7.0 two fixes.
+ *   1) Labels are now globally unique: to8_render_line prints
+ *      "_<funcno>_<id>" (hex, new helper to8_print_local_label)
+ *      instead of bare "_<id>". gnextid resets to 0 per gfuncprolog,
+ *      so two functions could reuse the same label text once
+ *      concatenated - caused "Multiply Defined Symbol". to8_func_no
+ *      is a per-function serial, incremented once in gfuncprolog,
+ *      never reset - cheap and collision-free across the whole file.
+ *   2) to8_peep_hole_ext now mutates cur in place instead of
+ *      allocating a new to8line and unlinking cur - same fix as
+ *      to8peepholemov (v7.31.1), to8peepholeldderef (v7.24.0),
+ *      to8peepholecommute (v7.25.1). Old version dropped cur's label
+ *      if cur was a jump target, since the fused line had no redirect
+ *      back to cur's id. !cur->istarget removed accordingly.
+ *      !nxt->istarget unchanged, still required for the symmetric case.
+ * 
  * - v8.6.1: use '*' for comments instead of ';'
  *
  * - v8.6.0: to8_peephole_float_store_dup() now performs a real forward
@@ -766,7 +782,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.6.1"
+#define TO8_GEN_VERSION "8.7.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -2717,7 +2733,7 @@ static int to8_peephole_ext(void)
     to8_line *cur = g_head;
     while (cur) {
         to8_line *nxt = cur->next;
-        if (cur->op == OP_SHLi && !cur->is_target &&
+        if (cur->op == OP_SHLi &&
             (cur->imm_val == 24 || cur->imm_val == 16) &&
             nxt && !nxt->is_target &&
             (nxt->op == OP_SARi || nxt->op == OP_SHRi) &&
@@ -2725,21 +2741,19 @@ static int to8_peephole_ext(void)
             to8_opcode rep = (nxt->op == OP_SARi)
                 ? (cur->imm_val == 24 ? OP_EXT1S : OP_EXT2S)
                 : (cur->imm_val == 24 ? OP_EXT1U : OP_EXT2U);
-            to8_line *ext = tcc_mallocz(sizeof(to8_line));
-            to8_line *scan_from;
-            ext->op = rep;
-            ext->kind = ARG_NONE;
-            {
-                const char *c = bare_comment(rep);
-                if (c) { snprintf(ext->comment, sizeof ext->comment, "%s", c); ext->has_comment = 1; }
+            /* Mutate cur in place: same id/position/istarget survive,
+             * so any label attached to cur stays correctly attached
+             * to the fused EXT instruction. No new to8line, no malloc,
+             * no to8insertafter needed anymore. */
+            cur->op = rep;
+            cur->kind = ARG_NONE;
+	    {
+		const char *c = bare_comment(rep);
+		if (c) { snprintf(cur->comment, sizeof cur->comment, "%s", c); cur->has_comment = 1; } else { cur->has_comment = 0;}
             }
-            to8_insert_after(cur, ext);
-            to8_unlink(cur);
             to8_unlink(nxt);
-            scan_from = ext->next;
-            cur = scan_from;
+            nxt = cur->next;
             changed = 1;
-            continue;
         }
         cur = nxt;
     }
@@ -3476,10 +3490,17 @@ static void to8_peephole_run(void)
 
 static to8_line *to8_func_adj_line;
 static char to8_func_name[256];
+static int to8_func_no;
 
 static int to8_final_slot(int raw_slot, int push_depth)
 {
     return g_frame_size + raw_slot + push_depth;
+}
+
+static void to8_print_local_label(int id) {
+    char text[256];
+    snprintf(text, sizeof text, "_%X_%X", to8_func_no, id);
+    out_str(text);
 }
 
 static void to8_render_line(to8_line *ln)
@@ -3499,7 +3520,9 @@ static void to8_render_line(to8_line *ln)
     
     if (ln->is_target) {
         g_col = 0;
-        out_char('_'); out_int(ln->id);out_char('\n');
+	to8_print_local_label(ln->id);
+	out_tab(); out_str("set"); out_tab(); out_char('*');
+	out_char('\n');
     }
 
     /* --- raw inline-asm passthrough: bypass ALL normal rendering --- */
@@ -3556,8 +3579,7 @@ static void to8_render_line(to8_line *ln)
         break;
     case ARG_JMP:
         out_tab();
-	out_char('_');
-        out_int(to8_by_id(ln->jmp_target_id)->id);
+	to8_print_local_label(to8_by_id(ln->jmp_target_id)->id);
         break;
     }
 
@@ -3565,8 +3587,8 @@ static void to8_render_line(to8_line *ln)
     out_char(';'); out_char(' ');
     if (ln->kind == ARG_JMP) {
         out_str(ln->jump_prefix);
-        out_str(" _");
-        out_int(to8_by_id(ln->jmp_target_id)->id);
+	out_char(' ');
+	to8_print_local_label(to8_by_id(ln->jmp_target_id)->id);
     } else if (ln->has_comment) {
         out_str(ln->comment);
     }
@@ -3639,6 +3661,7 @@ void gfunc_prolog(Sym *func_sym)
     to8_func_start_ind = ind;
 
     snprintf(to8_func_name, sizeof to8_func_name, "%s", funcname ? funcname : "?");
+    ++to8_func_no;
 
     to8_func_adj_line = to8_append(OP_ADJi);
     to8_func_adj_line->kind = ARG_IMM;
