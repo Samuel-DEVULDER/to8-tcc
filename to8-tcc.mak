@@ -34,7 +34,7 @@ cross-to8-dbg:
 	strings -n 2 .$*.o | \
 	sed -n '/\* TO8 backend/,/\* --- end of asm ---/p' >> $@
 	@echo "(info)" >>$@
-	@echo "	end	crt0" >>$@
+	@echo "	end	init" >>$@
 	@rm .$*.o
 
 C6809=/cygdrive/c/Users/Utilisateur/Desktop/Thomson/c6809-0.83/Thomson-Projects/c6809/c6809.exe
