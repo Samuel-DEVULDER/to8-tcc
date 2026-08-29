@@ -35,15 +35,15 @@ void esc(int code) {
 
 
 void ink(int col) {
-	esc((col>=8 ? 0x68 : 0x40) + col);
+	esc(col + (col>=8 ? 0x68 : 0x40));
 }
 
 void paper(int col) {
-	esc((col>=8 ? 0x70 : 0x50) + col);
+	esc(col + (col>=8 ? 0x70 : 0x50));
 }
 
 void border(int  col) {
-	esc((col>=8 ? 0x78 : 0x60) + col);
+	esc(col + (col>=8 ? 0x78 : 0x60));
 }
 
 enum  {

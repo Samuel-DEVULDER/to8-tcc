@@ -1,8 +1,28 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.7.0 (better local labels and better to8_peep_hole_ext)
+ * Version: 8.8.0 (call-argument release coalescing)
  *
  * Changelog:
+ * - v8.8.0 new peephole to8_peephole_merge_adj, called once after the
+ *   fixed-point loop (not idempotent, would double-correct push_depth
+ *   on re-entry). Merges chains of positive ADJi (call-arg releases)
+ *   into the last one of the chain, carrying the cumulative amount -
+ *   the last survives, not the first, so SP is never released before
+ *   the corresponding args are actually popped.
+ *
+ *   ARG_SLOT/ARG_SLOT2 operands crossed while a release is pending get
+ *   push_depth bumped by the deferred amount, keeping local/parameter
+ *   addressing correct (covers OPJSR-via-slot too, no special case
+ *   needed). ARG_JMP or a jump target resets/finalizes the pending
+ *   candidate immediately, since a taken branch could skip the
+ *   instruction meant to perform the deferred release.
+ *
+ *   Negative ADJi (prologue frame allocation) is left untouched: it's
+ *   already accounted for separately via gframesize, and folding it
+ *   into defer would corrupt any access happening before the first
+ *   call. Comment is regenerated on the surviving ADJi to avoid a
+ *   stale "sp += N".
+ * 
  * - v8.7.0 two fixes.
  *   1) Labels are now globally unique: to8_render_line prints
  *      "_<funcno>_<id>" (hex, new helper to8_print_local_label)
@@ -782,7 +802,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.7.0"
+#define TO8_GEN_VERSION "8.8.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3168,6 +3188,43 @@ static int to8_peephole_jump_inversion(void)
     return changed;
 }
 
+static int to8_peephole_merge_adj(void) {
+    int changed = 0, defer = 0;
+    to8_line *candidate = NULL;
+    to8_line *cur;
+
+    for (cur = g_head; cur; cur = cur->next) {
+        if (cur->is_target || cur->kind == ARG_JMP) {
+	    if (candidate) {
+	        candidate->imm_val = defer;
+	        imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJi, defer);
+	    }
+            candidate = NULL;
+            defer = 0;
+            continue;
+        }
+
+        if (cur->kind == ARG_SLOT || cur->kind == ARG_SLOT2)
+            cur->push_depth += defer;
+
+        if (cur->op == OP_ADJi && cur->imm_val > 0) {
+            if (candidate) {
+                to8_unlink(candidate);
+                changed = 1;
+            }
+            defer += cur->imm_val;
+            candidate = cur;
+        }
+    }
+    
+    if (candidate) {
+        candidate->imm_val = defer;
+        imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJi, defer);
+    }            
+
+    return changed;
+}
+
 static int to8_same_float_load(const to8_line *a, const to8_line *b)
 {
     if (!a || !b || a->op != b->op || a->kind != b->kind)
@@ -3482,6 +3539,8 @@ static void to8_peephole_run(void)
 	changed |= to8_peephole_op2();      /* NEW v7.26.0 */
 	changed |= to8_peephole_jump_inversion();
     } while (changed && ++guard < 256);
+    // only once
+    changed |= to8_peephole_merge_adj();
 }
 
 /* ===================================================================
