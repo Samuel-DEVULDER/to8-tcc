@@ -3558,7 +3558,7 @@ static int to8_final_slot(int raw_slot, int push_depth)
 
 static void to8_print_local_label(int id) {
     char text[256];
-    snprintf(text, sizeof text, "_%X_%X", to8_func_no, id);
+    snprintf(text, sizeof text, "_%d_%x", to8_func_no, id);
     out_str(text);
 }
 
