@@ -722,7 +722,7 @@ opLDCLK pshs    cc
         orcc    #$50
         ldd     <CLK
         ldx     <CLK+2
-        puls    cx
+        puls    cc
         std     <R0
         stx     <R0+2
         pulu    pc
