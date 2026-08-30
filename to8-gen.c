@@ -495,7 +495,7 @@
  *   no-op by construction. Implemented via to8_invert_jcc(), a
  *   straight table of the six JEQ/JNE/JLT/JGT/JLE/JGE complements
  *   (no signedness ambiguity - the SAME opcode already encodes
- *   signed vs unsigned via the OP_CMP/OP_CMPU choice that produced
+ *   signed vs unsigned via the OP_CMP/OP_UCMP choice that produced
  *   the flag-less R0 sign check upstream, so inversion is always
  *   exact, never approximate). Only fires when the JCC's target is
  *   EXACTLY the instruction right after the JMP (the "label1"
@@ -560,7 +560,7 @@
  *   of (a*b) + (c*d). Fixed by requiring callers to pass the EXACT left
  *   operand slot, and asserting 4-alignment before use.
  *   Affects gen_opi() for all commutative ops (ADD, MUL, AND, OR, XOR)
- *   and CMP/CMPU. Thanks to extensive testing with mul_complex2 test case.
+ *   and CMP/UCMP. Thanks to extensive testing with mul_complex2 test case.
  *
  * - v7.27.0: new peephole to8_peephole_useless_ld() replaces the old
  *   to8_peephole_dead_ld(). Removes redundant LD slot when R0 already
@@ -708,7 +708,7 @@
  *   F0 = float/double accumulator (also REG_FRET) - width is tracked
  *        by the CALLER (gen_opf, load, store), never by F0 itself.
  *   NO status/flags register of any kind, for EITHER integers or
- *   floats. OP_CMP/OP_CMPU/OP_CMPi/OP_CMPUi and OP_CMPF/OP_CMPG ALL
+ *   floats. OP_CMP/OP_UCMP/OP_CMPi/OP_UCMPi and OP_CMPF/OP_CMPG ALL
  *   write a SIGNED integer directly into R0. Every S../J.. opcode
  *   that follows just reads the sign of whatever is currently in R0.
  *
@@ -721,7 +721,7 @@
  *   the family's register-operand form (PUSHr, JSRr, LD1r/LDU1r/
  *   LD2r/LDU2r/LD4r).
  * - plain vs "U"-suffixed pair (integer family only) = signed vs
- *   unsigned. Applies to compares (CMP vs CMPU, CMPi vs CMPUi) and
+ *   unsigned. Applies to compares (CMP vs UCMP, CMPi vs UCMPi) and
  *   to sub-word loads (LD1 vs LDU1, LD2 vs LDU2, LD1r vs LDU1r,
  *   LD2r vs LDU2r): the "U" form zero-extends into R0, the plain
  *   form sign-extends.
@@ -831,8 +831,8 @@ ST_DATA const int reg_classes[NB_REGS] = {
  * "slot" always means a stack-frame memory location (a local
  * variable or parameter). "R0"/"F0" are the two accumulators.
  *
- * There is NO flags register, for integers or floats. OP_CMP/OP_CMPU/
- * OP_CMPi/OP_CMPUi and OP_CMPF/OP_CMPG ALL write a SIGNED integer
+ * There is NO flags register, for integers or floats. OP_CMP/OP_UCMP/
+ * OP_CMPi/OP_UCMPi and OP_CMPF/OP_CMPG ALL write a SIGNED integer
  * directly into R0. Every S../J.. opcode that follows just reads the
  * sign of whatever is currently in R0.
  * =================================================================== */
@@ -872,7 +872,7 @@ typedef enum {
     OP_SHR,   /* R0 >>= slot (logical/unsigned) */
     OP_SAR,   /* R0 >>= slot (arithmetic/signed) */
     OP_CMP,   /* R0 = sign(R0 - slot), SIGNED subtraction. */
-    OP_CMPU,  /* R0 = sign(R0 -u slot), UNSIGNED subtraction. */
+    OP_UCMP,  /* R0 = sign(R0 -u slot), UNSIGNED subtraction. */
 
     OP_ADDi,  /* R0 += immediate */
     OP_SUBi,  /* R0 -= immediate */
@@ -886,7 +886,16 @@ typedef enum {
     OP_SHRi,  /* R0 >>= immediate (logical/unsigned) */
     OP_SARi,  /* R0 >>= immediate (arithmetic/signed) */
     OP_CMPi,  /* R0 = sign(R0 - immediate), SIGNED */
-    OP_CMPUi, /* R0 = sign(R0 -u immediate), UNSIGNED */
+    OP_UCMPi, /* R0 = sign(R0 -u immediate), UNSIGNED */
+
+    OP_ADD2,   /* R0 = slotA + slotB   (fusion de "LD slotA ; ADD slotB") */
+    OP_SUB2,   /* R0 = slotA - slotB */
+    OP_MUL2,   /* R0 = slotA * slotB */
+    OP_AND2,   /* R0 = slotA & slotB */
+    OP_OR2,    /* R0 = slotA | slotB */
+    OP_XOR2,   /* R0 = slotA ^ slotB */
+    OP_CMP2,   /* R0 = sign(slotA - slotB), SIGNED */
+    OP_UCMP2,  /* R0 = sign(slotA -u slotB), UNSIGNED */
 
     OP_SEQ,   /* R0 = (R0 == 0) ? 1 : 0 */
     OP_SNE,   /* R0 = (R0 != 0) ? 1 : 0 */
@@ -974,7 +983,7 @@ typedef enum {
     OP_STF4m, /* *(float*)slot-or-symbol = F */
     OP_STF8m, /* *(double*)slot-or-symbol = F (widened) */
     
-    /* opertions */
+    /* operations */
     OP_FADD,     /* F = G + F */
     OP_FSUB,     /* F = G - F */
     OP_FMUL,     /* F = G * F */
@@ -996,23 +1005,13 @@ typedef enum {
     OP_JSRr,  /* call the function pointer held in R0 */
 
     /* jump */
-    OP_JMP,   /* unconditional: goto target */
+    OP_JRA,   /* unconditional: goto target */
     OP_JEQ,   /* if (R0 == 0) goto target */
     OP_JNE,   /* if (R0 != 0) goto target */
     OP_JLT,   /* if (R0 < 0) goto target */
     OP_JGT,   /* if (R0 > 0) goto target */
     OP_JLE,   /* if (R0 <= 0) goto target */
     OP_JGE,   /* if (R0 >= 0) goto target */
-    
-    /* OP2 */
-    OP_ADD2,   /* R0 = slotA + slotB   (fusion de "LD slotA ; ADD slotB") */
-    OP_SUB2,   /* R0 = slotA - slotB */
-    OP_MUL2,   /* R0 = slotA * slotB */
-    OP_AND2,   /* R0 = slotA & slotB */
-    OP_OR2,    /* R0 = slotA | slotB */
-    OP_XOR2,   /* R0 = slotA ^ slotB */
-    OP_CMP2,   /* R0 = sign(slotA - slotB), SIGNED */
-    OP_CMPU2,  /* R0 = sign(slotA -u slotB), UNSIGNED */
 } to8_opcode;
 
 static const char *to8_opcode_name(to8_opcode op)
@@ -1035,13 +1034,13 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_OR: return "OR"; case OP_XOR: return "XOR"; case OP_MUL: return "MUL";
     case OP_DIV: return "DIV"; case OP_MOD: return "MOD";
     case OP_SHL: return "SHL"; case OP_SHR: return "SHR"; case OP_SAR: return "SAR";
-    case OP_CMP: return "CMP"; case OP_CMPU: return "CMPU";
+    case OP_CMP: return "CMP"; case OP_UCMP: return "UCMP";
     
     case OP_ADDi: return "ADDi"; case OP_SUBi: return "SUBi"; case OP_ANDi: return "ANDi";
     case OP_ORi: return "ORi"; case OP_XORi: return "XORi"; case OP_MULi: return "MULi";
     case OP_DIVi: return "DIVi"; case OP_MODi: return "MODi";
     case OP_SHLi: return "SHLi"; case OP_SHRi: return "SHRi"; case OP_SARi: return "SARi";
-    case OP_CMPi: return "CMPi"; case OP_CMPUi: return "CMPUi";
+    case OP_CMPi: return "CMPi"; case OP_UCMPi: return "UCMPi";
     
     case OP_SEQ: return "SEQ"; case OP_SNE: return "SNE"; case OP_SLT: return "SLT"; case OP_SGT: return "SGT";
     case OP_SLE: return "SLE"; case OP_SGE: return "SGE";
@@ -1067,7 +1066,7 @@ static const char *to8_opcode_name(to8_opcode op)
 
     case OP_PUSH: return "PUSH"; case OP_PUSHi: return "PUSHi"; case OP_PUSHr: return "PUSHr";
     case OP_JSR: return "CALL"; case OP_JSRi: return "CALLi"; case OP_JSRr: return "CALLr";
-    case OP_JMP: return "JRA"; case OP_JEQ: return "JEQ"; case OP_JNE: return "JNE";
+    case OP_JRA: return "JRA"; case OP_JEQ: return "JEQ"; case OP_JNE: return "JNE";
     case OP_JLT: return "JLT"; case OP_JGT: return "JGT"; case OP_JLE: return "JLE"; case OP_JGE: return "JGE";
     
     case OP_MOV:   return "MOV";
@@ -1078,7 +1077,7 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_OR2:   return "OR2";
     case OP_XOR2:  return "XOR2";
     case OP_CMP2:  return "CMP2";
-    case OP_CMPU2: return "CMPU2";
+    case OP_UCMP2: return "UCMP2";
     }
     return "?";
 }
@@ -1669,7 +1668,7 @@ static void slot_comment(char *out, size_t outsz, to8_opcode op, const char *des
     case OP_SHR: snprintf(out, outsz, "R0 >>= %s", desc); return;
     case OP_SAR: snprintf(out, outsz, "R0 >>= %s (arith)", desc); return;
     case OP_CMP: snprintf(out, outsz, "R0 = sign(R0 - %s)", desc); return;
-    case OP_CMPU: snprintf(out, outsz, "R0 = sign(R0 -u %s)", desc); return;
+    case OP_UCMP: snprintf(out, outsz, "R0 = sign(R0 -u %s)", desc); return;
     case OP_LDF4: case OP_LDF8: snprintf(out, outsz, "F = %s", desc); return;
     case OP_LDG4: case OP_LDG8: snprintf(out, outsz, "G = %s", desc); return;
     case OP_LDF4m: case OP_LDF8m: snprintf(out, outsz, "F = *%s", desc); return;
@@ -1704,7 +1703,7 @@ static void imm_comment(char *out, size_t outsz, to8_opcode op, int v)
     case OP_SHRi: snprintf(out, outsz, "R0 >>= %s", num); return;
     case OP_SARi: snprintf(out, outsz, "R0 >>= %s (arith)", num); return;
     case OP_CMPi: snprintf(out, outsz, "R0 = sign(R0 - %s)", num); return;
-    case OP_CMPUi: snprintf(out, outsz, "R0 = sign(R0 -u %s)", num); return;
+    case OP_UCMPi: snprintf(out, outsz, "R0 = sign(R0 -u %s)", num); return;
     case OP_ADJi: snprintf(out, outsz, v < 0 ? "sp -= %s" : "sp += %s", v < 0 ? num + 1 : num); return;
     case OP_PUSHi: snprintf(out, outsz, "push %s", num); return;
     case OP_FSCALEi: snprintf(out, outsz, "F *= 2^%s", num); return;
@@ -1763,7 +1762,7 @@ static const char *bare_comment(to8_opcode op)
 static const char *to8_jump_prefix(to8_opcode op)
 {
     switch (op) {
-    case OP_JMP: return "goto";
+    case OP_JRA: return "goto";
     case OP_JEQ: return "if (==) goto";
     case OP_JNE: return "if (!=) goto";
     case OP_JLT: return "if (<) goto";
@@ -1785,7 +1784,7 @@ static void op2_comment(char *out, size_t outsz, to8_opcode op2,
     case OP_OR2:   snprintf(out, outsz, "R0 = %s | %s", desc_a, desc_b); return;
     case OP_XOR2:  snprintf(out, outsz, "R0 = %s ^ %s", desc_a, desc_b); return;
     case OP_CMP2:  snprintf(out, outsz, "R0 = sign(%s - %s)", desc_a, desc_b); return;
-    case OP_CMPU2: snprintf(out, outsz, "R0 = sign(%s -u %s)", desc_a, desc_b); return;
+    case OP_UCMP2: snprintf(out, outsz, "R0 = sign(%s -u %s)", desc_a, desc_b); return;
     default:       snprintf(out, outsz, "%s , %s", desc_a, desc_b); return;
     }
 }
@@ -1971,7 +1970,7 @@ static to8_opcode to8_op2_variant(to8_opcode op1)
     case OP_OR:   return OP_OR2;
     case OP_XOR:  return OP_XOR2;
     case OP_CMP:  return OP_CMP2;
-    case OP_CMPU: return OP_CMPU2;
+    case OP_UCMP: return OP_UCMP2;
     /* OP_DIV / OP_MOD deliberement exclus : la division a une
      * semantique plus lourde (piege sur division par zero, quotient
      * ET reste couples sur la future implementation 6809 reelle) -
@@ -2412,7 +2411,7 @@ void gen_opi(int op)
             vpop();
             gv(RC_R0);
             if (!(c0 == 0 && tst_ok)) {
-                e_op_imm(is_unsigned_cmp ? OP_CMPUi : OP_CMPi, c0);
+                e_op_imm(is_unsigned_cmp ? OP_UCMPi : OP_CMPi, c0);
             }
             vset_VT_CMP(op);
             return;
@@ -2431,7 +2430,7 @@ void gen_opi(int op)
         {
             int left_slot = c1;
             int temp = to8_spill_and_reload(left_slot);
-	    e_op_slot(is_unsigned_cmp ? OP_CMPU : OP_CMP, temp);
+	    e_op_slot(is_unsigned_cmp ? OP_UCMP : OP_CMP, temp);
             to8_temp_free(temp, 4, 4);
         }
 
@@ -2579,7 +2578,9 @@ void gen_opf(int op)
         /* Right operand is a power-of-two constant - drop it, scale
          * the left operand directly. Covers "x * 2.0". */
         bt = vtop->type.t & VT_BTYPE;
-        if (to8_float_const_value(vtop, bt, &cval) && to8_pow2_exponent(cval, &n)) {
+        if (to8_float_const_value(vtop, bt, &cval) 
+		&& to8_pow2_exponent(cval, &n) 
+		&& -128<=n && n<=127) {
             vpop();
             gv(RC_FLOAT);
             if (n != 0) /* n==0 means "* 1" - nothing to emit at all */
@@ -2593,7 +2594,9 @@ void gen_opf(int op)
          * shape, "2 * x". Swap first so the SAME logic above applies
          * uniformly, then fall through the swapped positions. */
         bt = vtop[-1].type.t & VT_BTYPE;
-        if (to8_float_const_value(&vtop[-1], bt, &cval) && to8_pow2_exponent(cval, &n)) {
+        if (to8_float_const_value(&vtop[-1], bt, &cval) 
+		&& to8_pow2_exponent(cval, &n)
+		&& -128<=n && n<=127) {
             vswap();
             vpop();
             gv(RC_FLOAT);
@@ -3161,7 +3164,7 @@ static int to8_peephole_jump_inversion(void)
         
         /* Look for JCC followed by JMP */
         if (cur->op >= OP_JEQ && cur->op <= OP_JGE &&  /* JCC family */
-            nxt && nxt->op == OP_JMP) {
+            nxt && nxt->op == OP_JRA) {
             
             to8_line *target = to8_by_id(cur->jmp_target_id);
             to8_line *jmp_target = to8_by_id(nxt->jmp_target_id);
@@ -3562,6 +3565,15 @@ static void to8_print_local_label(int id) {
     out_str(text);
 }
 
+static void out_slot(int slot) {
+	
+    if(slot<-128 || slot>127)  {
+	tcc_error("Function %s has too many slots (ofset=%d)", to8_func_name, slot);
+    }
+	
+    out_int(slot);
+}    
+
 static void to8_render_line(to8_line *ln)
 {
     if (tcc_state && tcc_state->do_debug && ln->src_line
@@ -3600,17 +3612,19 @@ static void to8_render_line(to8_line *ln)
         break;
     case ARG_SLOT:
         out_tab();
-        out_int(to8_final_slot(ln->slot_a, ln->push_depth));
+        out_slot(to8_final_slot(ln->slot_a, ln->push_depth));
         break;
     case ARG_SLOT2:
         out_tab();
-        out_int(to8_final_slot(ln->slot_a, ln->push_depth));
+        out_slot(to8_final_slot(ln->slot_a, ln->push_depth));
         out_char(',');
-        out_int(to8_final_slot(ln->slot_b, ln->push_depth));
+        out_slot(to8_final_slot(ln->slot_b, ln->push_depth));
         break;
     case ARG_IMM:
         out_tab();
-	if(ln->op==OP_ADJi || ln->op==OP_FSCALEi) {
+	if(ln->op==OP_ADJi) {
+	   out_slot(ln->imm_val);
+	} else if(ln->op==OP_FSCALEi) {
 	    out_int(ln->imm_val);
 	} else {
             out_int16(ln->imm_val>>16);
@@ -3799,7 +3813,7 @@ static int to8_emit_jmp(to8_opcode op)
 
 ST_FUNC int gjmp(int t)
 {
-    int off = to8_emit_jmp(OP_JMP);
+    int off = to8_emit_jmp(OP_JRA);
     return gjmp_append(off, t);
 }
 
@@ -3807,7 +3821,7 @@ ST_FUNC void gjmp_addr(int a)
 {
     to8_line *ln;
     int target = a - to8_func_start_ind;
-    ln = to8_append(OP_JMP);
+    ln = to8_append(OP_JRA);
     ln->kind = ARG_JMP;
     ln->jump_prefix = "goto";
     ln->jmp_target_id = target;
