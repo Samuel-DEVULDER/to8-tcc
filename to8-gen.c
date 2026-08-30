@@ -1,8 +1,72 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.9.0 (DIV2/MOD2 fusion enabled)
+ * Version: 8.11.0 (unsigned division/modulo wired to existing runtime helpers)
  *
  * Changelog:
+ * - v8.11.0 fixed TOK_UDIV/TOK_UMOD being routed to the same OP_DIV/OP_MOD
+ *   as signed division in to8_get_arith_ops - confirmed by direct compiler
+ *   output showing udiv_simple/umod_simple emitting DIV2/MOD2, identical
+ *   to their signed counterparts, meaning any unsigned operand above
+ *   INT_MAX was divided/modulo'd as if negative.
+ *
+ *   The runtime side (opUDIV/opUDIV2/opUDIVi and opUMOD/opUMOD2/opUMODi
+ *   in the 6809 asm library) was already present and correct - both share
+ *   opUDIVy the same way opDIV/opMOD do, opUDIV applies an unconditional
+ *   bit-fixup on the raw quotient (an artifact of the shift-subtract
+ *   algorithm, not a sign correction), opUMOD just copies the remainder
+ *   from R1. These routines sat unused: the gap was entirely on the
+ *   compiler side, with no OP_UDIV/OP_UMOD (nor _i/_2 variants) in the
+ *   opcode enum, so to8_get_arith_ops had nowhere to route TOK_UDIV/
+ *   TOK_UMOD except back to the signed opcodes.
+ *
+ *   Added OP_UDIV/OP_UMOD/OP_UDIVi/OP_UMODi/OP_UDIV2/OP_UMOD2 to the enum,
+ *   routed TOK_UDIV/TOK_UMOD to them in to8_get_arith_ops, added them to
+ *   to8_op2_variant (LD+op -> OP2 fusion, same rationale as v8.9.0's
+ *   DIV/MOD fix) so the v8.10.0 two-slot fast path also benefits unsigned
+ *   ops, and added their mnemonics/comments to to8_opcode_name/op2_comment.
+ *
+ *   udiv_simple(a,b){return a/b;} now compiles to UDIV2 4,8; RET (2
+ *   instructions, correct for all unsigned values) instead of the
+ *   incorrect DIV2 4,8; RET.
+ *
+ * - v8.10.0 new fast path in gen_opi for the case where BOTH operands are
+ *   plain, unmodified local slots (VT_LOCAL/VT_LLOCAL, no symbol). Checked
+ *   right after v1/c1 capture, before any gv() call - gv(RC_INT) on the
+ *   right operand would otherwise force it into R0 and erase the fact
+ *   that it already lived at a stable, directly-addressable slot.
+ *
+ * - v8.10.0 new fast path in gen_opi for the case where BOTH operands are
+ *   plain, unmodified local slots (VT_LOCAL/VT_LLOCAL, no symbol). Checked
+ *   right after v1/c1 capture, before any gv() call - gv(RC_INT) on the
+ *   right operand would otherwise force it into R0 and erase the fact
+ *   that it already lived at a stable, directly-addressable slot.
+ *
+ *   Before this fix, a non-commutative op with two simple slot operands
+ *   (e.g. "a / b", "a % b", "a - b") unconditionally went through
+ *   to8_spill_and_reload: right operand forced into R0 by the generic
+ *   gv(RC_INT) call, then spilled to a fresh temp slot so the left
+ *   operand could be reloaded into R0 for the (order-sensitive) op.
+ *   div_simple(a,b){return a/b;} compiled to 5 instructions: ADJ -4;
+ *   MOV temp,b; DIV2 a,temp (fused by to8_peephole_op2, see v8.9.0);
+ *   ADJ 4; RET. Commutative ops never paid this cost, since reordering
+ *   is free for them - mul_simple(a,b){return a*b;} was already 2
+ *   instructions (MUL2 b,a; RET).
+ *
+ *   The new fast path emits LD left ; <op> right directly for BOTH
+ *   commutative and non-commutative ops uniformly - neither operand is
+ *   ever routed through R0 in a way that would need a later role swap,
+ *   so there's nothing commutativity-specific left to handle here. The
+ *   existing to8_peephole_op2 still performs the final LD+OP -> OP2
+ *   fusion exactly as before, unchanged. div_simple now compiles to 2
+ *   instructions (DIV2 a,b; RET), matching mul_simple.
+ *
+ *   Symmetric to the v7.39.0 fix (kept, unmodified, right below this
+ *   block), which handles the case of a constant right operand for
+ *   non-commutative ops without spilling it to a temp first. The two
+ *   fast paths are mutually exclusive by construction (one requires the
+ *   right operand to be a slot, the other requires it to be a constant)
+ *   so their relative order doesn't affect correctness.
+ *
  * - v8.9.0 enabled OP_DIV2/OP_MOD2 in to8_op2_variant, closing a gap found
  *   while auditing which enum opcodes were actually reachable from genopi.
  *   Both were already declared in the ISA (OP_DIV2, R0 = slotA / slotB;
@@ -936,6 +1000,8 @@ typedef enum {
     OP_MUL,   /* R0 *= slot */
     OP_DIV,   /* R0 /= slot */
     OP_MOD,   /* R0 %= slot */
+    OP_UDIV,  /* R0 = (unsigned)R0 / slot */
+    OP_UMOD,  /* R0 = (unsigned)R0 % slot */
     OP_SHL,   /* R0 <<= slot */
     OP_SHR,   /* R0 >>= slot (logical/unsigned) */
     OP_SAR,   /* R0 >>= slot (arithmetic/signed) */
@@ -950,6 +1016,9 @@ typedef enum {
     OP_MULi,  /* R0 *= immediate */
     OP_DIVi,  /* R0 /= immediate */
     OP_MODi,  /* R0 %= immediate */
+    OP_UDIVi, /* R0 = (unsigned)R0 / imm */
+    OP_UMODi, /* R0 = (unsigned)R0 % imm */
+
     OP_SHLi,  /* R0 <<= immediate */
     OP_SHRi,  /* R0 >>= immediate (logical/unsigned) */
     OP_SARi,  /* R0 >>= immediate (arithmetic/signed) */
@@ -961,6 +1030,8 @@ typedef enum {
     OP_MUL2,   /* R0 = slotA * slotB */
     OP_DIV2,   /* R0 = slotA / slotB */
     OP_MOD2,   /* R0 = slotA % slotB */
+    OP_UDIV2,  /* R0 = (unsigned)slotA / slotB */
+    OP_UMOD2,  /* R0 = (unsigned)slotA % slotB */
     OP_AND2,   /* R0 = slotA & slotB */
     OP_OR2,    /* R0 = slotA | slotB */
     OP_XOR2,   /* R0 = slotA ^ slotB */
@@ -1072,6 +1143,7 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_ADD: return "ADD"; case OP_SUB: return "SUB"; case OP_AND: return "AND";
     case OP_OR: return "OR"; case OP_XOR: return "XOR"; case OP_MUL: return "MULT";
     case OP_DIV: return "DIV"; case OP_MOD: return "MOD";
+    case OP_UDIV: return "UDIV"; case OP_UMOD: return "UMOD";
     case OP_SHL: return "SHL"; case OP_SHR: return "SHR"; case OP_SAR: return "SAR";
     case OP_CMP: return "CMP"; case OP_UCMP: return "UCMP";
     
@@ -1118,6 +1190,8 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_UCMP2: return "UCMP2";
     case OP_DIV2: return "DIV2"; 
     case OP_MOD2: return "MOD2";
+    case OP_UDIV2: return "UDIV2"; 
+    case OP_UMOD2: return "UMOD2";
     }
     return "?";
 }
@@ -1821,6 +1895,8 @@ static void op2_comment(char *out, size_t outsz, to8_opcode op2,
     case OP_MUL2:  snprintf(out, outsz, "R0 = %s * %s", desc_a, desc_b); return;
     case OP_DIV2:  snprintf(out, outsz, "R0 = %s / %s", desc_a, desc_b); return;
     case OP_MOD2:  snprintf(out, outsz, "R0 = %s %% %s", desc_a, desc_b); return;
+    case OP_UDIV2: snprintf(out, outsz, "R0 = %s / %s (unsigned)", desc_a, desc_b); break;
+    case OP_UMOD2: snprintf(out, outsz, "R0 = %s %% %s (unsigned)", desc_a, desc_b); break;
     case OP_AND2:  snprintf(out, outsz, "R0 = %s & %s", desc_a, desc_b); return;
     case OP_OR2:   snprintf(out, outsz, "R0 = %s | %s", desc_a, desc_b); return;
     case OP_XOR2:  snprintf(out, outsz, "R0 = %s ^ %s", desc_a, desc_b); return;
@@ -1995,8 +2071,8 @@ static int to8_get_arith_ops(int op, to8_opcode *slot_op, to8_opcode *imm_op)
     case TOK_SHL: *slot_op = OP_SHL; *imm_op = OP_SHLi; return 0;
     case TOK_SHR: *slot_op = OP_SHR; *imm_op = OP_SHRi; return 0;
     case TOK_SAR: *slot_op = OP_SAR; *imm_op = OP_SARi; return 0;
-    case TOK_UDIV: *slot_op = OP_DIV; *imm_op = OP_DIVi; return 0;
-    case TOK_UMOD: *slot_op = OP_MOD; *imm_op = OP_MODi; return 0;
+    case TOK_UDIV: *slot_op = OP_UDIV; *imm_op = OP_UDIVi; return 0;
+    case TOK_UMOD: *slot_op = OP_UMOD; *imm_op = OP_UMODi; return 0;
     default: return -1;
     }
 }
@@ -2009,6 +2085,8 @@ static to8_opcode to8_op2_variant(to8_opcode op1)
     case OP_MUL:  return OP_MUL2;
     case OP_DIV:  return OP_DIV2;
     case OP_MOD:  return OP_MOD2;
+    case OP_UDIV: return OP_UDIV2;
+    case OP_UMOD: return OP_UMOD2;
     case OP_AND:  return OP_AND2;
     case OP_OR:   return OP_OR2;
     case OP_XOR:  return OP_XOR2;
@@ -2488,6 +2566,45 @@ void gen_opi(int op)
 
     v1 = vtop[-1].r & VT_VALMASK;
     c1 = vtop[-1].c.i;
+    
+    /*
+     * v8.10.0: fast path when BOTH operands are already plain, unmodified
+     * local slots (VT_LOCAL/VT_LLOCAL, no symbol) - the extremely common
+     * case of e.g. "a / b", "a % b", "a - b" where a and b are simple
+     * variables. Checked HERE, before any gv() call, because gv() would
+     * force the right operand into R0 and destroy the information that
+     * it already lives in a stable slot we can reference directly.
+     *
+     * Applies uniformly to commutative AND non-commutative ops: neither
+     * operand is ever routed through R0 in a way that would need a
+     * later role swap, so there is nothing non-commutativity-specific
+     * to worry about here. Skips the whole gv(RC_INT)+spill-to-temp
+     * dance entirely: LD left ; <op> right, which the existing OP2
+     * peephole still fuses into a single ADD2/SUB2/MUL2/DIV2/MOD2.
+     *
+     * Before this fix, div_simple(a,b){return a/b;} compiled to 5
+     * instructions (ADJ -4; MOV temp,b; DIV2 a,temp; ADJ 4; RET) because
+     * the right operand (b) was unconditionally forced into R0 first,
+     * then had to be spilled out of the way so the left operand (a)
+     * could be reloaded into R0 for the non-commutative DIV. Now it
+     * compiles to 2 (DIV2 a,b; RET), matching mul_simple.
+     */
+    {
+        int rv = vtop->r & VT_VALMASK;
+        if ((rv == VT_LOCAL || rv == VT_LLOCAL) && !(vtop->r & VT_SYM)
+            && (v1 == VT_LOCAL || v1 == VT_LLOCAL) && !(vtop[-1].r & VT_SYM)) {
+            to8_opcode slot_op, imm_op;
+            if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) { vtop--; return; }
+            int rslot = vtop->c.i;
+            int lslot = c1;
+            e_op_slot(OP_LD, lslot);
+            e_op_slot(slot_op, rslot);
+            vtop--;
+            vtop->r = TREG_R0;
+            vtop->r2 = VT_CONST;
+            return;
+        }
+    }
     
     /*
      * v7.39.0: capture whether the RIGHT operand (top of stack) is a

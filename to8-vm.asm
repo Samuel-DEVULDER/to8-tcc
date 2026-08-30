@@ -592,6 +592,52 @@ opMODd	ldb	,s+	; get initial sign of R0
 	jsr	<opNEG  ; make (R0%y)of the samesign as R0
 opMODe	pulu	pc	  
 
+opUDIV2	pulu	d
+	leax	a,s
+	leay	b,s
+	ldd	,x
+	std	<R0
+	ldd	2,x
+	std	<R0+2
+	bra	opUDIVa
+opUDIVi	leay	,u
+	leau	4,u
+	bra	opUDIVa
+opUDIV	pulu	d
+	leay	b,s
+opUDIVa	jsr	<opUDIVy
+	rol	<R0+3
+	rol	<R0+2
+	ldd	<R0
+	rolb
+	rola
+	comb
+	coma
+	std	<R0
+	com	<R0+2
+	com	<R0+3
+	pulu	pc	  
+
+opUMOD2	pulu	d
+	leay	b,s
+	leax	a,s
+	ldd	,x
+	std	<R0
+	ldd	2,x
+	std	<R0+2
+	bra	opUMODa
+opUMODi	leay	,u
+	leau	4,u
+	bra	opMODa
+opUMOD	pulu	d
+	leay	b,s
+opUMODa	jsr	<opUDIVy
+	ldd	<R1     ; move remainder to R0
+	std	<R0
+	ldd	<R1+2
+	std	<R0+2
+	pulu	pc	  
+
 (info)
        
 crt0	pshs	d,x,y,u,dp,cc
