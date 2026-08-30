@@ -717,7 +717,16 @@ interCLK
         inc     <CLK
 interCLK0
         jmp     KBIN
-        
+
+opLDCLK pshs    cc
+        orcc    #$50
+        ldd     <CLK
+        ldx     <CLK+2
+        puls    cx
+        std     <R0
+        stx     <R0+2
+        pulu    pc
+
 (info)
         
 *************************************************************************
@@ -730,6 +739,9 @@ LDi     macro
         endm
 LEA     macro
         fdb     opLEA,\0
+        endm
+MOV     macro
+        fdb     opMOV,\0*256+\1
         endm
 LD      macro
         fdb     opLD,\0
@@ -944,14 +956,14 @@ EXT2U   macro
         endm           
         
 * misc
-MOV     macro
-        fdb     opMOV,\0*256+\1
-        endm
 VM_OFF  macro
         fdb     *+2
         endm
 VM_ON   macro
         jsr     <go_vm
         endm  
+LDCLK   macro
+        fdb     opLDCLK
+        endm
 
 (info)
