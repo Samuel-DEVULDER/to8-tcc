@@ -1,26 +1,60 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.8.0 (call-argument release coalescing)
+ * Version: 8.9.0 (DIV2/MOD2 fusion enabled)
  *
  * Changelog:
+ * - v8.9.0 enabled OP_DIV2/OP_MOD2 in to8_op2_variant, closing a gap found
+ *   while auditing which enum opcodes were actually reachable from genopi.
+ *   Both were already declared in the ISA (OP_DIV2, R0 = slotA / slotB;
+ *   OP_MOD2, R0 = slotA % slotB) and documented in the enum comment, but
+ *   to8_op2_variant explicitly excluded OP_DIV/OP_MOD from the LD+OP ->
+ *   OP2 fusion that to8_peephole_op2 performs for every other commutative
+ *   and comparison opcode - the original comment worried about "division
+ *   by zero trap, quotient AND remainder coupled on the future real 6809
+ *   implementation". That concern is real for the eventual native 6809
+ *   codegen, but irrelevant at this pseudo-asm level: fusing LD slotA;
+ *   DIV slotB into DIV2 slotA,slotB changes neither the division-by-zero
+ *   behavior (still undefined in C either way) nor the quotient/remainder
+ *   coupling (opDIV/opMOD in to8-vm.asm already compute both independently
+ *   via the shared opUDIVy helper, regardless of fusion). The real 6809
+ *   backend will need to re-examine this fusion on its own terms when it
+ *   exists - noted in a comment left in place.
+ *
+ *   Two related gaps fixed at the same time, found by the same audit:
+ *   1) to8_opcode_name had no case for OP_DIV2/OP_MOD2 - since nothing
+ *      ever produced them, this silently fell through to the "?" default
+ *      and would have printed a broken mnemonic the moment fusion was
+ *      enabled. Added "DIV2"/"MOD2".
+ *   2) op2_comment had the same gap - added "R0 = %s / %s" and
+ *      "R0 = %s %% %s" comment templates, matching the style of every
+ *      other OP2 variant.
+ *
+ *   Confirmed via full audit of every enum opcode against its emission
+ *   site that OP_FSGN is the only remaining intentionally-unreachable
+ *   opcode - explicitly marked "reserved, not yet emitted" in the ISA
+ *   comment, with no peephole or genopf path anywhere near it, unlike
+ *   OP_DIV2/OP_MOD2 which had a real (if disabled) production path.
+ *   Left untouched - it awaits a future genopf shortcut for x<0?-x:x-style
+ *   idioms, not a fusion gap.
+ *
  * - v8.8.0 new peephole to8_peephole_merge_adj, called once after the
  *   fixed-point loop (not idempotent, would double-correct push_depth
- *   on re-entry). Merges chains of positive ADJi (call-arg releases)
+ *   on re-entry). Merges chains of positive ADJ (call-arg releases)
  *   into the last one of the chain, carrying the cumulative amount -
  *   the last survives, not the first, so SP is never released before
  *   the corresponding args are actually popped.
  *
  *   ARG_SLOT/ARG_SLOT2 operands crossed while a release is pending get
  *   push_depth bumped by the deferred amount, keeping local/parameter
- *   addressing correct (covers OPJSR-via-slot too, no special case
+ *   addressing correct (covers OPSBR-via-slot too, no special case
  *   needed). ARG_JMP or a jump target resets/finalizes the pending
  *   candidate immediately, since a taken branch could skip the
  *   instruction meant to perform the deferred release.
  *
- *   Negative ADJi (prologue frame allocation) is left untouched: it's
+ *   Negative ADJ (prologue frame allocation) is left untouched: it's
  *   already accounted for separately via gframesize, and folding it
  *   into defer would corrupt any access happening before the first
- *   call. Comment is regenerated on the surviving ADJi to avoid a
+ *   call. Comment is regenerated on the surviving ADJ to avoid a
  *   stale "sp += N".
  * 
  * - v8.7.0 two fixes.
@@ -84,7 +118,7 @@
  *   Reuses the same "does this opcode write F" classification already
  *   established in to8_peephole_useless_fload() (v8.1.x), factored out
  *   as to8_stops_fmov_scan(): LDF* /FADD/FSUB/FMUL/FDIV/FSCALEi/ITOF (all
- *   redefine F) and JSR/JSRi/JSRr (opaque - the callee may use F/G
+ *   redefine F) and SBR/SBRi/SBRr (opaque - the callee may use F/G
  *   arbitrarily) stop the scan. Everything else - STF4/STF8/STF4m/
  *   STF8m (read F, never write it), FCMP/FSGN/FTOI (read F, write only
  *   R0), all integer instructions, and every jump (reads only R0's
@@ -203,7 +237,7 @@
  *
  * G is deliberately kept OUT of TCC's register-class system (no
  * TREG_G, no RC_G bit in reg_classes[]) - TCC's binary-op codegen
- * never materializes the LEFT operand into a register before calling
+ * never materializes the LEFT operand into a register before SBRng
  * gen_opf() (only the RIGHT operand, via gv(RC_FLOAT)), so a TCC-
  * visible G would gain nothing; worse, G's write-only/non-storable
  * nature would violate the symmetry TCC's generic allocator assumes
@@ -539,10 +573,10 @@
  *      37 instr (no -O) / 30 instr (-O).
  *
  *   3) New peephole to8_peephole_dead_r0_load(): removes a dead integer
- *      load (LD/LD1/LDU1/LD2/LDU2/LD4, slot form) when a later R0-
+ *      load (LD/LD1/LD1U/LD2/LD2U/LD4, slot form) when a later R0-
  *      writing load of the same family is reached with no intervening
  *      read of R0 and no jump target crossed. Uses a WHITELIST of
- *      opcodes provably transparent to R0 (MOV, NOP, ADJi, PUSH/PUSHi,
+ *      opcodes provably transparent to R0 (MOV, NOP, ADJ, PUSH/PUSHi,
  *      and the whole F0-only float family) - any opcode NOT in this
  *      list stops the scan, so omitting a transparent one only loses
  *      an optimization, never changes semantics. Catches the residual
@@ -616,8 +650,8 @@
  *   value if reordered this way.
  *
  * - v7.24.0: to8_peephole_ld_deref() no longer requires `!cur->is_target`
- *   before fusing "LD slot" + "LD1r/LDU1r/LD2r/LDU2r/LD4r" into a
- *   single "LD1/LDU1/LD2/LDU2/LD4 slot". A loop-header LD immediately
+ *   before fusing "LD slot" + "LD1r/LD1Ur/LD2r/LD2Ur/LD4r" into a
+ *   single "LD1/LD1U/LD2/LD2U/LD4 slot". A loop-header LD immediately
  *   after a label (the extremely common "while (*p) { ... p++; }"
  *   shape) never got fused before, because the pass required BOTH
  *   `cur` (the LD) and `nxt` (the LDxr) to be non-targets. Fusing
@@ -663,9 +697,9 @@
  *   affect float/double constant bytes - see v7.20.0 above.
  *
  * - v7.18.0: three cleanups on top of 7.17.0:
- *   1) gfunc_epilog()'s frame-release ADJi now goes through
+ *   1) gfunc_epilog()'s frame-release ADJ now goes through
  *      to8_adjust(frame_size) (which already no-ops on n==0) instead
- *      of a hand-rolled to8_append() - no more useless "ADJi 0" for
+ *      of a hand-rolled to8_append() - no more useless "ADJ 0" for
  *      functions with no locals.
  *   2) to8_flush_pending_data() added, dumping rodata/data section
  *      contents as FCB directives (wrapped 8 bytes/line), with a
@@ -696,8 +730,8 @@
  *   sign- or zero-extended the upper 24/16 bits of R0 afterwards.
  *   Fixed by baking extension into the load opcode itself:
  *   - OP_LD1 / OP_LD2 / OP_LD1r / OP_LD2r = load + SIGN-extend.
- *   - OP_LDU1 / OP_LDU2 / OP_LDU1r / OP_LDU2r = load + ZERO-extend.
- *   - VT_BOOL always routes to the unsigned form (LDU1/LDU1r).
+ *   - OP_LD1U / OP_LD2U / OP_LD1Ur / OP_LD2Ur = load + ZERO-extend.
+ *   - VT_BOOL always routes to the unsigned form (LD1U/LD1Ur).
  *
  * - v7.15.0 and earlier: see prior versions (float/double ISA split,
  *   raw inline-asm passthrough, etc.)
@@ -706,7 +740,7 @@
  *   R0 = real integer accumulator (also REG_IRET).
  *   R1 = VIRTUAL integer register, memory-backed shadow slot.
  *   F0 = float/double accumulator (also REG_FRET) - width is tracked
- *        by the CALLER (gen_opf, load, store), never by F0 itself.
+ *        by the SBRER (gen_opf, load, store), never by F0 itself.
  *   NO status/flags register of any kind, for EITHER integers or
  *   floats. OP_CMP/OP_UCMP/OP_CMPi/OP_UCMPi and OP_CMPF/OP_CMPG ALL
  *   write a SIGNED integer directly into R0. Every S../J.. opcode
@@ -715,15 +749,15 @@
  * Naming convention:
  * - "i" suffix = opcode is FULLY resolved with NO extra runtime
  *   memory access: a plain immediate, a symbol's ADDRESS (LDi,
- *   JSRi), or a float/double VALUE baked directly into the
+ *   SBRi), or a float/double VALUE baked directly into the
  *   instruction (LDFi, LDGi).
  * - "r" suffix = opcode takes NO ARGUMENT but reads/writes R0 as
- *   the family's register-operand form (PUSHr, JSRr, LD1r/LDU1r/
- *   LD2r/LDU2r/LD4r).
+ *   the family's register-operand form (PUSHr, SBRr, LD1r/LD1Ur/
+ *   LD2r/LD2Ur/LD4r).
  * - plain vs "U"-suffixed pair (integer family only) = signed vs
  *   unsigned. Applies to compares (CMP vs UCMP, CMPi vs UCMPi) and
- *   to sub-word loads (LD1 vs LDU1, LD2 vs LDU2, LD1r vs LDU1r,
- *   LD2r vs LDU2r): the "U" form zero-extends into R0, the plain
+ *   to sub-word loads (LD1 vs LD1U, LD2 vs LD2U, LD1r vs LD1Ur,
+ *   LD2r vs LD2Ur): the "U" form zero-extends into R0, the plain
  *   form sign-extends.
  * - "F"/"G" suffix (float family only) = operates on a 4-byte
  *   float slot (F) or an 8-byte double slot (G). Applies to the
@@ -735,7 +769,7 @@
  *   pointer or a real mutable symbol - a genuinely different axis
  *   from the F/G own-value suffix.
  * - no suffix (integer family) = opcode takes a SLOT (LD, ST, ADD,
- *   CMP, PUSH, JSR...).
+ *   CMP, PUSH, SBR...).
  *
  * Output format (once per compiled file):
  *   ; TO8 backend <version>
@@ -802,7 +836,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.8.0"
+#define TO8_GEN_VERSION "8.9.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -840,26 +874,60 @@ ST_DATA const int reg_classes[NB_REGS] = {
 typedef enum {
     OP_NOP,   /* no-op */
 
-    OP_LD,    /* R0 = slot (4-byte load) */
-    OP_ST,    /* slot = R0 (4-byte store) */
+    /* load/store */
+    OP_LDi,   /* R0 = immediate, OR R0 = address of a global symbol
+                 (a compile/link-time-known value either way). */
     OP_LEA,   /* R0 = address of slot */
+
+    OP_MOV,   /* dst_slot = src_slot, WITHOUT touching R0 - fusion of LD+ST */
+
+    OP_LD,    /* R0 = slot (4-byte load) */
     OP_LD1,   /* R0 = (int)(signed char)*(char*)slot - byte load, SIGN-extend */
-    OP_LDU1,  /* R0 = (int)(unsigned char)*(char*)slot - byte load, ZERO-extend */
-    OP_LD2,   /* R0 = (int)(signed short)*(short*)slot - halfword load, SIGN-extend */
-    OP_LDU2,  /* R0 = (int)(unsigned short)*(short*)slot - halfword load, ZERO-extend */
-    OP_LD4,   /* R0 = *(int*)slot (word-sized memory load; already full width) */
     OP_LD1r,  /* R0 = (int)(signed char)*(char*)R0 - dereference pointer ALREADY in R0, SIGN-extend */
-    OP_LDU1r, /* R0 = (int)(unsigned char)*(char*)R0 - dereference pointer ALREADY in R0, ZERO-extend */
+    OP_LD1U,  /* R0 = (int)(unsigned char)*(char*)slot - byte load, ZERO-extend */
+    OP_LD1Ur, /* R0 = (int)(unsigned char)*(char*)R0 - dereference pointer ALREADY in R0, ZERO-extend */
+    OP_LD2,   /* R0 = (int)(signed short)*(short*)slot - halfword load, SIGN-extend */
     OP_LD2r,  /* R0 = (int)(signed short)*(short*)R0 - dereference, SIGN-extend */
-    OP_LDU2r, /* R0 = (int)(unsigned short)*(short*)R0 - dereference, ZERO-extend */
+    OP_LD2U,  /* R0 = (int)(unsigned short)*(short*)slot - halfword load, ZERO-extend */
+    OP_LD2Ur, /* R0 = (int)(unsigned short)*(short*)R0 - dereference, ZERO-extend */
+    OP_LD4,   /* R0 = *(int*)slot (word-sized memory load; already full width) */
     OP_LD4r,  /* R0 = *(int*)R0 */
+
+    OP_ST,    /* slot = R0 (4-byte store) */
     OP_ST1,   /* *(char*)slot = R0 (byte-sized memory store via pointer in slot) */
     OP_ST2,   /* *(short*)slot = R0 (halfword-sized memory store) */
     OP_ST4,   /* *(int*)slot = R0 (word-sized memory store) */
 
-    OP_LDi,   /* R0 = immediate, OR R0 = address of a global symbol
-                 (a compile/link-time-known value either way). */
+    /* stack */
+    OP_ADJ,   /* SP += n if n<0 => allocate otherwise release */
+    OP_PUSH,  /* push slot's value onto the call-argument stack */
+    OP_PUSHi, /* push an immediate onto the call-argument stack */
+    OP_PUSHr, /* push R0 onto the call-argument stack */
 
+    /*  subroutine */
+    OP_RET,   /* return from the current function */
+    OP_SBR,   /* call the function pointer held in slot */
+    OP_SBRi,  /* call the function named by symbol */
+    OP_SBRr,  /* call the function pointer held in R0 */
+
+    /* bool */
+    OP_SEQ,   /* R0 = (R0 == 0) ? 1 : 0 */
+    OP_SNE,   /* R0 = (R0 != 0) ? 1 : 0 */
+    OP_SLT,   /* R0 = (R0 < 0) ? 1 : 0 */
+    OP_SGT,   /* R0 = (R0 > 0) ? 1 : 0 */
+    OP_SLE,   /* R0 = (R0 <= 0) ? 1 : 0 */
+    OP_SGE,   /* R0 = (R0 >= 0) ? 1 : 0 */
+
+    /* jump */
+    OP_JRA,   /* unconditional: goto target */
+    OP_JEQ,   /* if (R0 == 0) goto target */
+    OP_JNE,   /* if (R0 != 0) goto target */
+    OP_JLT,   /* if (R0 < 0) goto target */
+    OP_JGT,   /* if (R0 > 0) goto target */
+    OP_JLE,   /* if (R0 <= 0) goto target */
+    OP_JGE,   /* if (R0 >= 0) goto target */
+
+    /* arith */
     OP_ADD,   /* R0 += slot */
     OP_SUB,   /* R0 -= slot */
     OP_AND,   /* R0 &= slot */
@@ -891,26 +959,21 @@ typedef enum {
     OP_ADD2,   /* R0 = slotA + slotB   (fusion de "LD slotA ; ADD slotB") */
     OP_SUB2,   /* R0 = slotA - slotB */
     OP_MUL2,   /* R0 = slotA * slotB */
+    OP_DIV2,   /* R0 = slotA / slotB */
+    OP_MOD2,   /* R0 = slotA % slotB */
     OP_AND2,   /* R0 = slotA & slotB */
     OP_OR2,    /* R0 = slotA | slotB */
     OP_XOR2,   /* R0 = slotA ^ slotB */
     OP_CMP2,   /* R0 = sign(slotA - slotB), SIGNED */
     OP_UCMP2,  /* R0 = sign(slotA -u slotB), UNSIGNED */
 
-    OP_SEQ,   /* R0 = (R0 == 0) ? 1 : 0 */
-    OP_SNE,   /* R0 = (R0 != 0) ? 1 : 0 */
-    OP_SLT,   /* R0 = (R0 < 0) ? 1 : 0 */
-    OP_SGT,   /* R0 = (R0 > 0) ? 1 : 0 */
-    OP_SLE,   /* R0 = (R0 <= 0) ? 1 : 0 */
-    OP_SGE,   /* R0 = (R0 >= 0) ? 1 : 0 */
-    OP_SNZ,   /* R0 = (R0 != 0) ? 1 : 0 (used when no dedicated S.. fits) */
-
-    OP_MOV,   /* dst_slot = src_slot, WITHOUT touching R0 - fusion of LD+ST */
-
-    OP_EXT1S, /* R0 = (int)(signed char)R0 */
-    OP_EXT2S, /* R0 = (int)(signed short)R0 */
+    /* cast */
+    OP_EXT1,  /* R0 = (int)(signed char)R0 */
+    OP_EXT2,  /* R0 = (int)(signed short)R0 */
     OP_EXT1U, /* R0 = (int)(unsigned char)R0 */
     OP_EXT2U, /* R0 = (int)(unsigned short)R0 */
+    OP_FTOI,  /* R0 = (int)F0 */
+    OP_ITOF,  /* F0 = (float/double)R0 */
 
     /* ===============================================================
      * ARCHITECTURE NOTE - floating-point storage format:
@@ -962,9 +1025,6 @@ typedef enum {
      * zero integration cost (no library to link) wins for now.
      * =============================================================== */
 
-    OP_FTOI,  /* R0 = (int)F0 */
-    OP_ITOF,  /* F0 = (float/double)R0 */
-
     OP_FMOV,  /* G = F (register-to-register transfer, no memory access) */
 
     OP_LDFi,  /* F = <float literal>, baked directly into the instruction */
@@ -991,47 +1051,26 @@ typedef enum {
     OP_FSCALEi,  /* F = F * 2^n */
     OP_FCMP,     /* R0 = sign(G - F) (F and G both survive) */
     OP_FSGN,     /* R0 = sign(F) (F survives; reserved, not yet emitted) */
-
-    /* stack */
-    OP_ADJi,  /* SP += n if n<0 => allocate otherwise release */
-    OP_PUSH,  /* push slot's value onto the call-argument stack */
-    OP_PUSHi, /* push an immediate onto the call-argument stack */
-    OP_PUSHr, /* push R0 onto the call-argument stack */
-
-    /*  call */
-    OP_RET,   /* return from the current function */
-    OP_JSR,   /* call the function pointer held in slot */
-    OP_JSRi,  /* call the function named by symbol */
-    OP_JSRr,  /* call the function pointer held in R0 */
-
-    /* jump */
-    OP_JRA,   /* unconditional: goto target */
-    OP_JEQ,   /* if (R0 == 0) goto target */
-    OP_JNE,   /* if (R0 != 0) goto target */
-    OP_JLT,   /* if (R0 < 0) goto target */
-    OP_JGT,   /* if (R0 > 0) goto target */
-    OP_JLE,   /* if (R0 <= 0) goto target */
-    OP_JGE,   /* if (R0 >= 0) goto target */
 } to8_opcode;
 
 static const char *to8_opcode_name(to8_opcode op)
 {
     switch (op) {
     case OP_NOP: return "NOP"; case OP_RET: return "RET";
-    case OP_ADJi: return "ADJi";
+    case OP_ADJ: return "ADJ";
     
     case OP_LD: return "LD"; case OP_ST: return "ST"; case OP_LEA: return "LEA";
-    case OP_LD1: return "LD1"; case OP_LDU1: return "LDU1";
-    case OP_LD2: return "LD2"; case OP_LDU2: return "LDU2";
+    case OP_LD1: return "LD1"; case OP_LD1U: return "LD1U";
+    case OP_LD2: return "LD2"; case OP_LD2U: return "LD2U";
     case OP_LD4: return "LD4";
-    case OP_LD1r: return "LD1r"; case OP_LDU1r: return "LDU1r";
-    case OP_LD2r: return "LD2r"; case OP_LDU2r: return "LDU2r";
+    case OP_LD1r: return "LD1r"; case OP_LD1Ur: return "LD1Ur";
+    case OP_LD2r: return "LD2r"; case OP_LD2Ur: return "LD2Ur";
     case OP_LD4r: return "LD4r";
     case OP_ST1: return "ST1"; case OP_ST2: return "ST2"; case OP_ST4: return "ST4";
     case OP_LDi: return "LDi";
     
     case OP_ADD: return "ADD"; case OP_SUB: return "SUB"; case OP_AND: return "AND";
-    case OP_OR: return "OR"; case OP_XOR: return "XOR"; case OP_MUL: return "MUL";
+    case OP_OR: return "OR"; case OP_XOR: return "XOR"; case OP_MUL: return "MULT";
     case OP_DIV: return "DIV"; case OP_MOD: return "MOD";
     case OP_SHL: return "SHL"; case OP_SHR: return "SHR"; case OP_SAR: return "SAR";
     case OP_CMP: return "CMP"; case OP_UCMP: return "UCMP";
@@ -1044,9 +1083,8 @@ static const char *to8_opcode_name(to8_opcode op)
     
     case OP_SEQ: return "SEQ"; case OP_SNE: return "SNE"; case OP_SLT: return "SLT"; case OP_SGT: return "SGT";
     case OP_SLE: return "SLE"; case OP_SGE: return "SGE";
-    case OP_SNZ: return "SNZ";
  
-    case OP_EXT1S: return "EXT1S"; case OP_EXT2S: return "EXT2S";
+    case OP_EXT1: return "EXT1"; case OP_EXT2: return "EXT2";
     case OP_EXT1U: return "EXT1U"; case OP_EXT2U: return "EXT2U";
     case OP_ITOF: return "ITOF"; case OP_FTOI: return "FTOI";
 
@@ -1065,7 +1103,7 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_FCMP: return "FCMP"; case OP_FSGN: return "FSGN";
 
     case OP_PUSH: return "PUSH"; case OP_PUSHi: return "PUSHi"; case OP_PUSHr: return "PUSHr";
-    case OP_JSR: return "CALL"; case OP_JSRi: return "CALLi"; case OP_JSRr: return "CALLr";
+    case OP_SBR: return "SBR"; case OP_SBRi: return "SBRi"; case OP_SBRr: return "SBRr";
     case OP_JRA: return "JRA"; case OP_JEQ: return "JEQ"; case OP_JNE: return "JNE";
     case OP_JLT: return "JLT"; case OP_JGT: return "JGT"; case OP_JLE: return "JLE"; case OP_JGE: return "JGE";
     
@@ -1078,6 +1116,8 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_XOR2:  return "XOR2";
     case OP_CMP2:  return "CMP2";
     case OP_UCMP2: return "UCMP2";
+    case OP_DIV2: return "DIV2"; 
+    case OP_MOD2: return "MOD2";
     }
     return "?";
 }
@@ -1415,7 +1455,7 @@ ST_FUNC void to8_emit_raw_asm_n(const char *text, size_t len)
  *
  *   ; L6: *d = *s;
  *           MOV     4,16
- *           LDU1    12
+ *           LD1U    12
  *           ...
  *
  * Design: track the last line number we already marked. At the
@@ -1643,9 +1683,9 @@ static const char *to8_size_name(to8_opcode op)
 {
     switch (op) {
     case OP_LD1: case OP_ST1: return "signed char";
-    case OP_LDU1: return "unsigned char";
+    case OP_LD1U: return "unsigned char";
     case OP_LD2: case OP_ST2: return "signed short";
-    case OP_LDU2: return "unsigned short";
+    case OP_LD2U: return "unsigned short";
     default: return "int";
     }
 }
@@ -1676,8 +1716,8 @@ static void slot_comment(char *out, size_t outsz, to8_opcode op, const char *des
     case OP_STF4: case OP_STF8: snprintf(out, outsz, "%s = F", desc); return;
     case OP_STF4m: case OP_STF8m: snprintf(out, outsz, "*%s = F", desc); return;
     case OP_PUSH: snprintf(out, outsz, "push %s", desc); return;
-    case OP_JSR: snprintf(out, outsz, "call *%s", desc); return;
-    case OP_LD1: case OP_LDU1: case OP_LD2: case OP_LDU2: case OP_LD4:
+    case OP_SBR: snprintf(out, outsz, "call *%s", desc); return;
+    case OP_LD1: case OP_LD1U: case OP_LD2: case OP_LD2U: case OP_LD4:
         snprintf(out, outsz, "R0 = *(%s*)%s", to8_size_name(op), desc); return;
     case OP_ST1: case OP_ST2: case OP_ST4:
         snprintf(out, outsz, "*(%s*)%s = R0", to8_size_name(op), desc); return;
@@ -1704,7 +1744,7 @@ static void imm_comment(char *out, size_t outsz, to8_opcode op, int v)
     case OP_SARi: snprintf(out, outsz, "R0 >>= %s (arith)", num); return;
     case OP_CMPi: snprintf(out, outsz, "R0 = sign(R0 - %s)", num); return;
     case OP_UCMPi: snprintf(out, outsz, "R0 = sign(R0 -u %s)", num); return;
-    case OP_ADJi: snprintf(out, outsz, v < 0 ? "sp -= %s" : "sp += %s", v < 0 ? num + 1 : num); return;
+    case OP_ADJ: snprintf(out, outsz, v < 0 ? "sp -= %s" : "sp += %s", v < 0 ? num + 1 : num); return;
     case OP_PUSHi: snprintf(out, outsz, "push %s", num); return;
     case OP_FSCALEi: snprintf(out, outsz, "F *= 2^%s", num); return;
     default: snprintf(out, outsz, "%s", num); return;
@@ -1715,7 +1755,7 @@ static void addr_comment(char *out, size_t outsz, to8_opcode op, const char *des
 {
     switch (op) {
     case OP_LDi: snprintf(out, outsz, "R0 = &%s", desc); return;
-    case OP_JSRi: snprintf(out, outsz, "call %s", desc); return;
+    case OP_SBRi: snprintf(out, outsz, "call %s", desc); return;
     case OP_LDF4m: case OP_LDF8m: snprintf(out, outsz, "F = %s", desc); return;
     case OP_LDG4m: case OP_LDG8m: snprintf(out, outsz, "G = %s", desc); return;
     case OP_STF4m: case OP_STF8m: snprintf(out, outsz, "%s = F", desc); return;
@@ -1728,11 +1768,11 @@ static const char *bare_comment(to8_opcode op)
     switch (op) {
     case OP_RET: return "return";
     case OP_PUSHr: return "push R0";
-    case OP_JSRr: return "call *R0";
+    case OP_SBRr: return "call *R0";
     case OP_LD1r: return "R0 = (int)(signed char)*(char*)R0";
-    case OP_LDU1r: return "R0 = (int)(unsigned char)*(char*)R0";
+    case OP_LD1Ur: return "R0 = (int)(unsigned char)*(char*)R0";
     case OP_LD2r: return "R0 = (int)(signed short)*(short*)R0";
-    case OP_LDU2r: return "R0 = (int)(unsigned short)*(short*)R0";
+    case OP_LD2Ur: return "R0 = (int)(unsigned short)*(short*)R0";
     case OP_LD4r: return "R0 = *(int*)R0";
     case OP_ITOF: return "R0 -> F0 (int to float)";
     case OP_FTOI: return "F0 -> R0 (float to int)";
@@ -1742,9 +1782,8 @@ static const char *bare_comment(to8_opcode op)
     case OP_SGT: return "R0 = (> ? 1 : 0)";
     case OP_SLE: return "R0 = (<= ? 1 : 0)";
     case OP_SGE: return "R0 = (>= ? 1 : 0)";
-    case OP_SNZ: return "R0 = (R0 != 0 ? 1 : 0)";
-    case OP_EXT1S: return "R0 = (int)(char)R0";
-    case OP_EXT2S: return "R0 = (int)(short)R0";
+    case OP_EXT1: return "R0 = (int)(char)R0";
+    case OP_EXT2: return "R0 = (int)(short)R0";
     case OP_EXT1U: return "R0 = (int)(unsigned char)R0";
     case OP_EXT2U: return "R0 = (int)(unsigned short)R0";
     case OP_NOP: return "no-op";
@@ -1780,6 +1819,8 @@ static void op2_comment(char *out, size_t outsz, to8_opcode op2,
     case OP_ADD2:  snprintf(out, outsz, "R0 = %s + %s", desc_a, desc_b); return;
     case OP_SUB2:  snprintf(out, outsz, "R0 = %s - %s", desc_a, desc_b); return;
     case OP_MUL2:  snprintf(out, outsz, "R0 = %s * %s", desc_a, desc_b); return;
+    case OP_DIV2:  snprintf(out, outsz, "R0 = %s / %s", desc_a, desc_b); return;
+    case OP_MOD2:  snprintf(out, outsz, "R0 = %s %% %s", desc_a, desc_b); return;
     case OP_AND2:  snprintf(out, outsz, "R0 = %s & %s", desc_a, desc_b); return;
     case OP_OR2:   snprintf(out, outsz, "R0 = %s | %s", desc_a, desc_b); return;
     case OP_XOR2:  snprintf(out, outsz, "R0 = %s ^ %s", desc_a, desc_b); return;
@@ -1861,12 +1902,12 @@ static void to8_track_push(void) { cur_push_depth += PTR_SIZE; }
  * Used by gfunc_call() (always n>0 there in practice, guarded by
  * "if (nb_args > 0)" at the call site already) AND by gfunc_epilog()'s
  * frame-release, so a function with no locals never prints a useless
- * "ADJi 0". */
+ * "ADJ 0". */
 static void to8_adjust(int n)
 {
     if (n == 0)
         return;
-    e_op_imm(OP_ADJi, n);
+    e_op_imm(OP_ADJ, n);
     cur_push_depth -= n;
 }
 
@@ -1966,6 +2007,8 @@ static to8_opcode to8_op2_variant(to8_opcode op1)
     case OP_ADD:  return OP_ADD2;
     case OP_SUB:  return OP_SUB2;
     case OP_MUL:  return OP_MUL2;
+    case OP_DIV:  return OP_DIV2;
+    case OP_MOD:  return OP_MOD2;
     case OP_AND:  return OP_AND2;
     case OP_OR:   return OP_OR2;
     case OP_XOR:  return OP_XOR2;
@@ -1989,7 +2032,9 @@ static to8_opcode to8_get_set_cond(int op)
     case TOK_GT: case TOK_UGT: return OP_SGT;
     case TOK_LE: case TOK_ULE: return OP_SLE;
     case TOK_GE: case TOK_UGE: return OP_SGE;
-    default: return OP_SNZ;
+    default: 
+    tcc_error("Internal  error  %s:%d,  invalid op=%d",  __FUNCTION__, __LINE__, op);
+    return OP_NOP;    
     }
 }
 
@@ -2002,7 +2047,9 @@ static to8_opcode to8_get_jcond(int op)
     case TOK_GT: case TOK_UGT: return OP_JGT;
     case TOK_LE: case TOK_ULE: return OP_JLE;
     case TOK_GE: case TOK_UGE: return OP_JGE;
-    default: return OP_JNE;
+    default: 
+    tcc_error("Internal  error  %s:%d,  invalid op=%d",  __FUNCTION__, __LINE__, op);
+    return OP_NOP;    
     }
 }
 
@@ -2027,17 +2074,17 @@ static int to8_swap_cmp_op(int op)
  * regardless of what VT_UNSIGNED happens to say. */
 static to8_opcode to8_byte_suffix_ld(int bt, int is_unsigned)
 {
-    if (bt == VT_BOOL) return OP_LDU1;
-    if (bt == VT_BYTE) return is_unsigned ? OP_LDU1 : OP_LD1;
-    if (bt == VT_SHORT) return is_unsigned ? OP_LDU2 : OP_LD2;
+    if (bt == VT_BOOL) return OP_LD1U;
+    if (bt == VT_BYTE) return is_unsigned ? OP_LD1U : OP_LD1;
+    if (bt == VT_SHORT) return is_unsigned ? OP_LD2U : OP_LD2;
     return OP_LD4;
 }
 
 static to8_opcode to8_byte_suffix_ld_r(int bt, int is_unsigned)
 {
-    if (bt == VT_BOOL) return OP_LDU1r;
-    if (bt == VT_BYTE) return is_unsigned ? OP_LDU1r : OP_LD1r;
-    if (bt == VT_SHORT) return is_unsigned ? OP_LDU2r : OP_LD2r;
+    if (bt == VT_BOOL) return OP_LD1Ur;
+    if (bt == VT_BYTE) return is_unsigned ? OP_LD1Ur : OP_LD1r;
+    if (bt == VT_SHORT) return is_unsigned ? OP_LD2Ur : OP_LD2r;
     return OP_LD4r;
 }
 
@@ -2726,13 +2773,13 @@ void gfunc_call(int nb_args)
     save_regs(0);
 
     if ((func->r & VT_VALMASK) == VT_CONST && (func->r & VT_SYM)) {
-        e_op_addr(OP_JSRi, func->sym, func->c.i);
+        e_op_addr(OP_SBRi, func->sym, func->c.i);
     } else if ((func->r & VT_LVAL) &&
                ((func->r & VT_VALMASK) == VT_LOCAL || (func->r & VT_VALMASK) == VT_LLOCAL)) {
-        e_op_slot(OP_JSR, func->c.i);
+        e_op_slot(OP_SBR, func->c.i);
     } else {
         load(TREG_R0, func);
-        e_op(OP_JSRr);
+        e_op(OP_SBRr);
     }
 
     if (nb_args > 0) {
@@ -2762,7 +2809,7 @@ static int to8_peephole_ext(void)
             (nxt->op == OP_SARi || nxt->op == OP_SHRi) &&
             nxt->imm_val == cur->imm_val) {
             to8_opcode rep = (nxt->op == OP_SARi)
-                ? (cur->imm_val == 24 ? OP_EXT1S : OP_EXT2S)
+                ? (cur->imm_val == 24 ? OP_EXT1 : OP_EXT2)
                 : (cur->imm_val == 24 ? OP_EXT1U : OP_EXT2U);
             /* Mutate cur in place: same id/position/istarget survive,
              * so any label attached to cur stays correctly attached
@@ -2905,7 +2952,7 @@ static int to8_peephole_useless_ld(void)
  * program semantics.
  *
  * A load is removable only when:
- *   - it is a slot load that writes R0 (LD/LD1/LDU1/LD2/LDU2/LD4);
+ *   - it is a slot load that writes R0 (LD/LD1/LD1U/LD2/LD2U/LD4);
  *   - no instruction in between reads R0;
  *   - a later R0-writing load of the same family is encountered;
  *   - no jump target is crossed.
@@ -2926,8 +2973,8 @@ static int to8_peephole_dead_r0_load(void)
         if (first->is_target || first->kind != ARG_SLOT)
             continue;
         if (first->op != OP_LD && first->op != OP_LD1 &&
-            first->op != OP_LDU1 && first->op != OP_LD2 &&
-            first->op != OP_LDU2 && first->op != OP_LD4)
+            first->op != OP_LD1U && first->op != OP_LD2 &&
+            first->op != OP_LD2U && first->op != OP_LD4)
             continue;
 
         for (scan = first->next; scan; scan = scan->next) {
@@ -2935,7 +2982,7 @@ static int to8_peephole_dead_r0_load(void)
                 break;
 
             if (scan->op == OP_MOV || scan->op == OP_NOP ||
-                scan->op == OP_ADJi || scan->op == OP_PUSH ||
+                scan->op == OP_ADJ || scan->op == OP_PUSH ||
                 scan->op == OP_PUSHi ||
                 scan->op == OP_LDFi || scan->op == OP_LDGi ||
                 scan->op == OP_LDF4 || scan->op == OP_LDG4 ||
@@ -2955,8 +3002,8 @@ static int to8_peephole_dead_r0_load(void)
 
             if (scan->kind == ARG_SLOT &&
                 (scan->op == OP_LD || scan->op == OP_LD1 ||
-                 scan->op == OP_LDU1 || scan->op == OP_LD2 ||
-                 scan->op == OP_LDU2 || scan->op == OP_LD4)) {
+                 scan->op == OP_LD1U || scan->op == OP_LD2 ||
+                 scan->op == OP_LD2U || scan->op == OP_LD4)) {
                 to8_unlink(first);
                 changed = 1;
                 break;
@@ -2976,14 +3023,14 @@ static int to8_peephole_ld_deref(void)
         to8_line *nxt = cur->next;
         if (cur->op == OP_LD &&
             nxt && !nxt->is_target &&
-            (nxt->op == OP_LD1r || nxt->op == OP_LDU1r ||
-             nxt->op == OP_LD2r || nxt->op == OP_LDU2r ||
+            (nxt->op == OP_LD1r || nxt->op == OP_LD1Ur ||
+             nxt->op == OP_LD2r || nxt->op == OP_LD2Ur ||
              nxt->op == OP_LD4r) &&
             cur->push_depth == nxt->push_depth) {
             to8_opcode rep = (nxt->op == OP_LD1r) ? OP_LD1
-                            : (nxt->op == OP_LDU1r) ? OP_LDU1
+                            : (nxt->op == OP_LD1Ur) ? OP_LD1U
                             : (nxt->op == OP_LD2r) ? OP_LD2
-                            : (nxt->op == OP_LDU2r) ? OP_LDU2
+                            : (nxt->op == OP_LD2Ur) ? OP_LD2U
                             : OP_LD4;
             char desc[24];
 
@@ -3200,7 +3247,7 @@ static int to8_peephole_merge_adj(void) {
         if (cur->is_target || cur->kind == ARG_JMP) {
 	    if (candidate) {
 	        candidate->imm_val = defer;
-	        imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJi, defer);
+	        imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJ, defer);
 	    }
             candidate = NULL;
             defer = 0;
@@ -3210,7 +3257,7 @@ static int to8_peephole_merge_adj(void) {
         if (cur->kind == ARG_SLOT || cur->kind == ARG_SLOT2)
             cur->push_depth += defer;
 
-        if (cur->op == OP_ADJi && cur->imm_val > 0) {
+        if (cur->op == OP_ADJ && cur->imm_val > 0) {
             if (candidate) {
                 to8_unlink(candidate);
                 changed = 1;
@@ -3222,7 +3269,7 @@ static int to8_peephole_merge_adj(void) {
     
     if (candidate) {
         candidate->imm_val = defer;
-        imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJi, defer);
+        imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJ, defer);
     }            
 
     return changed;
@@ -3268,7 +3315,7 @@ static int to8_stops_fmov_scan(to8_opcode op)
     case OP_LDFi: case OP_LDF4: case OP_LDF8: case OP_LDF4m: case OP_LDF8m:
     case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
     case OP_FSCALEi: case OP_ITOF:
-    case OP_JSR: case OP_JSRi: case OP_JSRr:
+    case OP_SBR: case OP_SBRi: case OP_SBRr:
         return 1;
     default:
         return 0;
@@ -3334,7 +3381,7 @@ static int to8_peephole_useless_ldf(void)
         case OP_FMOV:
             last_g_load = NULL;
             break;
-        case OP_JSR: case OP_JSRi: case OP_JSRr:
+        case OP_SBR: case OP_SBRi: case OP_SBRr:
             last_f_load = NULL;
             last_g_load = NULL;
             break;
@@ -3622,7 +3669,7 @@ static void to8_render_line(to8_line *ln)
         break;
     case ARG_IMM:
         out_tab();
-	if(ln->op==OP_ADJi) {
+	if(ln->op==OP_ADJ) {
 	   out_slot(ln->imm_val);
 	} else if(ln->op==OP_FSCALEi) {
 	    out_int(ln->imm_val);
@@ -3736,7 +3783,7 @@ void gfunc_prolog(Sym *func_sym)
     snprintf(to8_func_name, sizeof to8_func_name, "%s", funcname ? funcname : "?");
     ++to8_func_no;
 
-    to8_func_adj_line = to8_append(OP_ADJi);
+    to8_func_adj_line = to8_append(OP_ADJ);
     to8_func_adj_line->kind = ARG_IMM;
 
     addr = PTR_SIZE;
@@ -3778,7 +3825,7 @@ void gfunc_epilog(void)
             to8_func_adj_line->redirect = g_head;
     } else {
         to8_func_adj_line->imm_val = -frame_size;
-        imm_comment(to8_func_adj_line->comment, sizeof to8_func_adj_line->comment, OP_ADJi, -frame_size);
+        imm_comment(to8_func_adj_line->comment, sizeof to8_func_adj_line->comment, OP_ADJ, -frame_size);
         to8_func_adj_line->has_comment = 1;
     }
 

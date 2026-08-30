@@ -1,4 +1,4 @@
-#if 1
+#if 0
 char *f(char *s, char *d) {
 	while(*d++ = *s++);
 	return d-1;
@@ -131,7 +131,6 @@ void test_asm(void) {
 
 __native_asm ("\ttest2 a,b\nlabel:\n  code 0x1111");
 
-int mul_simple(int a, int b) { return a * b; }
 int mul_complex(int a, int b, int c) { return a * b + c; }
 int mul_complex2(int a, int b, int c, int d) { return a * b + c*d; }
 
@@ -149,3 +148,11 @@ int mandel3(int count, float cx,  float cy) {
 
 
 #endif
+int add_simple(int a, int b) { return a + b; }
+int sub_simple(int a, int b) { return a - b; }
+int mul_simple(int a, int b) { return a * b; }
+int div_simple(int a, int b) { return a / b; }
+int mod_simple(int a, int b) { return a % b; }
+unsigned int udiv_simple(unsigned int a, unsigned int b) { return a / b; }
+unsigned int umod_simple(unsigned int a, unsigned int b) { return a % b; }
+
