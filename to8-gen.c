@@ -1,8 +1,42 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.11.0 (unsigned division/modulo wired to existing runtime helpers)
+ * Version: 8.13.0 (fixed slot/ADJ overflow in to8_peephole_merge_adj)
  *
  * Changelog:
+ * - v8.13.0 fixed "Function X has too many slots" false failures caused
+ *   by to8_peephole_merge_adj (v8.8.0) deferring ADJ releases too far.
+ *   Two independent overflow paths existed, both landing in out_slot's
+ *   signed-byte range check - fixed together, since either alone still
+ *   left the other failing (confirmed on dhry_1.c: main, offset=236 with
+ *   neither guard, offset=172 with only the slot guard, 0 with both).
+ *   1) Slot guard: applying `defer` to an ARG_SLOT/ARG_SLOT2 crossed
+ *      while a release is pending can push g_frame_size+slot+push_depth
+ *      out of range, especially in large-frame functions where the base
+ *      offset alone is already close to the limit.
+ *   2) ADJ guard: the merged ADJ's own immediate is rendered through the
+ *      same out_slot check (leas n,s shares the 6809's signed-byte
+ *      postbyte with ordinary ,s addressing) - a long chain of merged
+ *      calls with no local access in between can overflow defer with
+ *      no ARG_SLOT ever crossing it to trigger guard 1.
+ *   Fix: both cases now flush the pending candidate immediately -
+ *   materializing what's safely accumulated so far - instead of letting
+ *   defer grow unchecked. Costs at most one extra ADJ per overflow point,
+ *   in exchange for never emitting an out-of-range offset.
+ *
+ * - v8.12.0 two runtime asm fixes found while testing esc(GFX_MODE_BM4).
+ *   1) PUSHi macro referenced only \0 (its own first param, literal 0)
+ *      and hardcoded an extra 0 before it, discarding \1 (the actual
+ *      value) entirely - every push of a non-trivial constant as a
+ *      function-call argument silently became opPUSHi,0,0. Masked until
+ *      now because cursor(0)/border(0) happen to genuinely push 0. Fixed
+ *      to reference both: fdb opPUSHi,\0,\1.
+ *   2) opUMODi branched to opMODa (the SIGNED routine) instead of
+ *      opUMODa - a leftover from copy-pasting opMODi's definition
+ *      without updating the label. unsigned int % constant would
+ *      silently apply signed-division sign correction, wrong for any
+ *      operand above INT_MAX. opUDIVi/opUDIV2/opUMOD2 were unaffected -
+ *      only this one label was mistyped. Fixed: bra opUMODa.
+ *
  * - v8.11.0 fixed TOK_UDIV/TOK_UMOD being routed to the same OP_DIV/OP_MOD
  *   as signed division in to8_get_arith_ops - confirmed by direct compiler
  *   output showing udiv_simple/umod_simple emitting DIV2/MOD2, identical
@@ -1292,6 +1326,7 @@ static int g_last_end_ind = -1;
  * pair, so to8_emit_raw_asm_n() must never touch g_head/g_tail when
  * this is 0. */
 static int g_in_function = 0;
+static int to8_final_slot(int raw_slot, int push_depth);
 
 static void to8_by_id_set(int id, to8_line *ln)
 {
@@ -3371,11 +3406,64 @@ static int to8_peephole_merge_adj(void) {
             continue;
         }
 
-        if (cur->kind == ARG_SLOT || cur->kind == ARG_SLOT2)
-            cur->push_depth += defer;
+        if (cur->kind == ARG_SLOT || cur->kind == ARG_SLOT2) {
+            /* The bound that actually matters isn't on `defer` in isolation -
+               it's on the FINAL slot value that out_slot will later reject:
+               to8_final_slot(raw_slot, push_depth) = g_frame_size + raw_slot
+               + push_depth. main() in dhry_1.c has a large g_frame_size on
+               its own (many locals), so a slot whose base offset is already
+               close to the +-128 boundary can overflow from adding even a
+               small deferred amount - bounding defer alone (e.g. to +-127)
+               doesn't catch this, since g_frame_size + raw_slot can already
+               eat most of that range before defer is even added.
 
+               In the ORIGINAL, unmerged code this never happened: each ADJ
+               fired immediately after its call, so push_depth returned to 0
+               before the next slot access. Merging ADJs (v8.8.0) is what
+               artificially extends the window during which push_depth stays
+               elevated - so if applying `defer` here would push the final
+               slot for THIS instruction out of range, the right fix is to
+               flush the pending release right now (materialize the ADJ with
+               what has safely accumulated so far), so this instruction - and
+               everything after it, until the next call - sees push_depth
+               reset, exactly as it would have in the unmerged original. */
+            int over = 0;
+            if (to8_final_slot(cur->slot_a, cur->push_depth + defer) < -128 ||
+                to8_final_slot(cur->slot_a, cur->push_depth + defer) > 127)
+                over = 1;
+            if (cur->kind == ARG_SLOT2 &&
+                (to8_final_slot(cur->slot_b, cur->push_depth + defer) < -128 ||
+                 to8_final_slot(cur->slot_b, cur->push_depth + defer) > 127))
+                over = 1;
+
+            if (over && candidate) {
+                candidate->imm_val = defer;
+                imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJ, defer);
+                candidate = NULL;
+                defer = 0;
+            }
+
+            cur->push_depth += defer;
+        }
+	
         if (cur->op == OP_ADJ && cur->imm_val > 0) {
-            if (candidate) {
+            /* Guard #2: the ADJ's own encoded immediate ALSO goes through
+               out_slot (see ARG_IMM rendering: OP_ADJ uses out_slot, not
+               out_int - the 6809's "leas n,s" shares the same signed-byte
+               postbyte as ordinary ",s" slot addressing). A long chain of
+               merged call-argument releases can overflow this value on
+               its own, with NO slot access ever crossed to trigger Guard
+               #1 above - exactly the remaining gap that let main() in
+               dhry_1.c still fail at offset=172 after Guard #1 alone. */
+            if (defer + cur->imm_val > 127 || defer + cur->imm_val < -128) {
+                if (candidate) {
+                    candidate->imm_val = defer;
+                    imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJ, defer);
+                }
+                defer = 0;
+                candidate = NULL;
+            }
+	    if (candidate) {
                 to8_unlink(candidate);
                 changed = 1;
             }

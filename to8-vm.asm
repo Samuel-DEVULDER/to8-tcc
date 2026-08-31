@@ -627,7 +627,7 @@ opUMOD2 pulu	d
 	bra	opUMODa
 opUMODi leay	,u
 	leau	4,u
-	bra	opMODa
+	bra	opUMODa
 opUMOD	pulu	d
 	leay	b,s
 opUMODa jsr	<opUDIVy
