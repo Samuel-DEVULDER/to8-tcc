@@ -637,7 +637,167 @@ opUMODa jsr	<opUDIVy
 	std	<R0+2
 	pulu	pc	  
 
-(info)
+* shifts
+lslR0   macro
+        lslb
+        rola
+        rol     <R0+1
+        rol     <R0
+        endm
+opSHL   pulu    d,y
+        leax    b,s
+        LDB     3,x
+        SKIP2X
+opSHLi  pulu    d,y
+        stb     <R1
+        ldd     <R0+2
+        beq     opSHL_half
+        lsr     <R1
+        bcc     opSHL_2
+        lslR0
+opSHL_2 lsr     <R1
+        bcc     opSHL_4
+        lslR0
+        lslR0
+opSHL_4 lsr     <R1
+        bcc     opSHL_8
+        lslR0
+        lslR0
+        lslR0
+        lslR0
+opSHL_8 std     <R0+2
+        lsr     <R1
+        bcc     opSHL_16
+        ldd     <R0+1
+        std     <R0
+        lda     <R0+3
+        clrb
+        std     <R0+2
+opSHL_16
+        lsr     <R1
+        bcc     opSHL_32
+        std     <R0        
+        ldd     #0
+        std     <R0+2
+opSHL_32
+        jmp     ,y
+opSHL_half
+        ldd     <R0
+        lsr     <R1
+        bcc     opSHL_half2
+        lslb
+        rola
+opSHL_half2
+        lsr     <R1
+        bcc     opSHL_half4
+        lslb
+        rola
+        lslb
+        rola
+opSHL_half4
+        lsr     <R1
+        bcc     opSHL_half8
+        lslb
+        rola
+        lslb
+        rola
+        lslb
+        rola
+        lslb
+        rola
+opSHL_half8
+        lsr     <R1
+        bcc     opSHL_half16
+        tfr     b,a
+        clrb
+opSHL_half16
+        lsr     <R1
+        bcc     opSHL_half32
+        ldd     #0
+opSHL_half32
+        std     <R0
+        jmp     ,y
+lsrR0   macro
+        lsra
+        rorb
+        ror     <R0+2
+        ror     <R0+3
+        endm
+opSHR   pulu    d,y
+        leax    b,s
+        LDB     3,x
+        SKIP2X
+opSHRi  pulu    d,y
+        stb     <R1
+        ldd     <R0
+        beq     opSHR_half
+        lsr     <R1
+        bcc     opSHR_2
+        lsrR0
+opSHR_2 lsr     <R1
+        bcc     opSHR_4
+        lsrR0
+        lsrR0
+opSHR_4 lsr     <R1
+        bcc     opSHR_8
+        lsrR0
+        lsrR0
+        lsrR0
+        lsrR0
+opSHR_8 std     <R0
+        lsr     <R1
+        bcc     opSHR_16
+        ldd     <R0+1
+        std     <R0+2
+        ldb     <R0
+        clra
+        std     <R0
+opSHR_16
+        lsr     <R1
+        bcc     opSHR_32
+        std     <R0+2
+opSHR_0 ldd     #0
+        std     <R0
+opSHR_32
+        jmp     ,y
+opSHR_half
+        ldd     <R0+2
+        lsr     <R1
+        bcc     opSHR_half2
+        lsra
+        rorb
+opSHR_half2
+        lsr     <R1
+        bcc     opSHR_half4
+        lsra
+        rorb
+        lsra
+        rorb
+opSHR_half4
+        lsr     <R1
+        bcc     opSHR_half8
+        lsra
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
+opSHR_half8
+        lsr     <R1
+        bcc     opSHR_half16
+        tfr     a,b
+        clra
+opSHR_half16
+        lsr     <R1
+        bcc     opSHR_half32
+        ldd     #0
+opSHR_half32
+        std     <R0+2
+        jmp     ,y
+
+        echo    VM    size = &(*-R0) bytes
        
 crt0	pshs	d,x,y,u,dp,cc
 	ldd	#R0&$FF00
@@ -726,7 +886,7 @@ opLDCLK pshs	cc
 	stx	<R0+2
 	pulu	pc
 
-(info)
+        echo    CRT0  size = &(*-crt0) bytes
 	
 *************************************************************************
 * macros
@@ -879,8 +1039,29 @@ XOR	macro
 	fdb	opEOR,\0
 	endm
 MULT	macro
-	fdb	opMULT,\0
+	fdb	opMUL,\0
 	endm
+DIV	macro
+	fdb	opDIV,\0
+	endm
+MOD	macro
+	fdb	opMOD,\0
+	endm
+UDIV	macro
+	fdb	opUDIV,\0
+	endm
+UMOD	macro
+	fdb	opUMOD,\0
+	endm
+SHL     macro
+        FDB     opSHL,\0
+        endm
+SHR     macro
+        FDB     opSHR,\0
+        endm
+SAR     macro
+        FDB     opSAR,\0
+        endm
 CMP	macro
 	fdb	opCMP,\0
 	endm
@@ -906,6 +1087,27 @@ XORi	macro
 MULi	macro
 	fdb	opMULi,\0,\1
 	endm
+DIVi	macro
+	fdb	opDIVi,\0,\1
+	endm
+MODi	macro
+	fdb	opMODi,\0,\1
+	endm
+UDIVi	macro
+	fdb	opUDIVi,\0,\1
+	endm
+UMODi	macro
+	fdb	opUMODi,\0,\1
+	endm
+SHLi    macro
+        FDB     opSHLi,\1
+        endm
+SHRi    macro
+        FDB     opSHRi,\1
+        endm
+SARi    macro
+        FDB     opSARi,\0
+        endm
 CMPi	macro
 	fdb	opCMPi,\0,\1
 	endm
@@ -922,8 +1124,17 @@ SUB2	macro
 MUL2	macro
 	fdb	opMUL2,256*\0+\1
 	endm
+DIV2	macro
+	fdb	opDIV2,256*\0+\1
+	endm	    
 MOD2	macro
 	fdb	opMOD2,256*\0+\1
+	endm	    
+UDIV2	macro
+	fdb	opUDIV2,256*\0+\1
+	endm	    
+UMOD2	macro
+	fdb	opUMOD2,256*\0+\1
 	endm	    
 AND2	macro
 	fdb	opAND2,256*\0+\1
@@ -940,6 +1151,7 @@ CMP2	macro
 UCMP2	macro
 	fdb	opUCMP2,256*\0+\1
 	endm
+
 * cast
 EXT1	macro
 	fdb	opEXT1
@@ -964,5 +1176,3 @@ VM_ON	macro
 LDCLK	macro
 	fdb	opLDCLK
 	endm
-
-(info)

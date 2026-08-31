@@ -30,10 +30,14 @@ cross-to8-dbg:
 %.asm: %.c cross-to8 to8-vm.asm
 	@echo "(main)main" >$@
 	@cat to8-vm.asm >>$@
+	@echo "* start of code" >>$@
+	@echo "__start set *" >>$@
 	./to8-tcc $< -c -O -g -o .$*.o 
 	strings -n 2 .$*.o | \
 	sed -n '/\* TO8 backend/,/\* --- end of asm ---/p' >> $@
-	@echo "(info)" >>$@
+	@echo "	echo Code  size = &(*-__start) bytes (&((*-__start+1023)/1024) kb)" >>$@
+	@echo "__start set __start+0" >>$@
+	@echo "	echo Total size = &(*-init) bytes (&((*-init+1023)/1024) kb)" >>$@
 	@echo "	end	init" >>$@
 	@rm .$*.o
 
