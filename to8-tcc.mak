@@ -43,10 +43,20 @@ C6809=/cygdrive/c/Users/Utilisateur/Desktop/Thomson/c6809-0.83/Thomson-Projects/
 	#less codes.lst
 	
 SAPFS=/cygdrive/c/Users/Utilisateur/Desktop/Thomson/c6809-0.83/Thomson-Projects/sapfs/sapfs.exe
-%.sap: %.bin	
-	$(SAPFS) -c $@
-	$(SAPFS) -a $@ $(subst a,A,$(subst b,B,$(subst c,C,$(subst d,D,$(subst e,E,$(subst f,F,$(subst g,G,$(subst h,H,$(subst i,I,$(subst j,J,$(subst k,K,$(subst l,L,$(subst m,M,$(subst n,N,$(subst o,O,$(subst p,P,$(subst q,Q,$(subst r,R,$(subst s,S,$(subst t,T,$(subst u,U,$(subst v,V,$(subst w,W,$(subst x,X,$(subst y,Y,$(subst z,Z,$<))))))))))))))))))))))))))
+%.sap: %.bin AUTO.BAT 	
+	$(SAPFS) -c $@ 
+	$(SAPFS) -a $@ AUTO.BAT
+	BASE=$$(basename $< .bin | tr 'a-z' 'A-Z' | cut -c1-8); \
+	BIN="$$BASE.BIN"; mv $< .$$BIN; mv .$$BIN $$BIN;\
+	printf >AUTO.BAS "\\r\\n10 BANK2:CLEAR,&H71FF:LOADM\"%s\"" "$$BIN"; \
+	$(SAPFS) -a $@ AUTO.BAS; \
+	$(SAPFS) -a $@ $$BIN; \
+	$(SAPFS) -t $@
+	@cat AUTO.BAS
 
+AUTO.BAT:
+	echo /wATABAACoggIkFVVE8uQkFTAAAA | base64 -d > $@
+	
 tst: cross-to8-dbg to8-tst.asm 
 	cat to8-tst.asm | tee /dev/clipboard
 

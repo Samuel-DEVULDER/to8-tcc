@@ -3807,7 +3807,7 @@ static void to8_render_line(to8_line *ln)
         out_tab();
         if (ln->sym) {
             const char *name = get_tok_str(ln->sym->v, NULL);
-	    out_str("_");
+	    out_str(ln->op == OP_PUSHi ? "0,_" : "_");
             //out_str(name ? name : "?");
 	    {char  *s=name ? name : "?"; while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
         } else {
