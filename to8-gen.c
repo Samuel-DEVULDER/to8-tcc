@@ -1,8 +1,20 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.13.0 (fixed slot/ADJ overflow in to8_peephole_merge_adj)
+ * Version: 8.14.0 (bss globals emitted as explicit zero FCB, not RMB)
  *
  * Changelog:
+ * - v8.14.0 fixed to8_flush_pending_data silently skipping every symbol
+ *   in a .bss section (SHT_NOBITS) - uninitialized globals like Int1Loc
+ *   in dhry2.c never appeared in the generated asm at all. Fixed by
+ *   walking bss symbols too and emitting explicit "FCB 0,0,0,..." for
+ *   their full size, instead of reading (nonexistent) backing bytes from
+ *   sec->data. Chosen over RMB specifically because it also guarantees
+ *   zero-initialization at assemble time, with no need for a separate
+ *   crt0 bss-clear loop - C's requirement that uninitialized globals
+ *   start at 0 is satisfied directly by the emitted bytes. Trade-off:
+ *   larger object file (zeros are now stored, not just reserved) - an
+ *   acceptable cost given this backend's pseudo-asm/pedagogical nature. 
+ *
  * - v8.13.0 fixed "Function X has too many slots" false failures caused
  *   by to8_peephole_merge_adj (v8.8.0) deferring ADJ releases too far.
  *   Two independent overflow paths existed, both landing in out_slot's
@@ -934,7 +946,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.9.0"
+#define TO8_GEN_VERSION "8.14.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -4128,14 +4140,29 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
     for (i = 1; i < s1->nb_sections; i++) {
         Section *sec = s1->sections[i];
         int j;
+        int is_bss;
 
-        if (!sec || !sec->data || sec->data_offset == 0)
-            continue;
-        if (sec->sh_type == SHT_NOBITS) /* .bss: no bytes to show */
+        if (!sec)
             continue;
         if (!(sec->sh_flags & SHF_ALLOC)) /* debug/symtab/etc: not runtime data */
             continue;
         if (sec == cur_text_section) /* code: already rendered as pseudo-asm */
+            continue;
+        if (sec->data_offset == 0)
+            continue;
+
+        /* v8.14.0: .bss (SHT_NOBITS) carries no backing bytes in the
+           object file by construction - sec->data can legitimately be
+           NULL here even though data_offset is > 0 (the section's
+           logical size). The OLD code required sec->data to be non-NULL
+           unconditionally, which silently skipped every symbol living in
+           .bss - uninitialized globals like Int1Loc in dhry2.c never
+           appeared anywhere in the generated asm: no label, no reserved
+           space, nothing. Fixed by walking bss symbols too (below) and
+           emitting explicit zero bytes for them instead of reading
+           sec->data, which we now correctly avoid dereferencing for bss. */
+        is_bss = (sec->sh_type == SHT_NOBITS);
+        if (!is_bss && !sec->data)
             continue;
 
         for (j = 1; j < nb_syms; j++) {
@@ -4156,14 +4183,18 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
 
             g_col = 0;
             out_char('_'); //out_str(name);
-	    {char  *s=name;while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
-	    out_tab();
-	    out_str("set");
-	    out_tab();
-	    out_str("*");
+    {char  *s=name;while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
+    out_tab();
+    out_str("set");
+    out_tab();
+    out_str("*");
             out_pad_to(TO8_COMMENT_COL);
             out_char(';'); out_char(' ');
-            out_int((int)n); out_str(" bytes (data)");
+            out_int((int)n);
+            /* v8.14.0: distinguish bss in the comment - same FCB rendering
+               below either way, but the source is explicit zeros, not
+               real initialized bytes. */
+            out_str(is_bss ? " bytes (bss, zero-filled)" : " bytes (data)");
 
             for (k = 0; k < n; k++) {
                 if ((k & 7) == 0) {
@@ -4175,7 +4206,10 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
                 } else {
                     out_char(',');
                 }
-                out_int(sec->data[off + k]);
+                /* v8.14.0: bss has no real backing byte to read - it is
+                   zero by definition, and sec->data may be NULL here, so
+                   never index into it for a bss section. */
+                out_int(is_bss ? 0 : sec->data[off + k]);
             }
             out_char('\n');
             g_col = 0;
