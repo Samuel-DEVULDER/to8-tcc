@@ -1,8 +1,18 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.14.0 (bss globals emitted as explicit zero FCB, not RMB)
+ * Version: 8.14.1 (comment separator always leaves a blank before ';')
  *
  * Changelog:
+ * - v8.14.1 added out_comment_sep(), used wherever a line comment's ';'
+ *   is emitted after out_pad_to(TO8_COMMENT_COL). out_pad_to() is a no-op
+ *   once g_col has already reached or passed the target column (e.g.
+ *   after a long symbol name), which left the ';' glued directly to the
+ *   previous character with no separating whitespace - some assemblers
+ *   require at least one blank before a comment marker and reject lines
+ *   like "foo*;comment" outright. out_comment_sep() pads normally when
+ *   there's room, and falls back to a single explicit space otherwise,
+ *   guaranteeing the separator in both cases.
+ *
  * - v8.14.0 fixed to8_flush_pending_data silently skipping every symbol
  *   in a .bss section (SHT_NOBITS) - uninitialized globals like Int1Loc
  *   in dhry2.c never appeared in the generated asm at all. Fixed by
@@ -946,7 +956,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.14.0"
+#define TO8_GEN_VERSION "8.14.1"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3838,6 +3848,13 @@ static void out_slot(int slot) {
     out_int(slot);
 }    
 
+static void out_eol_comment() {
+    if (g_col < TO8_COMMENT_COL) out_pad_to(TO8_COMMENT_COL);
+    else out_char(' ');
+    out_char(';');
+    out_char(' ');
+}
+
 static void to8_render_line(to8_line *ln)
 {
     if (tcc_state && tcc_state->do_debug && ln->src_line
@@ -3920,8 +3937,7 @@ static void to8_render_line(to8_line *ln)
         break;
     }
 
-    out_pad_to(TO8_COMMENT_COL);
-    out_char(';'); out_char(' ');
+    out_eol_comment();
     if (ln->kind == ARG_JMP) {
         out_str(ln->jump_prefix);
 	out_char(' ');
@@ -3943,8 +3959,7 @@ static void to8_render_function(void)
     out_str("set");
     out_tab();
     out_char('*');
-    out_pad_to(TO8_COMMENT_COL);
-    out_char(';'); out_char(' ');
+    out_eol_comment();
     out_int(g_count_after);
     out_str(" instr");
     if (g_count_after != g_count_before) {
@@ -4183,13 +4198,12 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
 
             g_col = 0;
             out_char('_'); //out_str(name);
-    {char  *s=name;while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
-    out_tab();
-    out_str("set");
-    out_tab();
-    out_str("*");
-            out_pad_to(TO8_COMMENT_COL);
-            out_char(';'); out_char(' ');
+   	    {char  *s=name;while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
+	    out_tab();
+            out_str("set");
+            out_tab();
+	    out_str("*");
+	    out_eol_comment();
             out_int((int)n);
             /* v8.14.0: distinguish bss in the comment - same FCB rendering
                below either way, but the source is explicit zeros, not
