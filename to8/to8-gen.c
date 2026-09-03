@@ -1,8 +1,19 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.19.0 (static initializer byte-order: reliable type detection + auto-correction)
+ * Version: 8.20.0 (silence palindromic-swap and L.N symbol warnings)
  *
  * Changelog:
+ * - v8.20.0 two warning suppressions on static/global initializers,
+ *   no behavior change:
+ *   1) to8_byte_swap_changes_anything: no warning when the byte swap
+ *      is a no-op, i.e. bytes are palindromic (0, -1, and other
+ *      symmetric values - the swap still runs, just produces the
+ *      same bytes).
+ *   2) No warning for TCC's anonymous L.N symbols (string literals,
+ *      uninlined float/double constants, unresolvable via
+ *      to8_find_global_sym_by_name since it skips anonymous syms) -
+ *      still uncorrected, just silent now.
+ *
  * - v8.19.0 static/global initializer byte order: reliable type detection,
  *   then correction where safe, warning where not. Two changes bundled in
  *   this revision, the second built directly on the first.
@@ -2965,7 +2976,7 @@ void gen_opi(int op)
             vtop--; return;
         }
 
-	        if (to8_is_commutative(op)) {
+                if (to8_is_commutative(op)) {
             if (v1 == VT_CONST && !(vtop[-1].r & VT_SYM)) {
                 /* Left operand is a true literal (5, 1, ...): c1 IS
                  * its value. Unchanged from the original code. */
@@ -4467,6 +4478,27 @@ static Sym *to8_find_global_sym_by_name(const char *elf_name)
     return NULL;
 }
 
+/* Returns 1 if reversing every esz-byte group in [off, off+n) would
+ * change at least one byte compared to the original section data,
+ * 0 if the correction is a complete no-op for this symbol (every
+ * group already reads the same forwards and backwards). */
+static int to8_byte_swap_changes_anything(Section *sec, unsigned long off,
+                                           unsigned long n, int esz)
+{
+    unsigned long g, i;
+    if (esz <= 1)
+        return 0; /* nothing to swap in the first place */
+    for (g = 0; g < n; g += esz) {
+        for (i = 0; i < esz / 2; i++) {
+            unsigned char lo = sec->data[off + g + i];
+            unsigned char hi = sec->data[off + g + (esz - 1 - i)];
+            if (lo != hi)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 /*
  * Emits n bytes as FCB directives, 8 per line, matching the existing
  * wrapping convention exactly. elem_size == 0 or 1 means "plain,
@@ -4478,7 +4510,7 @@ static void to8_emit_fcb_bytes(Section *sec, unsigned long off,
                                 unsigned long n, int elem_size, int is_bss)
 {
     unsigned long k;
-	
+        
     for (k = 0; k < n; k++) {
         unsigned long idx;
         if (elem_size > 1) {
@@ -4554,7 +4586,7 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
             ElfSym *sym = (ElfSym *)symtab->data + j;
             const char *name;
             unsigned long off, n, k;
-		    int elem_size = 0; /* 0 = no correction applied, natural order */
+                    int elem_size = 0; /* 0 = no correction applied, natural order */
 
             if (sym->st_shndx != sec->sh_num)
                 continue;
@@ -4564,33 +4596,36 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
             name = (const char *)symtab->link->data + sym->st_name;
             off = sym->st_value;
             n = sym->st_size ? sym->st_size : 1;
-	    
-	       
-           if (!is_bss) {
+               
+            if (!is_bss) {
                 Sym *gsym = to8_find_global_sym_by_name(name);
-                	       
+                               
                 if (!gsym) {
-                    tcc_warning("TO8: '%s': unknown type, byte order not checked", name);
+                    if(name[0]!='L' || name[1]!='.') {
+                        tcc_warning("TO8: '%s': unknown type, byte order not checked", name);
+                    }
                 } else if (to8_type_is_real_pointer(&gsym->type)) {
                     tcc_warning("TO8: '%s': pointer initializer not relocated", name);
                 } else {
                     CType *elem = to8_innermost_elem_type(&gsym->type);
                     int bt = elem->t & VT_BTYPE;
                     int all_bytes = (bt == VT_BYTE || bt == VT_BOOL);
-                
+                    
                     if (!all_bytes) {
                         int esz = to8_elem_byte_size(elem);
                         if (esz > 1 && (n % esz) == 0) {
                             elem_size = esz;
-                            tcc_warning("TO8: '%s': byte order auto-corrected", name);
+			    if (to8_byte_swap_changes_anything(sec, off, n, esz)) {
+                                tcc_warning("TO8: '%s': byte order auto-corrected", name);
+			    }
                         } else {
                             tcc_warning("TO8: '%s': unknown size, byte order not checked", name);
                         }
                     }
                 }
-		   }
-		   
-		   if (!g_banner_done) { to8_print_banner(); g_banner_done = 1; }
+            }
+                   
+            if (!g_banner_done) { to8_print_banner(); g_banner_done = 1; }
 
             g_col = 0;
             out_char('_'); //out_str(name);
@@ -4602,7 +4637,7 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
                below either way, but the source is explicit zeros, not
                real initialized bytes. */
             out_str(is_bss ? " bytes (bss, zero-filled)" : " bytes (data)");
-			out_char('\n');
+                        out_char('\n');
 
             to8_emit_fcb_bytes(sec, off, n, elem_size, is_bss);
         }

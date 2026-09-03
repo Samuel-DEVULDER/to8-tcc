@@ -70,7 +70,7 @@ SAPFS=$(TOP)/to8/sapfs/sapfs$(EXESUF)
 	$(SAPFS) -t $@
 
 $(SAPFS): $(TOP)/to8/sapfs/
-	$(MAKE) -C $< --no-print-directory $*
+	$(MAKE) -C $< --no-print-directory "CC=$(CC) -Dlinux" sapfs
 
 clean::
 	test ! -e $(C6809) || rm $(C6809) 
