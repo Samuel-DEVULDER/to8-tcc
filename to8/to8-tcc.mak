@@ -25,7 +25,7 @@ cross-to8-dbg:
 	$(MAKE) --no-print-directory cross-to8 "CC=$(CC) -g" "CFLAGS=-O0"
 	$(CC) -g -o to8-tcc$(EXESUF) to8-tcc.o -L.
 
-pull:
+git-pull:
 	git pull --rebase
 	git fetch thomson
 	mkdir c6809 sapfs
