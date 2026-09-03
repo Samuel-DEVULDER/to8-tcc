@@ -42,7 +42,7 @@ testspp.%+: %.c
 # tell make not to delete
 .PRECIOUS: %.expect
 
-clean:
+clean::
 	rm -f *.output
 
 02.test : DIFF_OPTS += -w

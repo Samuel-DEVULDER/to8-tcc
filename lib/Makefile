@@ -102,5 +102,5 @@ $(X)wincrt1w.o : wincrt1.c
 # don't try to make it
 $(TCC) : ;
 
-clean :
+clean ::
 	rm -f *.o $(addprefix $(TOP)/,*libtcc1.a $(EXTRA_O))

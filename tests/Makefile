@@ -341,7 +341,7 @@ cache: tcc_g
 	vg_annotate tcc.c > /tmp/linpack.cache.log
 
 # clean
-clean:
+clean::
 	rm -f *~ *.o *.a *.bin *.i *.ref *.out *.out? *.out?b *.cc *.gcc
 	rm -f *-cc *-gcc *-tcc *.exe hello libtcc_test vla_test tcctest[1234]
 	rm -f asm-c-connect asm-c-connect-sep

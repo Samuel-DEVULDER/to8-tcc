@@ -21,9 +21,9 @@ help::
 cross-to8: to8-tcc$(EXESUF) ;
 
 # full reset + rebuild + smoke-test cycle - the actual point of this file
-cross-to8-dbg: ./tcc$(EXESUF)
-	$(MAKE) --no-print-directory cross-to8 "CC=./tcc$(EXESUF) -g" "CFLAGS=-O0"
-	./tcc$(EXESUF) -g -o to8-tcc$(EXESUF) to8-tcc.o -L.
+cross-to8-dbg:
+	$(MAKE) --no-print-directory cross-to8 "CC=$(CC) -g" "CFLAGS=-O0"
+	$(CC) -g -o to8-tcc$(EXESUF) to8-tcc.o -L.
 
 pull:
 	git pull --rebase
@@ -38,36 +38,45 @@ pull:
 	@cat to8/to8-vm.asm >>$@
 	@echo "* start of code" >>$@
 	@echo "__start set *" >>$@
-	./to8-tcc $< -c -O -g -o .tmp.o 
-	strings -n 2 .tmp.o | \
+	./to8-tcc $< -c -O -g -o '.$(shell basename "$*").o'
+	@strings -n 2 '.$(shell basename "$*").o' | \
 	sed -n '/\* TO8 backend/,/\* --- end of asm ---/p' >> $@
 	@echo "	echo Code  size = &(*-__start) bytes (&((*-__start+1023)/1024) kb)" >>$@
 	@echo "__start set __start+0" >>$@
 	@echo "	echo Total size = &(*-init) bytes (&((*-init+1023)/1024) kb)" >>$@
 	@echo "	end	init" >>$@
-	@rm .tmp.o
+	@rm '.$(shell basename "$*").o'
 
-C6809=/cygdrive/c/Users/Utilisateur/Desktop/Thomson/c6809-0.83/Thomson-Projects/c6809/c6809.exe
-%.bin: %.asm $(C6808)
+C6809=$(TOP)/to8/c6809/c6809$(EXESUF)
+%.bin: %.asm $(C6809)
 	$(C6809) -oOP $< $@
-	#less codes.lst
-	
-SAPFS=/cygdrive/c/Users/Utilisateur/Desktop/Thomson/c6809-0.83/Thomson-Projects/sapfs/sapfs.exe
-%.sap: %.bin AUTO.BAT 	
-	$(SAPFS) -c $@ 
-	$(SAPFS) -a $@ AUTO.BAT
-	BASE=$$(basename $< .bin | tr 'a-z' 'A-Z' | cut -c1-8); \
+
+$(C6809): $(TOP)/to8/c6809/c6809.c
+	$(CC) $< -O -o $@
+
+
+SAPFS=$(TOP)/to8/sapfs/sapfs$(EXESUF)
+%.sap: %.bin $(SAPFS) AUTO.BAT
+	@$(SAPFS) -c $@
+	@$(SAPFS) -a $@ AUTO.BAT
+	@BASE=$$(basename $< .bin | tr 'a-z' 'A-Z' | cut -c1-8); \
 	BIN="$$BASE.BIN"; mv $< .$$BIN; mv .$$BIN $$BIN;\
 	printf >AUTO.BAS "\\r\\n10 BANK2:CLEAR,&H71FF:LOADM\"%s\"" "$$BIN"; \
 	$(SAPFS) -a $@ AUTO.BAS; \
-	$(SAPFS) -a $@ $$BIN; \
+	$(SAPFS) -a $@ $$BIN
 	$(SAPFS) -t $@
-	@cat AUTO.BAS
+
+$(SAPFS): $(TOP)/to8/sapfs/
+	$(MAKE) -C $< --no-print-directory $*
+
+clean::
+	test ! -e $(C6809) || rm $(C6809) 
+	$(MAKE) -C $(TOP)/to8/sapfs --no-print-directory clean
 
 AUTO.BAT:
 	echo /wATABAACoggIkFVVE8uQkFTAAAA | base64 -d > $@
-	
-tst: cross-to8-dbg to8-tst.asm 
+
+tst: cross-to8-dbg to8-tst.asm
 	cat to8-tst.asm | tee /dev/clipboard
 
 .DEFAULT_GOAL := all

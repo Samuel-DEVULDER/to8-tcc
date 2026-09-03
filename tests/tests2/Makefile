@@ -229,5 +229,5 @@ MS-CC = cl
 $(sort $(GEN-ALWAYS) $(UPDATE)) : force
 force:
 
-clean :
+clean ::
 	rm -f fred.txt *.output *.o *.a *.exe *.dll *.so *.def $(GEN-ALWAYS)

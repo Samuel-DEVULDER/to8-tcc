@@ -482,7 +482,7 @@ tcc_s$(EXESUF): $($T_FILES)
 test-install: $(TCCDEFS_H)
 	@$(MAKE) -C tests TESTINSTALL=yes #_all
 
-clean:
+clean::
 	@rm -f tcc *-tcc tcc_p tcc_c tcc_s
 	@rm -f tags ETAGS *.o *.a *.so* *.out *.log lib*.def *.exe *.dll
 	@rm -f a.out *.dylib *_.h *.pod *.tcov
