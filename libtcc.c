@@ -54,9 +54,9 @@
 #include "riscv64-link.c"
 #include "riscv64-asm.c"
 #elif defined(TCC_TARGET_TO8)
-# include "to8-gen.c"
-# include "to8-stubs.c"
-# include "to8-link.c"
+# include "to8/to8-gen.c"
+# include "to8/to8-stubs.c"
+# include "to8/to8-link.c"
 #else
 #error unknown target
 #endif

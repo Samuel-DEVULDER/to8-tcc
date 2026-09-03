@@ -5,7 +5,7 @@ DEF-to8 = -DTCC_TARGET_TO8 -w # TO8 pseudo-architecture (single-register backend
 TCC_X += to8
 
 # TO8: pseudo single-register backend (like c67: gen only + shared core)
-to8_FILES = $(CORE_FILES) to8-gen.c to8-link.c to8-stubs.c
+to8_FILES = $(CORE_FILES) to8/to8-gen.c to8/to8-link.c to8/to8-stubs.c
 
 # to8 has no standard runtime support library
 LIBTCC1_X := $(filter-out to8,$(LIBTCC1_X))
@@ -21,28 +21,34 @@ help::
 cross-to8: to8-tcc$(EXESUF) ;
 
 # full reset + rebuild + smoke-test cycle - the actual point of this file
-cross-to8-dbg:
-	$(MAKE) --no-print-directory cross-to8 "CC=gcc -g" "CFLAGS=-O0"
-	gcc -g -o to8-tcc$(EXESUF) to8-tcc.o
-	
+cross-to8-dbg: ./tcc$(EXESUF)
+	$(MAKE) --no-print-directory cross-to8 "CC=./tcc$(EXESUF) -g" "CFLAGS=-O0"
+	./tcc$(EXESUF) -g -o to8-tcc$(EXESUF) to8-tcc.o -L.
+
+pull:
+	git pull --rebase
+	git fetch thomson
+	git subtree pull --prefix=to8/sapfs thomson master
+	git subtree pull --prefix=to8/c6809 thomson master
+	git push
 
 # produces self-contained asm file
-%.asm: %.c cross-to8 to8-vm.asm
+%.asm: %.c cross-to8 to8/to8-vm.asm
 	@echo "(main)main" >$@
-	@cat to8-vm.asm >>$@
+	@cat to8/to8-vm.asm >>$@
 	@echo "* start of code" >>$@
 	@echo "__start set *" >>$@
-	./to8-tcc $< -c -O -g -o .$*.o 
-	strings -n 2 .$*.o | \
+	./to8-tcc $< -c -O -g -o .tmp.o 
+	strings -n 2 .tmp.o | \
 	sed -n '/\* TO8 backend/,/\* --- end of asm ---/p' >> $@
 	@echo "	echo Code  size = &(*-__start) bytes (&((*-__start+1023)/1024) kb)" >>$@
 	@echo "__start set __start+0" >>$@
 	@echo "	echo Total size = &(*-init) bytes (&((*-init+1023)/1024) kb)" >>$@
 	@echo "	end	init" >>$@
-	@rm .$*.o
+	@rm .tmp.o
 
 C6809=/cygdrive/c/Users/Utilisateur/Desktop/Thomson/c6809-0.83/Thomson-Projects/c6809/c6809.exe
-%.bin: %.asm
+%.bin: %.asm $(C6808)
 	$(C6809) -oOP $< $@
 	#less codes.lst
 	
