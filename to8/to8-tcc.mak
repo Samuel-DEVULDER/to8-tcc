@@ -25,7 +25,7 @@ cross-to8-dbg:
 	$(MAKE) --no-print-directory cross-to8 "CC=$(CC) -g" "CFLAGS=-O0"
 	$(CC) -g -o to8-tcc$(EXESUF) to8-tcc.o -L.
 
-git-pull:
+git-pull-all:
 	git pull --rebase
 	git fetch thomson
 	mkdir c6809 sapfs
@@ -58,7 +58,6 @@ C6809=$(TOP)/to8/c6809/c6809$(EXESUF)
 
 $(C6809): $(TOP)/to8/c6809/c6809.c
 	$(CC) $< -O -o $@
-
 
 SAPFS=$(TOP)/to8/sapfs/sapfs$(EXESUF)
 %.sap: %.bin $(SAPFS) AUTO.BAT

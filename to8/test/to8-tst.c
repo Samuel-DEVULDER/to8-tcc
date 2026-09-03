@@ -146,8 +146,6 @@ int mandel3(int count, float cx,  float cy) {
 	return i;
 }
 
-
-#endif
 int add_simple(int a, int b) { return a + b; }
 int sub_simple(int a, int b) { return a - b; }
 int mul_simple(int a, int b) { return a * b; }
@@ -156,3 +154,11 @@ int mod_simple(int a, int b) { return a % b; }
 unsigned int udiv_simple(unsigned int a, unsigned int b) { return a / b; }
 unsigned int umod_simple(unsigned int a, unsigned int b) { return a % b; }
 
+#endif
+
+float f=1.0;
+double d=1.0;
+char s[4]="1234";
+int i = 0x01020304, *pi=&i;
+short sh = 0x0102;
+char ch =  0x01;

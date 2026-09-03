@@ -132,7 +132,9 @@ opMOV	ldd	,u
 	ldd	2,y
 	std	2,x
 	pulu	d,pc
-	
+
+opLD1m	pulu	x
+	bra	opLD1a	
 opLD1r	ldx	#R0
 	bra	opLD1a
 opLD1	pulu	d
@@ -146,19 +148,23 @@ opLDB	sex
 	sta	<R0
 	pulu	pc
 
-opLD1Ur ldx	#R0
-	bra	opLD1Ua
-opLD1U	pulu	d
+opLDu1m pulu	x
+	bra	opLDu1a	
+opLDu1r ldx	#R0
+	bra	opLDu1a
+opLDu1	pulu	d
 	leax	b,s
-opLD1Ua ldb	[2,x]	; TODO banking
+opLDu1a ldb	[2,x]	; TODO banking
 	SKIP2X
-opEXT1U ldb	<R0
+opEXTu1 ldb	<R0
 	clra
 	std	<R0+2
 	clrb
 	std	<R0
 	pulu	pc
 
+opLD2m	pulu	x
+	bra	opLD2a	
 opLD2r	ldx	#R0
 	bra	opLD2a
 opLD2	pulu	d
@@ -175,17 +181,21 @@ opLD2c	clrb
 	std	<R0
 	pulu	pc
 
-opLD2Ur ldx	#R0
-	bra	opLD2Ua
-opLD2U	pulu	d
+opLDu2m pulu	x
+	bra	opLDu2a	
+opLDu2r ldx	#R0
+	bra	opLDu2a
+opLDu2	pulu	d
 	leax	b,s
-opLD2Ua ldd	[2,x]	; TODO banking
+opLDu2a ldd	[2,x]	; TODO banking
 	std	<R0+2
-opEXT2U ldd	#0
+opEXTu2 ldd	#0
 	std	<R0
 	pulu	pc
 
-opLDUr	pulu	y
+opLD4m	pulu	x,y
+	bra	opLD4a	
+opLD4r	pulu	y
 	ldx	#R0
 	bra	opLD4a
 opLD4	pulu	d,y
@@ -198,22 +208,28 @@ opLD4a	ldx	2,x    ; TODO banking
 	jmp	,y
 
 * store
+opST1m	pulu	x,y
+	bra	opST1a
 opST1	pulu	d,y
 	leax	b,s
-	lda	<R0+3
+opST1a	lda	<R0+3
 	sta	[2,x]	; TODO banking
 	jmp	,y
 
+opST2m	pulu	x,y
+	bra	opST2a
 opST2	pulu	d,y
 	leax	b,s
-	ldd	<R0+2
+opST2a	ldd	<R0+2
 	std	[2,x]	; TODO banking
 	jmp	,y
 
+opST4m	pulu	x,y
+	bra	opST4a
 opST4	pulu	d,y
 	addb	#2
 	ldx	b,s
-	ldd	<R0
+opST4a	ldd	<R0
 	std	,x
 	ldd	<R0+2
 	std	2,x
@@ -252,18 +268,18 @@ opPUSHi pulu	d,x,y
 opRET	puls	d,u	; TODO banking
 	pulu	pc
 
-opSBRr	ldx	#R0
-	bra	opSBRa
-opSBR	pulu	d
+opCALLr	ldx	#R0
+	bra	opCALLa
+opCALL	pulu	d
 	leax	b,s
-opSBRa	clrb		; TODO banking
+opCALLa	clrb		; TODO banking
 	pshs	d,u
 	ldd	,x
 	ldx	2,x	; TODO banking
-	bra	opSBRb
-opSBRi	pulu	x	; TODO load B with curr BANK
+	bra	opCALLb
+opCALLm	pulu	x	; TODO load B with curr BANK
 	pshs	d,u
-opSBRb	leau	,x	; TODO banking
+opCALLb	leau	,x	; TODO banking
 	pulu	pc
 	
 * jump
@@ -420,7 +436,7 @@ opMUL2	pulu	d
 opMULi	leay	,u
 	leau	4,u
 	bra	opMUL0
-opMULT	pulu	d
+opMUL	pulu	d
 	leay	b,s
 opMUL0	ldd	<R0+2
 	std	<R1+2
@@ -638,166 +654,211 @@ opUMODa jsr	<opUDIVy
 	pulu	pc	  
 
 * shifts
-lslR0   macro
-        lslb
-        rola
-        rol     <R0+1
-        rol     <R0
-        endm
-opSHL   pulu    d,y
-        leax    b,s
-        LDB     3,x
-        SKIP2X
-opSHLi  pulu    d,y
-        stb     <R1
-        ldd     <R0+2
-        beq     opSHL_half
-        lsr     <R1
-        bcc     opSHL_2
-        lslR0
-opSHL_2 lsr     <R1
-        bcc     opSHL_4
-        lslR0
-        lslR0
-opSHL_4 lsr     <R1
-        bcc     opSHL_8
-        lslR0
-        lslR0
-        lslR0
-        lslR0
-opSHL_8 std     <R0+2
-        lsr     <R1
-        bcc     opSHL_16
-        ldd     <R0+1
-        std     <R0
-        lda     <R0+3
-        clrb
-        std     <R0+2
+lslR0	macro
+	lslb
+	rola
+	rol	<R0+1
+	rol	<R0
+	endm
+opSHL	pulu	d,y
+	leax	b,s
+	LDB	3,x
+	SKIP2X
+opSHLi	pulu	d,y
+	stb	<R1
+	ldd	<R0+2
+	beq	opSHL_half
+	lsr	<R1
+	bcc	opSHL_2
+	lslR0
+opSHL_2 lsr	<R1
+	bcc	opSHL_4
+	lslR0
+	lslR0
+opSHL_4 lsr	<R1
+	bcc	opSHL_8
+	lslR0
+	lslR0
+	lslR0
+	lslR0
+opSHL_8 std	<R0+2
+	lsr	<R1
+	bcc	opSHL_16
+	ldd	<R0+1
+	std	<R0
+	lda	<R0+3
+	clrb
+	std	<R0+2
 opSHL_16
-        lsr     <R1
-        bcc     opSHL_32
-        std     <R0        
-        ldd     #0
-        std     <R0+2
+	lsr	<R1
+	bcc	opSHL_32
+	std	<R0	   
+	ldd	#0
+	std	<R0+2
 opSHL_32
-        jmp     ,y
+	jmp	,y
 opSHL_half
-        ldd     <R0
-        lsr     <R1
-        bcc     opSHL_half2
-        lslb
-        rola
+	ldd	<R0
+	lsr	<R1
+	bcc	opSHL_half2
+	lslb
+	rola
 opSHL_half2
-        lsr     <R1
-        bcc     opSHL_half4
-        lslb
-        rola
-        lslb
-        rola
+	lsr	<R1
+	bcc	opSHL_half4
+	lslb
+	rola
+	lslb
+	rola
 opSHL_half4
-        lsr     <R1
-        bcc     opSHL_half8
-        lslb
-        rola
-        lslb
-        rola
-        lslb
-        rola
-        lslb
-        rola
+	lsr	<R1
+	bcc	opSHL_half8
+	lslb
+	rola
+	lslb
+	rola
+	lslb
+	rola
+	lslb
+	rola
 opSHL_half8
-        lsr     <R1
-        bcc     opSHL_half16
-        tfr     b,a
-        clrb
+	lsr	<R1
+	bcc	opSHL_half16
+	tfr	b,a
+	clrb
 opSHL_half16
-        lsr     <R1
-        bcc     opSHL_half32
-        ldd     #0
+	lsr	<R1
+	bcc	opSHL_half32
+	ldd	#0
 opSHL_half32
-        std     <R0
-        jmp     ,y
-lsrR0   macro
-        lsra
-        rorb
-        ror     <R0+2
-        ror     <R0+3
-        endm
-opSHR   pulu    d,y
-        leax    b,s
-        LDB     3,x
-        SKIP2X
-opSHRi  pulu    d,y
-        stb     <R1
-        ldd     <R0
-        beq     opSHR_half
-        lsr     <R1
-        bcc     opSHR_2
-        lsrR0
-opSHR_2 lsr     <R1
-        bcc     opSHR_4
-        lsrR0
-        lsrR0
-opSHR_4 lsr     <R1
-        bcc     opSHR_8
-        lsrR0
-        lsrR0
-        lsrR0
-        lsrR0
-opSHR_8 std     <R0
-        lsr     <R1
-        bcc     opSHR_16
-        ldd     <R0+1
-        std     <R0+2
-        ldb     <R0
-        clra
-        std     <R0
+	std	<R0
+	jmp	,y
+lsrR0	macro
+	lsra
+	rorb
+	ror	<R0+2
+	ror	<R0+3
+	endm
+opSHR	pulu	d,y
+	leax	b,s
+	LDB	3,x
+	SKIP2X
+opSHRi	pulu	d,y
+	stb	<R1
+	ldd	<R0
+	beq	opSHR_half
+	lsr	<R1
+	bcc	opSHR_2
+	lsrR0
+opSHR_2 lsr	<R1
+	bcc	opSHR_4
+	lsrR0
+	lsrR0
+opSHR_4 lsr	<R1
+	bcc	opSHR_8
+	lsrR0
+	lsrR0
+	lsrR0
+	lsrR0
+opSHR_8 std	<R0
+	lsr	<R1
+	bcc	opSHR_16
+	ldd	<R0+1
+	std	<R0+2
+	ldb	<R0
+	clra
+	std	<R0
 opSHR_16
-        lsr     <R1
-        bcc     opSHR_32
-        std     <R0+2
-opSHR_0 ldd     #0
-        std     <R0
+	lsr	<R1
+	bcc	opSHR_32
+	std	<R0+2
+opSHR_0 ldd	#0
+	std	<R0
 opSHR_32
-        jmp     ,y
+	jmp	,y
 opSHR_half
-        ldd     <R0+2
-        lsr     <R1
-        bcc     opSHR_half2
-        lsra
-        rorb
+	ldd	<R0+2
+	lsr	<R1
+	bcc	opSHR_half2
+	lsra
+	rorb
 opSHR_half2
-        lsr     <R1
-        bcc     opSHR_half4
-        lsra
-        rorb
-        lsra
-        rorb
+	lsr	<R1
+	bcc	opSHR_half4
+	lsra
+	rorb
+	lsra
+	rorb
 opSHR_half4
-        lsr     <R1
-        bcc     opSHR_half8
-        lsra
-        rorb
-        lsra
-        rorb
-        lsra
-        rorb
-        lsra
-        rorb
+	lsr	<R1
+	bcc	opSHR_half8
+	lsra
+	rorb
+	lsra
+	rorb
+	lsra
+	rorb
+	lsra
+	rorb
 opSHR_half8
-        lsr     <R1
-        bcc     opSHR_half16
-        tfr     a,b
-        clra
+	lsr	<R1
+	bcc	opSHR_half16
+	tfr	a,b
+	clra
 opSHR_half16
-        lsr     <R1
-        bcc     opSHR_half32
-        ldd     #0
+	lsr	<R1
+	bcc	opSHR_half32
+	ldd	#0
 opSHR_half32
-        std     <R0+2
-        jmp     ,y
+	std	<R0+2
+	jmp	,y
 
-        echo    VM    size = &(*-R0) bytes
+asrR0	macro
+	asra
+	rorb
+	ror	<R0+2
+	ror	<R0+3
+	endm
+opSAR	pulu	d,y
+	leax	b,s
+	LDB	3,x
+	SKIP2X
+opSARi	pulu	d,y
+	stb	<R1
+	ldd	<R0
+	beq	opSHR_half
+	lsr	<R1
+	bcc	opSAR_2
+	asrR0
+opSAR_2 lsr	<R1
+	bcc	opSAR_4
+	asrR0
+	asrR0
+opSAR_4 lsr	<R1
+	bcc	opSAR_8
+	asrR0
+	asrR0
+	asrR0
+	asrR0
+opSAR_8 std	<R0
+	lsr	<R1
+	bcc	opSAR_16
+	ldd	<R0+1
+	std	<R0+2
+	ldb	<R0
+	sex
+	std	<R0
+opSAR_16
+	lsr	<R1
+	bcc	opSAR_32
+	std	<R0+2
+	lbpl	opSHR_0
+	ldd	#-1
+	std	<R0
+opSAR_32
+	jmp	,y
+
+	echo	VM    size = &(*-R0) bytes
        
 crt0	pshs	d,x,y,u,dp,cc
 	ldd	#R0&$FF00
@@ -886,7 +947,7 @@ opLDCLK pshs	cc
 	stx	<R0+2
 	pulu	pc
 
-        echo    CRT0  size = &(*-crt0) bytes
+	echo	CRT0  size = &(*-crt0) bytes
 	
 *************************************************************************
 * macros
@@ -911,30 +972,45 @@ LD1	macro
 LD1r	macro
 	fdb	opLD1r
 	endm	    
-LD1U	macro
-	fdb	opLD1U,\0
+LD1m	macro
+	fdb	opLD1m,\1
 	endm
-LD1Ur	macro
-	fdb	opLD1Ur
+LDu1	macro
+	fdb	opLDu1,\0
+	endm
+LDu1r	macro
+	fdb	opLDu1r
 	endm	    
+LDu1m	macro
+	fdb	opLDu1m,\1
+	endm
 LD2	macro
 	fdb	opLD2,\0
 	endm
 LD2r	macro
 	fdb	opLD2r
 	endm	    
-LD2U	macro
-	fdb	opLD2U,\0
+LD2m	macro
+	fdb	opLD2m,\1
 	endm
-LD2Ur	macro
-	fdb	opLD2Ur
+LDu2	macro
+	fdb	opLDu2,\0
+	endm
+LDu2r	macro
+	fdb	opLDu2r
 	endm	    
+LDu2m	macro
+	fdb	opLDu2m,\1
+	endm
 LD4	macro
 	fdb	opLD4,\0
 	endm
 LD4r	macro
 	fdb	opLD4r
 	endm	    
+LD4m	macro
+	fdb	opLD4m,\1
+	endm
 
 * store
 ST	macro
@@ -948,6 +1024,15 @@ ST2	macro
 	endm
 ST4	macro
 	fdb	opST4,\0
+	endm
+ST1m	macro
+	fdb	opST1m,\0
+	endm
+ST2m	macro
+	fdb	opST2m,\0
+	endm
+ST4m	macro
+	fdb	opST4m,\0
 	endm
 
 * stack
@@ -968,14 +1053,14 @@ PUSHr	macro
 RET	macro
 	fdb	opRET
 	endm	    
-SBR	macro	     
-	fdb	opSBR,\0
+CALL_	macro	     
+	fdb	opCALL,\0
 	endm
-SBRi	macro	     
-	fdb	opSBRi,\0
+CALLm	macro	     
+	fdb	opCALLm,\1
 	endm
-SBRr	macro	     
-	fdb	opSBRr
+CALLr	macro	     
+	fdb	opCALLr
 	endm
 
 * bool
@@ -1038,7 +1123,7 @@ OR	macro
 XOR	macro
 	fdb	opEOR,\0
 	endm
-MULT	macro
+MUL_	macro
 	fdb	opMUL,\0
 	endm
 DIV	macro
@@ -1053,15 +1138,15 @@ UDIV	macro
 UMOD	macro
 	fdb	opUMOD,\0
 	endm
-SHL     macro
-        FDB     opSHL,\0
-        endm
-SHR     macro
-        FDB     opSHR,\0
-        endm
-SAR     macro
-        FDB     opSAR,\0
-        endm
+SHL	macro
+	FDB	opSHL,\0
+	endm
+SHR	macro
+	FDB	opSHR,\0
+	endm
+SAR	macro
+	FDB	opSAR,\0
+	endm
 CMP	macro
 	fdb	opCMP,\0
 	endm
@@ -1099,15 +1184,15 @@ UDIVi	macro
 UMODi	macro
 	fdb	opUMODi,\0,\1
 	endm
-SHLi    macro
-        FDB     opSHLi,\1
-        endm
-SHRi    macro
-        FDB     opSHRi,\1
-        endm
-SARi    macro
-        FDB     opSARi,\0
-        endm
+SHLi	macro
+	FDB	opSHLi,\1
+	endm
+SHRi	macro
+	FDB	opSHRi,\1
+	endm
+SARi	macro
+	FDB	opSARi,\1
+	endm
 CMPi	macro
 	fdb	opCMPi,\0,\1
 	endm
@@ -1159,11 +1244,11 @@ EXT1	macro
 EXT2	macro
 	fdb	opEXT2
 	endm	    
-EXT1U	macro
-	fdb	opEXT1U
+EXTu1	macro
+	fdb	opEXTu1
 	endm
-EXT2U	macro
-	fdb	opEXT2U
+EXTu2	macro
+	fdb	opEXTu2
 	endm	       
 	
 * misc
