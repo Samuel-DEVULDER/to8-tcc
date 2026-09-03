@@ -28,8 +28,13 @@ cross-to8-dbg:
 pull:
 	git pull --rebase
 	git fetch thomson
-	git subtree pull --prefix=to8/sapfs thomson master
-	git subtree pull --prefix=to8/c6809 thomson master
+	mkdir c6809 sapfs
+	git subtree split --prefix=c6809 -b split-c6809 thomson/main
+	git subtree split --prefix=sapfs -b split-sapfs thomson/main
+	rmdir c6809 sapfs
+	git subtree merge --prefix=to8/c6809 split-c6809
+	git subtree merge --prefix=to8/sapfs split-sapfs
+	git branch -D split-c6809 split-sapfs
 	git push
 
 # produces self-contained asm file
