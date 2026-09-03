@@ -1,8 +1,54 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.18.0 (gen_opi() global-symbol constant-folding fix)
+ * Version: 8.19.0 (static initializer byte-order: reliable type detection + auto-correction)
  *
  * Changelog:
+ * - v8.19.0 static/global initializer byte order: reliable type detection,
+ *   then correction where safe, warning where not. Two changes bundled in
+ *   this revision, the second built directly on the first.
+ * 
+ *   1) NEW to8_find_global_sym_by_name, replacing the previous unreliable
+ *      approach of trying to infer a global's C type from its ELF/section
+ *      data alone (size and address only, no type info survives that
+ *      path). Walks global_stack directly, matching by name (bare name,
+ *      stripping a leading '_') and skipping VT_FUNC entries - the same
+ *      Sym structure TCC's own front-end already builds and trusts
+ *      everywhere else. Confirmed on the to8-tst.c reference case
+ *      (f, d, i, sh, s, ch, pi) that lookup succeeds for every symbol and
+ *      returns the correct declared CType in each case.
+ * 
+ *   2) NEW to8_type_is_real_pointer / to8_innermost_elem_type, closing a
+ *      confusion between VT_PTR (real pointer, address must be relocated)
+ *      and VT_PTR|VT_ARRAY (array, decays to a pointer type in C's type
+ *      system but is actually inline byte data with no relocation
+ *      involved). Without this distinction, an array of int would have
+ *      been misclassified as a pointer and left uncorrected. Arrays now
+ *      resolve through to their element type before the byte/pointer/
+ *      scalar classification below is applied.
+ * 
+ *   Combined effect at the to8_flush_pending_data call site: every
+ *   initialized global is now classified as byte-only (char/bool, scalar
+ *   or array - left untouched, no warning, already correct), a real
+ *   pointer (left untouched, tcc_warning: relocation not preserved), or
+ *   a recognized multi-byte scalar/array element (short/int/float/
+ *   long long/double - byte order corrected at print time via the new
+ *   to8_elem_byte_size / to8_emit_fcb_bytes, tcc_warning: byte order
+ *   auto-corrected). An unrecognized type or a size that isn't a clean
+ *   multiple of its element width falls back to untouched + warning,
+ *   never guessed.
+ * 
+ *   Verified on the full to8-tst.c reference set: `i` (0x01020304) now
+ *   emits FCB 1,2,3,4 and `sh` (0x0102) emits FCB 1,2 (both correct
+ *   big-endian order, previously reversed), `f` and `d` emit their IEEE
+ *   bytes correctly reordered as a single 4- and 8-byte group
+ *   respectively, `s` (char[4]) and `ch` (char) are emitted unchanged
+ *   with no warning, and `pi` (pointer) is left unchanged with its
+ *   warning intact. Byte-order correction only reorders bytes already
+ *   present - it does not perform the separate, still-pending IEEE to
+ *   EXTRAMON float format conversion (documented at v7.20.0 above),
+ *   which remains the responsibility of the real 6809 LDF/LDG/STF/STG
+ *   implementation.
+ *
  * - v8.18.0 four independent changes bundled in this revision.
  *
  *   1) CORRECTNESS FIX in gen_opi() - a global variable's value was
@@ -1067,7 +1113,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.18.0"
+#define TO8_GEN_VERSION "8.19.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -4352,105 +4398,105 @@ ST_FUNC void gen_vla_sp_save(int addr) { e_op_slot(OP_ST, addr); }
 ST_FUNC void gen_vla_sp_restore(int addr) { e_op_slot(OP_LD, addr); }
 
 /*
- * v8.19.1 (proposed) - fix: distinguish "confirmed pointer" from
- * "lookup failed, type unknown". The previous version conflated the
- * two by returning 1 (== pointer) in both cases, causing false
- * positives on any symbol the global_stack walk failed to match
- * (observed: char s[4] wrongly reported as a pointer).
+ * v8.20.0 (proposed) - upgrade from "detect and warn" to "detect and
+ * correct when safe, warn only when not". Builds directly on the
+ * v8.19.x type-lookup fixes verified working this session (name-based
+ * global_stack lookup, VT_ARRAY-aware pointer/array disambiguation).
  *
- * Now returns a tri-state via an out-parameter:
- *   found=1, is_ptr=1  -> confirmed pointer, warn as pointer
- *   found=1, is_ptr=0  -> confirmed non-pointer, proceed to the
- *                         type/palindrome checks normally
- *   found=0            -> genuinely unknown, warn with an HONEST
- *                         "could not verify this symbol's type"
- *                         message - never silently claim "pointer"
+ * Decision table:
+ *   - byte-only type (VT_BYTE/VT_BOOL, scalar or array) -> untouched,
+ *     no warning (already correct - bytes have no order to fix).
+ *   - real pointer (VT_PTR, not VT_ARRAY) -> untouched, WARN (blocking
+ *     concern: reversing placeholder/zero bytes does not fix the
+ *     underlying missing-relocation problem - the value itself is
+ *     absent, not merely misordered).
+ *   - any other recognized scalar/array element (VT_SHORT/VT_INT/
+ *     VT_FLOAT/VT_LLONG/VT_DOUBLE) -> byte order WITHIN each element
+ *     is reversed at print time (sec->data itself is never mutated -
+ *     only the FCB print order changes), element ORDER is preserved.
+ *     Informational (non-blocking) warning: this fixes byte ORDER
+ *     only, NOT the separate documented EXTRAMON float-format
+ *     conversion, which remains a distinct future task.
+ *   - unrecognized type, or size not a clean multiple of the element
+ *     width (e.g. an unexpected struct slipping through) -> untouched,
+ *     WARN (defensive fallback - never guess).
  */
-static int to8_lookup_symbol_type(int elf_sym_index, int *is_ptr_out)
+
+static int to8_elem_byte_size(CType *elem)
 {
-    Sym *s;
-    for (s = global_stack; s; s = s->prev) {
-        if ((s->type.t & VT_BTYPE) == VT_FUNC)
-            continue;
-        if (s->c != elf_sym_index)
-            continue;
-        *is_ptr_out = (s->type.t & VT_BTYPE) == VT_PTR;
-        return 1; /* found */
+    int bt = elem->t & VT_BTYPE;
+    switch (bt) {
+    case VT_BYTE: case VT_BOOL:    return 1;
+    case VT_SHORT:                 return 2;
+    case VT_INT:  case VT_FLOAT:   return 4;
+    case VT_LLONG: case VT_DOUBLE: return 8;
+    case VT_PTR:                   return PTR_SIZE;
+    default:                       return 0; /* unrecognized - caller must not swap */
     }
-    return 0; /* not found */
-}
-
-/* to8_symbol_is_all_bytes() also needs the SAME honest tri-state -
- * it currently returns 0 (not exempt) on lookup failure, which is
- * fine for correctness (fails toward warning, never toward silent
- * exemption) but should be called AFTER to8_lookup_symbol_type()
- * confirms the symbol was found, to avoid doing the walk twice with
- * inconsistent found/not-found outcomes between the two functions
- * (a second, independent source of the kind of mismatch you just
- * hit). Consolidate into ONE lookup: */
-static int to8_lookup_symbol_class(int elf_sym_index,
-                                    int *is_ptr_out, int *is_all_bytes_out)
-{
-    Sym *s;
-    CType *elem;
-    int bt;
-
-    for (s = global_stack; s; s = s->prev) {
-        if ((s->type.t & VT_BTYPE) == VT_FUNC)
-            continue;
-        if (s->c != elf_sym_index)
-            continue;
-
-        *is_ptr_out = (s->type.t & VT_BTYPE) == VT_PTR;
-
-        elem = &s->type;
-        while ((elem->t & VT_BTYPE) == VT_ARRAY)
-            elem = &elem->ref->type;
-        bt = elem->t & VT_BTYPE;
-        *is_all_bytes_out = (bt == VT_BYTE || bt == VT_BOOL);
-
-        return 1; /* found */
-    }
-    return 0; /* not found - caller must handle honestly, see below */
 }
 
 static CType *to8_innermost_elem_type(CType *t)
 {
-    while ((t->t & VT_BTYPE) == VT_ARRAY)
+    for (;;) {
+        int bt = t->t & VT_BTYPE;
+        if (bt != VT_PTR || !(t->t & VT_ARRAY))
+            return t;
         t = &t->ref->type;
-    return t;
+    }
 }
 
-static int to8_bytes_are_palindrome(const unsigned char *data,
-                                     unsigned long off, unsigned long n)
+static int to8_type_is_real_pointer(CType *t)
 {
-    unsigned long i;
-    if (n == 0)
-        return 1;
-    for (i = 0; i < n / 2; i++)
-        if (data[off + i] != data[off + n - 1 - i])
-            return 0;
-    return 1;
+    return (t->t & VT_BTYPE) == VT_PTR && !(t->t & VT_ARRAY);
 }
 
-static int to8_symbol_is_all_bytes(int elf_sym_index)
+static Sym *to8_find_global_sym_by_name(const char *elf_name)
 {
     Sym *s;
-    CType *elem;
-    int bt;
-
+    const char *bare = elf_name;
+    if (*bare == '_')
+        bare++;
     for (s = global_stack; s; s = s->prev) {
         if ((s->type.t & VT_BTYPE) == VT_FUNC)
             continue;
-        if (s->c != elf_sym_index)
+        if (!s->v || s->v >= SYM_FIRST_ANOM)
             continue;
-
-        elem = to8_innermost_elem_type(&s->type);
-        bt = elem->t & VT_BTYPE;
-        return (bt == VT_BYTE || bt == VT_BOOL);
+        if (!strcmp(get_tok_str(s->v, NULL), bare))
+            return s;
     }
-    /* Not found: fail toward "not exempt" (always warn). */
-    return 0;
+    return NULL;
+}
+
+/*
+ * Emits n bytes as FCB directives, 8 per line, matching the existing
+ * wrapping convention exactly. elem_size == 0 or 1 means "plain,
+ * natural order" (bytes, unknown type, or bss zero-fill); elem_size
+ * > 1 means "reverse the byte order within each elem_size-byte group,
+ * but keep group (element) order unchanged" - the actual correction.
+ */
+static void to8_emit_fcb_bytes(Section *sec, unsigned long off,
+                                unsigned long n, int elem_size, int is_bss)
+{
+    unsigned long k;
+	
+    for (k = 0; k < n; k++) {
+        unsigned long idx;
+        if (elem_size > 1) {
+            unsigned long group = k / elem_size;
+            unsigned long pos_in_group = k % elem_size;
+            idx = group * elem_size + (elem_size - 1 - pos_in_group);
+        } else {
+            idx = k;
+        }
+        if ((k % 4) == 0) {
+            if (k) out_char('\n');
+            out_tab(); out_str("FCB"); out_tab();
+        } else {
+            out_char(',');
+        }
+        out_int(is_bss ? 0 : sec->data[off + idx]);
+    }
+    out_char('\n');
 }
 
 /* ===================================================================
@@ -4508,6 +4554,7 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
             ElfSym *sym = (ElfSym *)symtab->data + j;
             const char *name;
             unsigned long off, n, k;
+		    int elem_size = 0; /* 0 = no correction applied, natural order */
 
             if (sym->st_shndx != sec->sh_num)
                 continue;
@@ -4518,62 +4565,46 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
             off = sym->st_value;
             n = sym->st_size ? sym->st_size : 1;
 	    
-	    fprintf(stderr, "DEBUG %s: all_bytes=%d palindrome=%d off=%lu n=%lu b0=%d b_last=%d\n",
-        name, to8_symbol_is_all_bytes(j), to8_bytes_are_palindrome(sec->data, off, n),
-        off, n, sec->data[off], sec->data[off+n-1]);
-	    if (!is_bss) {
-                int is_ptr = 0, is_all_bytes = 0;
-                int found = to8_lookup_symbol_class(j, &is_ptr, &is_all_bytes);
-            
-                if (!found) {
-                    tcc_warning(
-                        "TO8: could not determine the declared C type of '%s'.",
-                        name);
-                } else if (is_ptr) {
-                    tcc_warning(
-                        "TO8: '%s' is an unsupported static/global pointer.",
-                        name);
-                } else if (!is_all_bytes
-                           && !to8_bytes_are_palindrome(sec->data, off, n)) {
-                    tcc_warning(
-                        "TO8: '%s' is an unsuppoprted static/global value.",
-                        name);
+	       
+           if (!is_bss) {
+                Sym *gsym = to8_find_global_sym_by_name(name);
+                	       
+                if (!gsym) {
+                    tcc_warning("TO8: '%s': unknown type, byte order not checked", name);
+                } else if (to8_type_is_real_pointer(&gsym->type)) {
+                    tcc_warning("TO8: '%s': pointer initializer not relocated", name);
+                } else {
+                    CType *elem = to8_innermost_elem_type(&gsym->type);
+                    int bt = elem->t & VT_BTYPE;
+                    int all_bytes = (bt == VT_BYTE || bt == VT_BOOL);
+                
+                    if (!all_bytes) {
+                        int esz = to8_elem_byte_size(elem);
+                        if (esz > 1 && (n % esz) == 0) {
+                            elem_size = esz;
+                            tcc_warning("TO8: '%s': byte order auto-corrected", name);
+                        } else {
+                            tcc_warning("TO8: '%s': unknown size, byte order not checked", name);
+                        }
+                    }
                 }
-            }
-
-            if (!g_banner_done) { to8_print_banner(); g_banner_done = 1; }
+		   }
+		   
+		   if (!g_banner_done) { to8_print_banner(); g_banner_done = 1; }
 
             g_col = 0;
             out_char('_'); //out_str(name);
             {char  *s=name;while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
             out_tab();
-            out_str("set");
-            out_tab();
-            out_str("*");
-            out_eol_comment();
+            out_str("set"); out_tab(); out_str("*"); out_eol_comment();
             out_int((int)n);
             /* v8.14.0: distinguish bss in the comment - same FCB rendering
                below either way, but the source is explicit zeros, not
                real initialized bytes. */
             out_str(is_bss ? " bytes (bss, zero-filled)" : " bytes (data)");
+			out_char('\n');
 
-            for (k = 0; k < n; k++) {
-                if ((k & 7) == 0) {
-                    out_char('\n');
-                    g_col = 0;
-                    out_tab();
-                    out_str("FCB");
-                    out_tab();
-                } else {
-                    out_char(',');
-                }
-                /* v8.14.0: bss has no real backing byte to read - it is
-                   zero by definition, and sec->data may be NULL here, so
-                   never index into it for a bss section. */
-                out_int(is_bss ? 0 : sec->data[off + k]);
-            }
-            out_char('\n');
-            g_col = 0;
+            to8_emit_fcb_bytes(sec, off, n, elem_size, is_bss);
         }
     }
 

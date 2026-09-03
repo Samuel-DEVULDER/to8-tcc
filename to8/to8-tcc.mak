@@ -42,7 +42,7 @@ git-pull-all:
 	@cat to8/to8-vm.asm >>$@
 	@echo "* start of code" >>$@
 	@echo "__start set *" >>$@
-	./to8-tcc $< -c -O -g -o '.$(shell basename "$*").o'
+	./to8-tcc $< -c -O -g -o .$(shell basename "$*").o
 	@strings -n 2 '.$(shell basename "$*").o' | \
 	sed -n '/\* TO8 backend/,/\* --- end of asm ---/p' >> $@
 	@echo "	echo Code  size = &(*-__start) bytes (&((*-__start+1023)/1024) kb)" >>$@
@@ -80,6 +80,6 @@ AUTO.BAT:
 	echo /wATABAACoggIkFVVE8uQkFTAAAA | base64 -d > $@
 
 to8-tst: cross-to8-dbg to8/test/to8-tst.asm
-	cat to8/test/to8-tst.asm | tee /dev/clipboard
+	#cat to8/test/to8-tst.asm | tee /dev/clipboard
 
 .DEFAULT_GOAL := all
