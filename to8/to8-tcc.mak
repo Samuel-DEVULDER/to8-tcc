@@ -23,7 +23,6 @@ cross-to8: to8-tcc$(EXESUF) ;
 # full reset + rebuild + smoke-test cycle - the actual point of this file
 cross-to8-dbg:
 	$(MAKE) --no-print-directory cross-to8 "CC=$(CC) -g" "CFLAGS=-O0"
-	$(CC) -g -o to8-tcc$(EXESUF) to8-tcc.o -L.
 
 git-pull-all:
 	git pull --rebase
@@ -80,7 +79,7 @@ clean::
 AUTO.BAT:
 	echo /wATABAACoggIkFVVE8uQkFTAAAA | base64 -d > $@
 
-tst: cross-to8-dbg to8-tst.asm
-	cat to8-tst.asm | tee /dev/clipboard
+to8-tst: cross-to8-dbg to8/test/to8-tst.asm
+	cat to8/test/to8-tst.asm | tee /dev/clipboard
 
 .DEFAULT_GOAL := all

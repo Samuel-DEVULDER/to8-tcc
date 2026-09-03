@@ -1,6 +1,6 @@
 * to8-vm.asm kind of crt0.o
 *
-* Lightweigh. No banking system here.
+* Lightweight. No banking system here.
 
 	org	$9000
 
