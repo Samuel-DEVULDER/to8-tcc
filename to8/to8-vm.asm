@@ -1002,8 +1002,8 @@ opFMOV  ldx     #FACSGN
         stb     ARGSGN-FACSGN,X
         pulu    pc
 
-opLDG4m	pulu	x,y
-	bra	opLDGa
+opLDG4m	pulu	y
+		bra		opLDGa
 opLDGi  leay    ,u
         leau    4,u
         bra     opLDGa
@@ -1012,21 +1012,22 @@ opLDG   pulu    d
 opLDGa  ldx     #ARGEXP
         bra     opLDFb
 
-opLDF4m	pulu	x,y
-	bra	opLDFa	
+opLDF4m	pulu	y
+		bra		opLDFa	
 opLDFi  leay    ,u
         leau    4,u
         bra     opLDFa
 opLDF4  pulu    d
-        leay    b,s        
+        leay    b,s     		
 opLDFa  ldx     #FACEXP
+
 opLDFb  ldd     ,y
         sta     FACSGN-FACEXP,x
         lslb
         rola
-        beq     opLDf00
+        beq     opLDFz
         adda    #2              ; bias 127    
-        beq     opLDfFF
+        beq     opLDFw
         sta     FACEXP-FACEXP,x
         coma
         rorb            ; set b7
@@ -1035,24 +1036,52 @@ opLDFb  ldd     ,y
         std     1+FACHO-FACEXP,x
         pulu    pc
 
-opLDfFF ldd     #$FFFF          ; maxfloat
-        bra     opLDf01
+opLDFw	ldd     #$FFFF          ; maxfloat
+		std		FACEXP-FACEXP,x
+		std		2+FACEXP-FACEXP,x
+		pulu	pc
 
-opLDf00 ldd     #0              ; zero
-        stb     FACSGN-FACEXP,x
-opLDf01 std     FACEXP-FACEXP,x
-        std     2+FACEXP-FACEXP,x
+		clra					; zero
+opLDFz  sta		FACHO-FACEXP,x
+        pulu	pc
+
+opSTF4m pulu    y
+        bra     opSTF4a
+opSTF4  pulu    d
+        leay    b,s
+opSTF4a ldx     #FACEXP
+        ldd     FACEXP-FACEXP,x
+		tstb
+        beq     opSTFz+1          ; FACHO==0 -> IEEE +0.0 (the ONLY reliable test)
+        suba    #2
+        bcs     opSTFz            ; FACEXP was 1 -> underflow, flush to zero
+        lslb                      ; B<<=1, drop explicit leading bit into carry (discard)
+        lsra                      ; A>>=1, carry_out = ieee exponent's bit0
+        rorb                      ; carry_in -> B bit7 : B = byte1
+        std     ,y
+		lda     FACSGN-FACEXP,x
+        anda    #%10000000		  ; isolate sign bit
+        ora     ,y                ; A |= sign (A's bit7 is 0 after lsra, safe)
+        sta     ,y                ; byte0 done
+        ldd     1+FACHO-FACEXP,x
+        std     2,y               ; bytes 2,3: straight copy
+        pulu    pc
+
+opSTFz  clrb
+        clra
+        std     ,y
+        std     2,y
         pulu    pc
         
-opLDG8m	pulu	x,y
-	bra	opLDGb
+opLDG8m	pulu	y
+		bra		opLDGb
 opLDG8  pulu    d
         leay    b,s        
 opLDGb  ldx     #ARGEXP
         bra     opLDFd
 
-opLDF8m	pulu	x,y
-	bra	opLDFc
+opLDF8m	pulu	y
+		bra		opLDFc
 opLDF8  pulu    d
         leay    b,s        
 opLDFc  ldx     #FACEXP
@@ -1061,41 +1090,98 @@ opLDFd  ldd     ,y
         anda    #%01111111
         andb    #%11110000
         addd    #0
-        beq     opLDf00
+        beq     opLDFz
         bsr     lsrD4
         subd    #1023-129       ;  bias 127
-        ble     opLDf00
+        ble     opLDFz-1
         tsta
-        bne     opLDfFF
+        bne     opLDFw
         stb     FACEXP-FACEXP,x
         ldd     1,y
-        ora     #%11110000
-        lslb
-        rola
-        lslb
-        rola
-        lslb
-        rola
-        std     FACHO-FACEXP,x
-        ldd     3,y
-        bsr     lsrD4
+        ora     #%11110000		
+		bsr		lslD3			
+        std     FACHO-FACEXP,x	; 1mmm mmmm mmmm m000
+		clra
+        ldb     2,y
+        bsr     lslD3
         ora     1+FACHO-FACEXP,x
         std     1+FACHO-FACEXP,x
-        ldd     4,y
-        bsr     lsrD4
+        ldd     3,y
+        bsr     lslD3
         ora     2+FACHO-FACEXP,x
-        std     2+FACHO-FACEXP,x
+        sta     2+FACHO-FACEXP,x
+		ldd		4,y
+		bsr		lslD3
+		sta		3+FACHO-FACEXP,x
+        pulu    pc
+
+lslD4	lslb
+		rola
+lslD3   lslb
+        rola
+        lslb
+        rola
+        lslb
+        rola
+		rts
+
+opSTF8m pulu    y
+        bra     opSTF8a
+opSTF8  pulu    d
+        leay    b,s
+opSTF8a ldx     #FACEXP
+		clra
+        ldb     FACHO-FACEXP,x
+        bne     opSTF8b
+        std     ,y         		; FACHO==0 -> IEEE double +0.0
+        std     2,y
+        std     4,y
+        std     6,y
+        pulu    pc
+opSTF8b	ldb     FACEXP-FACEXP,x
+        addd    #1023-129       ; D = ieee_biased_exp (11 bits, max 1149, safe)
+        bsr     lslD4           ; A=exp[10:4], B=exp[3:0]000
+		std		,y
+		lda		#%10000000
+		anda    FACSGN-FACEXP,x	; isolate sign
+		ora		,y				; inject
+		sta		,y				; store
+		
+		ldd		#0
+		std		6,y
+		
+		lda		3+FACHO-FACEXP,x
+		bsr		lsrD3
+		std		4,y
+		
+		ldd		2+FACHO-FACEXP,x
+		bsr		lsrD3
+		orb		4,y
+		std		3,y
+		
+		ldd		1+FACHO-FACEXP,x
+		bsr		lsrD3
+		orb		3,y
+		std		2,y
+		
+		ldd		FACHO-FACEXP,x
+        anda    #%01111111      ; A = FACHO0's 7 real mantissa bits
+		bsr		lsrD3
+		orb		2,y
+		ora		1,y
+		std		1,y
         pulu    pc
 
 lsrD4   lsra
         rorb
-        lsra
+lsrD3   lsra
         rorb
         lsra
         rorb
         lsra
         rorb
         rts
+	
         endc
 
 	echo	CRT0  size = &(*-crt0) bytes
@@ -1120,47 +1206,48 @@ LD	macro
 LD1	macro
 	fdb	opLD1,\0
 	endm
-LD1r	macro
-	fdb	opLD1r
-	endm	    
-LD1m	macro
-	fdb	opLD1m,\1
-	endm
-LDu1	macro
-	fdb	opLDu1,\0
-	endm
-LDu1r	macro
-	fdb	opLDu1r
-	endm	    
-LDu1m	macro
-	fdb	opLDu1m,\1
-	endm
 LD2	macro
 	fdb	opLD2,\0
-	endm
-LD2r	macro
-	fdb	opLD2r
-	endm	    
-LD2m	macro
-	fdb	opLD2m,\1
-	endm
-LDu2	macro
-	fdb	opLDu2,\0
-	endm
-LDu2r	macro
-	fdb	opLDu2r
-	endm	    
-LDu2m	macro
-	fdb	opLDu2m,\1
 	endm
 LD4	macro
 	fdb	opLD4,\0
 	endm
+LD1r	macro
+	fdb	opLD1r
+	endm	    
+LD2r	macro
+	fdb	opLD2r
+	endm	    
 LD4r	macro
 	fdb	opLD4r
 	endm	    
+LD1m	macro
+	fdb	opLD1m,\1
+	endm
+LD2m	macro
+	fdb	opLD2m,\1
+	endm
 LD4m	macro
 	fdb	opLD4m,\1
+	endm
+
+LDu1	macro
+	fdb	opLDu1,\0
+	endm
+LDu2	macro
+	fdb	opLDu2,\0
+	endm
+LDu1r	macro
+	fdb	opLDu1r
+	endm	    
+LDu2r	macro
+	fdb	opLDu2r
+	endm	    
+LDu1m	macro
+	fdb	opLDu1m,\1
+	endm
+LDu2m	macro
+	fdb	opLDu2m,\1
 	endm
 
 * store
@@ -1177,13 +1264,13 @@ ST4	macro
 	fdb	opST4,\0
 	endm
 ST1m	macro
-	fdb	opST1m,\0
+	fdb	opST1m,\1
 	endm
 ST2m	macro
-	fdb	opST2m,\0
+	fdb	opST2m,\1
 	endm
 ST4m	macro
-	fdb	opST4m,\0
+	fdb	opST4m,\1
 	endm
 
 * stack
