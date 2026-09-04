@@ -4,6 +4,8 @@
 
 	org	$9000
 
+FPU     set     1
+
 	setdp	R0/256
 	
 SKIP1	macro
@@ -13,6 +15,24 @@ SKIP1	macro
 SKIP2X	macro
 	fcb	$8e	; LDX #
 	endm
+
+        ifne    FPU
+* floating point
+EXTRA   equ     $EC0C
+NBANK   equ     $618c
+MODELE  equ     $627B
+
+VALTYP  equ     $6105
+DBLFLG  equ     $6103
+
+FACEXP  equ     $614E
+FACHO   equ     FACEXP+1
+FACSGN  equ     $6156        
+
+ARGEXP  equ     $6159
+ARGHO   equ     FACEXP+1
+ARGSGN  equ     $6161
+        endc
 	
 init	jmp	crt0
 
@@ -864,7 +884,8 @@ crt0	pshs	d,x,y,u,dp,cc
 	ldd	#R0&$FF00
 	tfr	a,dp
 	sts	__exit+2
-	clra
+	
+        clra
 	std	<CLK	; clear clock
 	std	<CLK+1
 	tfr	d,x	; clear ac,av
@@ -873,8 +894,18 @@ crt0	pshs	d,x,y,u,dp,cc
 	ldx	#__exit-2
 	pshs	d,x	; return to __exit
 	
+        lda     MODELE
+        beq     *+5
+        jsr     >EXTRA  ; cold reset of EXTRAMON	
+
+        ifne    FPU
+        ldd     #4
+        sta     >DBLFLG
+        stb     >VALTYP
+        endc
+        
 	bsr	startCLK
-	
+        
 	ldu	#_main	; jmp to main
 	pulu	pc
 	fdb	__exit
@@ -946,6 +977,126 @@ opLDCLK pshs	cc
 	std	<R0
 	stx	<R0+2
 	pulu	pc
+
+        ifne    FPU
+* floating point
+VALTYP  equ     $6105
+DBLFLG  equ     $6103
+
+FACEXP  equ     $614E
+FACHO   equ     FACEXP+1
+FACSGN  equ     $6156        
+
+ARGEXP  equ     $6159
+ARGHO   equ     ARGEXP+1
+ARGSGN  equ     $6161
+
+opFMOV  ldx     #FACSGN
+        ldd     FACHO-FACSGN,X
+        std     ARGHO-FACSGN,X
+        ldd     FACHO-FACSGN+2,X
+        std     ARGHO-FACSGN+2,X
+        lda     FACEXP-FACSGN,X
+        ldb     FACSGN-FACSGN,X
+        sta     ARGEXP-FACSGN,X
+        stb     ARGSGN-FACSGN,X
+        pulu    pc
+
+opLDG4m	pulu	x,y
+	bra	opLDGa
+opLDGi  leay    ,u
+        leau    4,u
+        bra     opLDGa
+opLDG   pulu    d
+        leay    b,s        
+opLDGa  ldx     #ARGEXP
+        bra     opLDFb
+
+opLDF4m	pulu	x,y
+	bra	opLDFa	
+opLDFi  leay    ,u
+        leau    4,u
+        bra     opLDFa
+opLDF4  pulu    d
+        leay    b,s        
+opLDFa  ldx     #FACEXP
+opLDFb  ldd     ,y
+        sta     FACSGN-FACEXP,x
+        lslb
+        rola
+        beq     opLDf00
+        adda    #2              ; bias 127    
+        beq     opLDfFF
+        sta     FACEXP-FACEXP,x
+        coma
+        rorb            ; set b7
+        stb     FACHO-FACEXP,x
+        ldd     2,y
+        std     1+FACHO-FACEXP,x
+        pulu    pc
+
+opLDfFF ldd     #$FFFF          ; maxfloat
+        bra     opLDf01
+
+opLDf00 ldd     #0              ; zero
+        stb     FACSGN-FACEXP,x
+opLDf01 std     FACEXP-FACEXP,x
+        std     2+FACEXP-FACEXP,x
+        pulu    pc
+        
+opLDG8m	pulu	x,y
+	bra	opLDGb
+opLDG8  pulu    d
+        leay    b,s        
+opLDGb  ldx     #ARGEXP
+        bra     opLDFd
+
+opLDF8m	pulu	x,y
+	bra	opLDFc
+opLDF8  pulu    d
+        leay    b,s        
+opLDFc  ldx     #FACEXP
+opLDFd  ldd     ,y
+        sta     FACSGN-FACEXP,x
+        anda    #%01111111
+        andb    #%11110000
+        addd    #0
+        beq     opLDf00
+        bsr     lsrD4
+        subd    #1023-129       ;  bias 127
+        ble     opLDf00
+        tsta
+        bne     opLDfFF
+        stb     FACEXP-FACEXP,x
+        ldd     1,y
+        ora     #%11110000
+        lslb
+        rola
+        lslb
+        rola
+        lslb
+        rola
+        std     FACHO-FACEXP,x
+        ldd     3,y
+        bsr     lsrD4
+        ora     1+FACHO-FACEXP,x
+        std     1+FACHO-FACEXP,x
+        ldd     4,y
+        bsr     lsrD4
+        ora     2+FACHO-FACEXP,x
+        std     2+FACHO-FACEXP,x
+        pulu    pc
+
+lsrD4   lsra
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
+        rts
+        endc
 
 	echo	CRT0  size = &(*-crt0) bytes
 	
@@ -1250,7 +1401,11 @@ EXTu1	macro
 EXTu2	macro
 	fdb	opEXTu2
 	endm	       
-	
+
+        ifne    FPU
+* floating point
+        endc
+
 * misc
 VM_OFF	macro
 	fdb	*+2

@@ -1342,10 +1342,10 @@ typedef enum {
     OP_LDG4,  /* G = slot (own-slot value, as float, 4 bytes) */
     OP_LDF8,  /* F = slot (own-slot value, as double, 8 bytes; narrowed) */
     OP_LDG8,  /* G = slot (own-slot value, as double, 8 bytes; narrowed) */
-    OP_LDF4m, /* F = *(float*)slot-or-symbol */
-    OP_LDG4m, /* G = *(float*)slot-or-symbol */
-    OP_LDF8m, /* F = *(double*)slot-or-symbol (narrowed) */
-    OP_LDG8m, /* G = *(double*)slot-or-symbol (narrowed) */
+    OP_LDF4m, /* F = *(float*)imm */
+    OP_LDG4m, /* G = *(float*)imm */
+    OP_LDF8m, /* F = *(double*)imm */
+    OP_LDG8m, /* G = *(double*)imm */
     
     OP_STF4,  /* slot = F (own-slot value, as float) */
     OP_STF8,  /* slot = F (own-slot value, as double; widened) */

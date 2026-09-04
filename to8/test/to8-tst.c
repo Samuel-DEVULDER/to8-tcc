@@ -1,4 +1,4 @@
-#if 0
+#if 1
 char *f(char *s, char *d) {
 	while(*d++ = *s++);
 	return d-1;
@@ -154,7 +154,6 @@ int mod_simple(int a, int b) { return a % b; }
 unsigned int udiv_simple(unsigned int a, unsigned int b) { return a / b; }
 unsigned int umod_simple(unsigned int a, unsigned int b) { return a % b; }
 
-#endif
 
 float f=1.0;
 double d=1.0;
@@ -162,3 +161,4 @@ char s[4]="1234";
 int i = 0x01020304, *pi=&i;
 short sh = 0x0102;
 char ch =  0x01;
+#endif
