@@ -64,7 +64,7 @@ SAPFS=$(TOP)/to8/sapfs/sapfs$(EXESUF)
 	@$(SAPFS) -a $@ AUTO.BAT
 	@BASE=$$(basename $< .bin | tr 'a-z' 'A-Z' | cut -c1-8); \
 	BIN="$$BASE.BIN"; mv $< .$$BIN; mv .$$BIN $$BIN;\
-	printf >AUTO.BAS "\\r\\n10 BANK2:CLEAR,&H71FF:LOADM\"%s\"" "$$BIN"; \
+	printf >AUTO.BAS "\\r\\n10 BANK2:CLEAR,&H71FF:LOADM\"%s\",,R" "$$BIN"; \
 	$(SAPFS) -a $@ AUTO.BAS; \
 	$(SAPFS) -a $@ $$BIN
 	$(SAPFS) -t $@
