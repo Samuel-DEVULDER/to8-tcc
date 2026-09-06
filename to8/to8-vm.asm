@@ -311,11 +311,11 @@ opJRA	ldu	,u	; TODO banking
 	
 opJGE	lda	<R0
 	bpl	opJRA
-	pulu	y,pc
+	pulu	d,pc    ; D = trash address
 
 opJLT	lda	<R0
 	bmi	opJRA
-	pulu	y,pc
+	pulu	d,pc
 	  
 opJGT	ldd	<R0
 	bmi	opJRN
@@ -441,21 +441,38 @@ opUCMPb ldd	,x
 opMUL2	pulu	d
 	leax	a,s
 	leay	b,s
-	bra	opMUL0+3
+	bra	opMUL1
 opMULi	leay	,u
 	leau	4,u
 	bra	opMUL0
 opMUL	pulu	d
 	leay	b,s
-opMUL0	ldx	#R1
-	ldd	<R0+2
+opMUL0	ldd	<R0+2
 	std	<R1+2
 	ldd	<R0
-        std     ,x
-	bne	opMUL1
+        std     <R1
+        ldx	#R1
+opMUL1  ldd     ,x
+	bne	opMUL3
 	ldd	,y
 	beq	opMUL16
-opMUL1	lda	3,y
+        ldb     1,x
+        
+*        0123
+*        0123
+*        
+*        33*
+*      23
+*      32
+*    13*
+*    22
+*    31
+*  03
+*  12
+*  21
+*  30
+        
+opMUL3	lda	3,y
 	mul
 	std	<R0
 	
@@ -471,16 +488,16 @@ opMUL1	lda	3,y
 
 	ldd	#$0202
 	bsr	opMULb
-	ldd	#$0103
+	ldd	#$0301
 	bsr	opMULb
 	
-	ldd	#$0300
-	bsr	opMULc
-	ldd	#$0201
+	ldd	#$0003
 	bsr	opMULc
 	ldd	#$0102
 	bsr	opMULc
-	ldd	#$0003
+	ldd	#$0201
+	bsr	opMULc
+	ldd	#$0300
 	bsr	opMULc
 	pulu	pc
 
@@ -669,8 +686,8 @@ lslR0	macro
 	rol	<R0
 	endm
 opSHL	pulu	d,y
-	leax	b,s
-	LDB	3,x
+        addb    #3
+	LDB	b,s
 	SKIP2X
 opSHLi	pulu	d,y
 	stb	<R1
@@ -705,6 +722,7 @@ opSHL_16
 	std	<R0+2
 opSHL_32
 	jmp	,y
+        
 opSHL_half
 	ldd	<R0
 	lsr	<R1
@@ -741,6 +759,7 @@ opSHL_half16
 opSHL_half32
 	std	<R0
 	jmp	,y
+        
 lsrR0	macro
 	lsra
 	rorb
@@ -748,8 +767,8 @@ lsrR0	macro
 	ror	<R0+3
 	endm
 opSHR	pulu	d,y
-	leax	b,s
-	LDB	3,x
+        addb    #3
+	ldb	b,s
 	SKIP2X
 opSHRi	pulu	d,y
 	stb	<R1
@@ -784,6 +803,7 @@ opSHR_0 ldd	#0
 	std	<R0
 opSHR_32
 	jmp	,y
+        
 opSHR_half
 	ldd	<R0+2
 	lsr	<R1
@@ -828,8 +848,8 @@ asrR0	macro
 	ror	<R0+3
 	endm
 opSAR	pulu	d,y
-	leax	b,s
-	LDB	3,x
+	addb    #3
+	LDB	b,s
 	SKIP2X
 opSARi	pulu	d,y
 	stb	<R1

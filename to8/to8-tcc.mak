@@ -42,7 +42,7 @@ git-pull-all:
 	@cat to8/to8-vm.asm >>$@
 	@echo "* start of code" >>$@
 	@echo "__start set *" >>$@
-	./to8-tcc $< -c -O -g -o .$(shell basename "$*").o
+	./to8-tcc $< -c -O0 -g -o .$(shell basename "$*").o
 	@strings -n 2 '.$(shell basename "$*").o' | \
 	sed -n '/\* TO8 backend/,/\* --- end of asm ---/p' >> $@
 	@echo "	echo Code  size = &(*-__start) bytes (&((*-__start+1023)/1024) kb)" >>$@

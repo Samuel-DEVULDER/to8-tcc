@@ -68,9 +68,21 @@ void paper(int col) {
 	esc(col + (col>=8 ? 0x70 : 0x50));
 }
 
-void border(int  col) {
+void border(int col) {
 	esc(col + (col>=8 ? 0x78 : 0x60));
 }
+/*
+void setRGB8(int col, int rgb) {
+	int c;
+	rgb >>= 4;
+	c = (rgb&15)<<8;
+	rgb >>= 4;
+	c |= rgb&0xf0;
+	rgb >>= 12;
+	palette(col, 0, c|rgb);
+}
+*/
+#define setRGB8(col, rgb) palette(col,0,(((rgb<<4)&0xf00)+((rgb>>8)&0xf0)+((rgb>>20)&0xf)))
 
 enum  {
 	GFX_MODE_BM4 = 0x59,
@@ -79,9 +91,30 @@ enum  {
 	GFX_MODE_BM16 = 0x5E,
 };
 
+void setPalette(void) {
+	setRGB8(0, 0x000000);  // noir = intérieur
+	
+	// Dégradé électrique (1-15)
+	setRGB8( 1, 0x000040);
+	setRGB8( 2, 0x000080);
+	setRGB8( 3, 0x004080);
+	setRGB8( 4, 0x008080);
+	setRGB8( 5, 0x008040);
+	setRGB8( 6, 0x008000);
+	setRGB8( 7, 0x408000);
+	setRGB8( 8, 0x808000);
+	setRGB8( 9, 0x804000);
+	setRGB8(10, 0x800000);
+	setRGB8(11, 0x800040);
+	setRGB8(12, 0x800080);
+	setRGB8(13, 0x400080);
+	setRGB8(14, 0x808080);
+	
+	setRGB8(15, 0xffffff);
+}
+
 void pattern() {
 	int x,y,mask=15;
-	for(x=0;x<16;++x) palette(x,0,x*(1+16+256));
 	for(y=0;y<200;++y) {
 		for(x=0;x<160;++x) {
 			plot(x,y,(x^(y>>1))&mask);
@@ -89,11 +122,74 @@ void pattern() {
 	}
 }
 
+// ==================== CONFIG ====================
+#define FIX_FRAC 14
+#define FIX_ONE (1 << FIX_FRAC)
+
+// Conversion float → fixed-point à la compilation
+#define F2FIX(f) ((int)((f) * FIX_ONE + 0.5))
+
+// --- 3 CONSTANTES UTILISATEUR (en float) ---
+#define CH      2.20f   // Hauteur de la fenêtre (CI_MAX - CI_MIN)
+#define CR_MIN -2.50f    // Gauche (réel minimum)
+#define CI_MIN -1.10f    // Bas (imaginaire minimum)
+
+// --- Dimensions écran ---
+#define WIDTH  160
+#define HEIGHT 200
+
+// --- Calculs automatiques ---
+// Aspect ratio: largeur = hauteur * (WIDTH / HEIGHT)
+#define CW ((2*CH*WIDTH) / (float)HEIGHT)  // Largeur = 2.0 * (2*160/200) = 3.2
+
+#define CR_MAX (CR_MIN + CW)  // -2.1 + 3.2 = 1.1
+#define CI_MAX (CI_MIN + CH)  // -1.0 + 2.0 = 1.0
+
+// Steps en fixed-point
+#define STEP_X F2FIX(CW / WIDTH)      
+#define STEP_Y F2FIX(CH / HEIGHT)
+
+// Coin haut-gauche en fixed-point
+#define CR_BASE F2FIX(CR_MAX)
+#define CI_BASE F2FIX(CI_MIN)
+
+// Constantes pour Mandelbrot
+#define FIX_FOUR F2FIX(4.0f)
+#define FIX_MUL_SHIFT (FIX_FRAC)
+#define FIX_2MUL_SHIFT (FIX_FRAC - 1)
+
+#define MAX_ITER 32
+
+// ==================== MANDELBROT ====================
+void mandelbrot(void) {
+    int x, y, ci, cr;
+    
+    for(ci = CI_BASE, y = HEIGHT-1; y>=0; ci +=  STEP_Y, --y) {
+        for(cr = CR_BASE, x = WIDTH-1; x>=0; cr -= STEP_X, --x) {
+	    unsigned zr2 = 0, zi2 = 0;
+            int zr = 0, zi = 0;
+            int iter = MAX_ITER;
+            
+	    do {
+		zi = ((zr * zi) >> FIX_2MUL_SHIFT) + ci;
+		zr = zr2 - zi2 + cr;
+		    
+                zr2 = ((unsigned)(zr * zr)) >> FIX_MUL_SHIFT;
+                zi2 = ((unsigned)(zi * zi)) >> FIX_MUL_SHIFT;
+            } while(--iter && (zr2 + zi2) <= FIX_FOUR);
+           
+	    plot(x,y, iter ? (MAX_ITER - iter + ((x^y)&1))>>1 : 0);
+        }
+    }
+}
+
 void main(int ac,  char **av) {
 	cursor(0);
 	border(0);
 	esc(GFX_MODE_BM16);
-	pattern();
+	setPalette();
+	//pattern();
+	mandelbrot();
 	beep();
 	while(!getc());
 	esc(GFX_MODE_40);

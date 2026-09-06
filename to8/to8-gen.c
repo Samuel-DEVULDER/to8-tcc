@@ -1,8 +1,19 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.20.0 (silence palindromic-swap and L.N symbol warnings)
+ * Version: 8.21.0 (fix R0 clobber in v8.10.0 local/local fast path)
  *
  * Changelog:
+ * - v8.21.0 CORRECTNESS FIX: the v8.10.0 local/local fast path in
+ *   gen_opi() (`LD lslot ; <op> rslot`) writes R0 directly, bypassing
+ *   gv()/get_reg() and therefore TCC's save_reg() - so a value from an
+ *   *enclosing* expression already sitting in R0 could get clobbered
+ *   with no spill. Repro: "iter ? (MAX_ITER-iter + ((x^y)&1))>>1 : 0"
+ *   lost (MAX_ITER-iter) the moment (x^y) hit this fast path (both
+ *   plain locals). Fix: save_reg(TREG_R0) at the top of the fast path
+ *   (no-op if R0 isn't otherwise live, so the common case is unaffected).
+ *   Same "before any gv()" pattern at ~line 3143 (v7.39.0) likely has
+ *   the same bug - not yet audited/fixed.
+ *
  * - v8.20.0 two warning suppressions on static/global initializers,
  *   no behavior change:
  *   1) to8_byte_swap_changes_anything: no warning when the byte swap
@@ -1124,7 +1135,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.19.0"
+#define TO8_GEN_VERSION "8.21.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -2918,6 +2929,7 @@ void gen_opi(int op)
             if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) { vtop--; return; }
             int rslot = vtop->c.i;
             int lslot = c1;
+	    save_reg(TREG_R0);
             e_op_slot(OP_LD, lslot);
             e_op_slot(slot_op, rslot);
             vtop--;
@@ -2956,7 +2968,7 @@ void gen_opi(int op)
         return;
     }
 
-
+#if 1
     if (v1 == TREG_R0) {
         int pre_spill = to8_temp_alloc(4, 4);
         e_op_slot(OP_ST, pre_spill);
@@ -2969,6 +2981,33 @@ void gen_opi(int op)
         v1 = vtop[-1].r & VT_VALMASK;
         c1 = vtop[-1].c.i;
     }
+#else
+    if (v1 == TREG_R0) {
+        int pre_spill = to8_temp_alloc(4, 4);
+        
+        /* R0 contient l'opérande gauche : le sauver avant gv(RC_INT),
+        qui va charger et donc écraser R0 avec l'opérande droit. */
+        e_op_slot(OP_ST, pre_spill);
+        
+        /*
+        * Important : le SValue de gauche doit maintenant décrire
+        * son emplacement réel. Sinon les branches suivantes croient
+        * encore que le gauche est dans R0.
+        */
+        vtop[-1].r = VT_LOCAL;
+        vtop[-1].r2 = VT_CONST;
+        vtop[-1].c.i = pre_spill;
+        
+        v1 = VT_LOCAL;
+        c1 = pre_spill;
+    }
+    
+    gv(RC_INT);
+    
+    /* gv() peut avoir modifié/spillé des entrées du vstack : relire l'état réel. */
+    v1 = vtop[-1].r & VT_VALMASK;
+    c1 = vtop[-1].c.i;
+#endif 
 
     {
         to8_opcode slot_op, imm_op;
@@ -2976,7 +3015,7 @@ void gen_opi(int op)
             vtop--; return;
         }
 
-                if (to8_is_commutative(op)) {
+        if (to8_is_commutative(op)) {
             if (v1 == VT_CONST && !(vtop[-1].r & VT_SYM)) {
                 /* Left operand is a true literal (5, 1, ...): c1 IS
                  * its value. Unchanged from the original code. */
