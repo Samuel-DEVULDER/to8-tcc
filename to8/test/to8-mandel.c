@@ -7,10 +7,13 @@ void putc(int c) {
 	       "jsr	$E803");
 }
 
-char getc(void) {
+int getc(void) {
 	int r=0;
 	native("jsr	$E806\n\t"
-	       "stb	3,s");
+	       "clra\n\t"
+	       "std	2,s\n\t"
+	       "clrb\n\t"
+	       "std	,s");
 	return r;
 }
 
@@ -123,7 +126,7 @@ void pattern() {
 }
 
 // ==================== CONFIG ====================
-#define FIX_FRAC 14
+#define FIX_FRAC 13
 #define FIX_ONE (1 << FIX_FRAC)
 
 // Conversion float → fixed-point à la compilation
@@ -176,7 +179,7 @@ void mandelbrot(void) {
 		    
                 zr2 = ((unsigned)(zr * zr)) >> FIX_MUL_SHIFT;
                 zi2 = ((unsigned)(zi * zi)) >> FIX_MUL_SHIFT;
-            } while(--iter && (zr2 + zi2) <= FIX_FOUR);
+            } while(--iter && (zr2 + zi2) < (FIX_FOUR+1));
            
 	    plot(x,y, iter ? (MAX_ITER - iter + ((x^y)&1))>>1 : 0);
         }
