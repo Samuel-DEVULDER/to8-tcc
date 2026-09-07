@@ -223,7 +223,7 @@ void print_time(unsigned t) {
 		t %= 1000;
 		puts("s");
 	}
-	if(t>0) {
+	if(t>0 || !*sep) {
 		puts(sep);
 		putu(t);
 		puts("ms");
@@ -245,9 +245,9 @@ void main(int ac,  char **av) {
 	esc(GFX_MODE_40);
 	paper(0);ink(15);cls();
 	puts("Mandelbrot computed in ");
-//	print_time(t);
-	putu((t+500)/1000);
-	puts(" secs.\r\n");
+	print_time(t);
+//	putu((t+500)/1000);
+	puts("\r\n");
 }
 
 

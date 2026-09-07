@@ -1,8 +1,25 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.22.0 (fix in to8_peephole_merge_adj (v8.8.0))
+ * Version: 8.23.0 (fix ARG_SYM name resolved at render time)
  *
  * Changelog:
+ * - v8.23.0 CORRECTNESS FIX: e_op_addr()/e_push_addr() stored a raw `Sym *`
+ *   on the line and re-resolved its name via get_tok_str(ln->sym->v, NULL)
+ *   at render time - long after creation. If that Sym's backing memory got
+ *   freed/reused by a later symbol before render ran, `ln->sym` was a
+ *   dangling read: silently returns whatever symbol now occupies that slot,
+ *   not the one it was created for. The comment (built immediately at
+ *   creation, before anything could be reused) stayed correct throughout,
+ *   which is what exposed the bug: rendered operand and comment disagreeing
+ *   on the same instruction. Repro: print_time()'s three single-char
+ *   literals ("h","m","s") all rendered as `_L_6` (the LAST string literal
+ *   in the function) while their comments correctly read L.3/L.4/L.5. Fix:
+ *   new `sym_name[32]` field, snapshotted at creation exactly like the
+ *   comment already was; render now reads sym_name instead of re-deref'ing
+ *   `sym`. `sym` itself is untouched and still used where only pointer
+ *   IDENTITY matters (to8_same_float_load, the fmov dedup in
+ *   to8_peephole_fmov) - neither dereferences it, so both stay correct.
+ *
  * - v8.22.0 CORRECTNESS FIX in to8_peephole_merge_adj (v8.8.0): the four
  *   materialization sites only rewrote candidate->imm_val, leaving the ADJ
  *   at its emission position (right after the last CALL of the chain) while
@@ -1150,7 +1167,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.22.0"
+#define TO8_GEN_VERSION "8.23.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -1585,6 +1602,15 @@ typedef struct to8_line {
     int imm_val;
     double f_val;
     Sym *sym; int sym_addend;
+    char sym_name[32]; /* v8.21.1: snapshot of get_tok_str(sym->v,...) taken
+                         * IMMEDIATELY at creation (e_op_addr/e_push_addr),
+                         * not re-read from `sym` at render time. `sym` can
+                         * outlive its usefulness as a name source: nothing
+                         * here frees it explicitly, but if the Sym's
+                         * backing memory gets reused before render runs,
+                         * ln->sym->v is a dangling read. Only pointer
+                         * IDENTITY (to8_same_float_load, fmov dedup) still
+                         * needs the raw `sym` field - rendering doesn't. */
     struct to8_line *jmp_chain;
     int jmp_target_id;
     const char *jump_prefix;
@@ -2299,8 +2325,10 @@ static void e_op_addr(to8_opcode op, Sym *sym, int c)
     if (sym) {
         const char *name = get_tok_str(sym->v, NULL);
         snprintf(desc, sizeof desc, "%s", name ? name : "?");
+	snprintf(ln->sym_name, sizeof ln->sym_name, "%s", name ? name : "?");								
     } else {
         snprintf(desc, sizeof desc, "%d", c);
+	ln->sym_name[0] = 0;	
     }
     addr_comment(ln->comment, sizeof ln->comment, op, desc);
     ln->has_comment = 1;
@@ -2354,8 +2382,10 @@ static void e_push_addr(Sym *sym, int c)
     if (sym) {
         const char *name = get_tok_str(sym->v, NULL);
         snprintf(desc, sizeof desc, "%s", name ? name : "?");
+	snprintf(ln->sym_name, sizeof ln->sym_name, "%s", name ? name : "?");
     } else {
         snprintf(desc, sizeof desc, "%d", c);
+	ln->sym_name[0] = 0;
     }
     snprintf(ln->comment, sizeof ln->comment, "push %s", desc);
     ln->has_comment = 1;
@@ -4283,10 +4313,15 @@ static void to8_render_line(to8_line *ln)
     case ARG_SYM:
         out_tab();
         if (ln->sym) {
-            const char *name = get_tok_str(ln->sym->v, NULL);
+            /* v8.21.1: was get_tok_str(ln->sym->v, NULL) here, re-reading
+             * through the raw `sym` pointer at render time - long after
+             * creation, and possibly after the Sym's memory was freed and
+             * reused by a later symbol (see sym_name's comment on the
+             * struct). Use the name snapshotted at creation time instead,
+             * exactly like the comment already (correctly) does. */
+            const char *name = ln->sym_name;		
             out_str("0,_");
-            //out_str(name ? name : "?");
-            {char  *s=name ? name : "?"; while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
+            {char  *s=name; while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
         } else {
             out_int(ln->sym_addend);
         }
