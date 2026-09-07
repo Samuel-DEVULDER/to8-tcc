@@ -1,8 +1,24 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.25.0 (new peephole: redundant R0 const re-loads removed)
+ * Version: 8.26.0 (new peephole to8_peephole_thread_jumps())
  *
  * Changelog:
+ * - v8.26.0 new peephole to8_peephole_thread_jumps(): a jump (JCC or JRA)
+ *   whose target is an unconditional JRA is retargeted to the JRA's own
+ *   landing point, chains resolved through consecutive JRAs in one pass.
+ *   Saves one executed instruction per taken path threaded through.
+ *   Safety: only JRA is traversable (a JCC's branch depends on R0 at ITS
+ *   execution point); the walk's step bound handles legal-C JRA cycles
+ *   ("A: goto B; B: goto A;" - no unique landing point, `cur` left alone);
+ *   a self-looping JRA is a valid landing but equals the current target
+ *   (skipped, keeps the fixed point from spinning). The threaded JRA keeps
+ *   is_target (may still receive other edges/fall-through) - dead labels
+ *   possible, harmless per the v7.30.0 precedent. jmp_target_id >= 1
+ *   guards added: 0 = never-backpatched chain, and to8_by_id(0) errors.
+ *   Same guards added to to8_peephole_jump_inversion(), which called
+ *   to8_by_id() unguarded (latent hard crash if an unresolving jump ever
+ *   exists - hardening, possibly unreachable from tccgen today).
+ *
  * - v8.25.0 R0-tracking restructured into one-invariant-per-pass passes,
  *   matching the useless_ldf() precedent: to8_peephole_useless_ld() keeps
  *   only the slot tracker, now updated by effect via the new shared
@@ -1190,7 +1206,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.25.0"
+#define TO8_GEN_VERSION "8.26.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3923,6 +3939,46 @@ static int to8_peephole_jump_inversion(void)
     return changed;
 }
 
+/* v8.24.0: jump threading, one step per fixed-point round. A jump whose
+ * target is an unconditional JRA is retargeted to the JRA's own target;
+ * chains (JCC->JRA->JRA->...) collapse over successive driver rounds.
+ * Only JRA is traversable: a JCC's branch depends on R0 at ITS execution
+ * point. The no-op guard (new target == current target) is REQUIRED for
+ * convergence: on a goto cycle "A: goto B; B: goto A;", one step turns A
+ * into a self-loop, after which B->A (A self-looping) would otherwise
+ * rewrite B->A every round and spin to the driver's 256-guard on EVERY
+ * compile. With the guard, cycles converge in <=2 rounds as harmless
+ * self-loops (JRA is side-effect-free, so A->B->A vs A->A is
+ * observationally identical). jmp_target_id >= 1 guards: 0 = never
+ * backpatched chain, to8_by_id(0) would tcc_error. The threaded-over JRA
+ * keeps is_target (may still receive other edges/fall-through) - dead
+ * labels possible, harmless per the v7.30.0 precedent. */
+static int to8_peephole_thread_jumps(void)
+{
+    int changed = 0;
+    to8_line *cur;
+
+    for (cur = g_head; cur; cur = cur->next) {
+        to8_line *t;
+
+        if (cur->kind != ARG_JMP || cur->jmp_target_id < 1)
+            continue;
+        t = to8_by_id(cur->jmp_target_id);
+        if (t == cur)                       /* self-loop: nothing to thread */
+            continue;
+        if (t->op != OP_JRA || t->kind != ARG_JMP || t->jmp_target_id < 1)
+            continue;                       /* target is not a JRA */
+        if (t->jmp_target_id == cur->jmp_target_id)
+            continue;                       /* no-op rewrite - MANDATORY,
+                                               see comment above */
+
+        cur->jmp_target_id = t->jmp_target_id;
+        to8_mark_target(t->jmp_target_id);
+        changed = 1;
+    }
+    return changed;
+}
+
 /* Materialize the pending ADJ-chain candidate: bake the deferred sum
  * into its immediate, and MOVE the line right before `before`
  * (before==NULL: no move, see below).
@@ -4411,6 +4467,7 @@ static void to8_peephole_run(void)
         changed |= to8_peephole_commute();
         changed |= to8_peephole_op2();      /* NEW v7.26.0 */
         changed |= to8_peephole_jump_inversion();
+	changed |= to8_peephole_thread_jumps();
     } while (changed && ++guard < 256);
     // only once
     changed |= to8_peephole_merge_adj();
