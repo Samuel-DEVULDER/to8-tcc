@@ -1,8 +1,15 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.23.0 (fix ARG_SYM name resolved at render time)
+ * Version: 8.24.0 (new opcodes for constants fix ARG_SYM name resolved at render time)
  *
  * Changelog:
+ *
+ * - v8.24.0 new operand-less constant-load opcodes: LDi_0/LDi_1/LDi_m1
+ *   (R0 = 0/1/-1) and LDFi_0/LDGi_01 (F/G = 0.0f), plus
+ *   to8_peephole_cst() rewriting the corresponding 2-word LDi (ARG_IMM
+ *   only - ARG_SYM is an ADDRESS and never matches) and LDFi/LDGi
+ *   (ARG_FIMM) forms under -O. 
+ *
  * - v8.23.0 CORRECTNESS FIX: e_op_addr()/e_push_addr() stored a raw `Sym *`
  *   on the line and re-resolved its name via get_tok_str(ln->sym->v, NULL)
  *   at render time - long after creation. If that Sym's backing memory got
@@ -1167,7 +1174,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.23.0"
+#define TO8_GEN_VERSION "8.24.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -1212,6 +1219,13 @@ typedef enum {
 
     OP_MOV,   /* dst_slot = src_slot, WITHOUT touching R0 - fusion of LD+ST */
 
+    /* fixed-constant loads: the value is baked into the opcode itself,
+     * rendered with NO operand words. The "_<k>" suffix = constant VALUE,
+     * as opposed to the bare size digits of LD1/LD2/LD4/LDF4/LDF8. */
+    OP_LDi_0,  /* R0 = 0  (operand-less form of "LDi 0")  */
+    OP_LDi_1,  /* R0 = 1  (operand-less form of "LDi 1")  */
+    OP_LDi_m1, /* R0 = -1 (operand-less form of "LDi -1") */
+    
     OP_LD,    /* R0 = slot (4-byte load) */
 
     OP_LD1,   /* R0 = (int)*(signed char)slot - byte load, SIGN-extend */
@@ -1379,6 +1393,9 @@ typedef enum {
 
     OP_FMOV,  /* G = F (register-to-register transfer, no memory access) */
 
+    OP_LDFi_0, /* F = 0.0f (operand-less form of "LDFi 0.0") */
+    OP_LDGi_0, /* G = 0.0f */
+    
     OP_LDFi,  /* F = <float literal>, baked directly into the instruction */
     OP_LDGi,  /* G = <float literal>, baked directly into the instruction */
     OP_LDF4,  /* F = slot (own-slot value, as float, 4 bytes) */
@@ -1537,6 +1554,12 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_FADD: return "FADD"; case OP_FSUB: return "FSUB";
     case OP_FMUL: return "FMUL"; case OP_FDIV: return "FDIV";  
     case OP_FCMP: return "FCMP"; case OP_FSGN: return "FSGN";
+
+    case OP_LDi_0:  return "LDi_0";
+    case OP_LDi_1:  return "LDi_1";
+    case OP_LDi_m1: return "LDi_m1";
+    case OP_LDFi_0: return "LDFi_0";
+    case OP_LDGi_0: return "LDGi_0";
     }
     return "?";
 }
@@ -2150,6 +2173,11 @@ static void slot_comment(char *out, size_t outsz, to8_opcode op, const char *des
         snprintf(out, outsz, "R0 = *(%s*)%s", to8_size_name(op), desc); return;
     case OP_ST1: case OP_ST2: case OP_ST4:
         snprintf(out, outsz, "*(%s*)%s = R0", to8_size_name(op), desc); return;
+    case OP_LDi_0:  return "R0 = 0";
+    case OP_LDi_1:  return "R0 = 1";
+    case OP_LDi_m1: return "R0 = -1";
+    case OP_LDFi_0: return "F = 0.0";
+    case OP_LDGi_0: return "G = 0.0";
     default: snprintf(out, outsz, "%s", desc); return;
     }
 }
@@ -3521,6 +3549,7 @@ static int to8_peephole_dead_r0_load(void)
             if (scan->op == OP_MOV || scan->op == OP_NOP ||
                 scan->op == OP_ADJ || scan->op == OP_PUSH ||
                 scan->op == OP_PUSHi ||
+		scan->op == OP_LDFi_0 || scan->op == OP_LDGi_0 ||
                 scan->op == OP_LDFi || scan->op == OP_LDGi ||
                 scan->op == OP_LDF4 || scan->op == OP_LDG4 ||
                 scan->op == OP_LDF8 || scan->op == OP_LDG8 ||
@@ -3929,6 +3958,7 @@ static to8_opcode to8_g_counterpart(to8_opcode f_op)
 static int to8_stops_fmov_scan(to8_opcode op)
 {
     switch (op) {
+    case OP_LDFi_0: case OP_LDGi_0:
     case OP_LDFi: case OP_LDF4: case OP_LDF8: case OP_LDF4m: case OP_LDF8m:
     case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
     case OP_FSCALEi: case OP_ITOF:
@@ -3991,10 +4021,12 @@ static int to8_peephole_useless_ldf(void)
         }
 
         switch (cur->op) {
+	case OP_LDFi_0:
         case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
         case OP_ITOF: case OP_FSCALEi:
             last_f_load = NULL;
             break;
+        case OP_LDGi_0:
         case OP_FMOV:
             last_g_load = NULL;
             break;
@@ -4175,6 +4207,59 @@ static int to8_peephole_fmov(void)
     return changed;
 }
 
+/* v8.23.0: rewrite 2-word-immediate constant loads into the dedicated
+ * operand-less opcodes LDi_0/LDi_1/LDi_m1 (int) and LDFi_0/LDFi_1/
+ * LDGi_0/LDGi_1 (float). Pure encoding-size optimization - identical
+ * semantics, so in-place mutation keeps id/is_target valid for any
+ * label or jump landing on the line.
+ *
+ * Float match rules (IEEE-exact):
+ *  - match on the NARROWED value (float)f_val, because out_float()
+ *    renders exactly that - the instruction's semantics ARE the
+ *    narrowed value, so rewriting from it is conservative by
+ *    construction;
+ *  - 0.0 requires !signbit: -0.0 == 0.0 is true in IEEE but the bit
+ *    patterns differ (1/x distinguishes them) and LDFi_0 encodes +0.0.
+ *
+ * ARG_SYM LDi never matches (it carries an ADDRESS, not a value).
+ * Writes R0/F/G respectively - see the whitelist audit in the
+ * changelog for the three existing passes that needed updating. */
+static int to8_peephole_cst(void)
+{
+    int changed = 0;
+    to8_line *cur;
+
+    for (cur = g_head; cur; cur = cur->next) {
+        to8_opcode rep;
+        const char *c;
+
+        if (cur->op == OP_LDi && cur->kind == ARG_IMM) {
+            switch (cur->imm_val) {
+            case 0:  rep = OP_LDi_0;  break;
+            case 1:  rep = OP_LDi_1;  break;
+            case -1: rep = OP_LDi_m1; break;
+            default: continue;
+            }
+        } else if ((cur->op == OP_LDFi || cur->op == OP_LDGi) &&
+                   cur->kind == ARG_FIMM) {
+            float fv = (float)cur->f_val;  /* the value the instruction renders */
+            if (fv == 0.0f)
+                rep = (cur->op == OP_LDGi) ? OP_LDGi_0 : OP_LDFi_0;
+            else
+                continue;
+        } else {
+            continue;
+        }
+
+        cur->op = rep;
+        cur->kind = ARG_NONE;
+        c = bare_comment(rep);
+        if (c) { snprintf(cur->comment, sizeof cur->comment, "%s", c); cur->has_comment = 1; }
+        changed = 1;
+    }
+    return changed;
+}
+
 static void to8_debug_dump_list(const char *tag)
 {
     to8_line *ln;
@@ -4198,6 +4283,7 @@ static void to8_peephole_run(void)
         changed |= to8_peephole_mov();
         changed |= to8_peephole_useless_ld();
         changed |= to8_peephole_useless_ldf(); /* NEW v8.0.1 */
+	changed |= to8_peephole_cst(); /* V8.24.0 */
         changed |= to8_peephole_fmov(); /* v8.4.0 */
         changed |= to8_peephole_float_store_dup(); /* NEW v8.0.2 */
         changed |= to8_peephole_dead_r0_load();   /* NEW v7.29.0 */

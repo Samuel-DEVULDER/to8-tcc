@@ -75,43 +75,54 @@ opNEGx	com	,x
 	bcc	opNEGx0
 	inc	,x
 opNEGx0 rts
-
+                
 * bool
 opSNE	ldd	<R0+2
-	bne	opTRUE
+	bne	opLDi_1
 	ldd	<R0
-	beq	opLDB
-opTRUE	LDB	#1
-	bra	opLDB
+	beq	opLDi_D
+
+opLDi_1 ldd     #1
+        std     <R0+2
+        clrb
+        std     <R0
+        pulu    pc
+
+opLDi_m1
+        ldd     #-1
+        bra     opLDi_D
 	
 opSEQ	ldd	<R0+2
-	bne	opFALS
+	bne	opLDi_0
 	ldd	<R0
-	beq	opTRUE
-opFALS	ClRB
-	bra	opLDB
+	beq	opLDi_1
+
+opLDi_0 ldd     #0
+opLDi_D std     <R0+2
+        std     <R0
+        pulu    pc
 	
 opSGE	lda	<R0
-	bpl	opTRUE
-	bra	opFALS
+	bpl	opLDi_1
+	bra	opLDi_0
 
 opSLT	lda	<R0
-	bmi	opTRUE
-	bra	opFALS
+	bmi	opLDi_1
+	bra	opLDi_0
 	  
 opSGT	ldd	<R0
-	bmi	opFALS
-	bpl	opTRUE
+	bmi	opLDi_0
+	bpl	opLDi_1
 	ldd	<R0+2
-	bne	opTRUE
-	bra	opFALS+1
+	beq	opLDi_D
+	bra	opLDi_1
 	
 opSLE	ldd	<R0
-	bmi	opTRUE
-	bpl	opFALS
+	bmi	opLDi_1
+	bpl	opLDi_0
 	ldd	<R0+2
-	beq	opTRUE
-	bra	opFALS
+	beq	opLDi_1
+	bra	opLDi_0
 
 * load
 opLDi	pulu	d,x,y
@@ -150,7 +161,7 @@ opLD1	pulu	d
 opLD1a	ldb	[2,x]	; TODO banking
 	SKIP2X
 opEXT1	ldb	<R0+3
-opLDB	sex
+	sex
 	std	<R0+2
 	sta	<R0+1
 	sta	<R0
@@ -1180,6 +1191,15 @@ opSTF8g lsra
 *************************************************************************
 
 * load
+LDi_0	macro
+	fdb	opLDi_0
+	endm
+LDi_1	macro
+	fdb	opLDi_1
+	endm
+LDi_m1	macro
+	fdb	opLDi_m1
+	endm
 LDi	macro
 	fdb	opLDi,\0,\1
 	endm
