@@ -5,6 +5,7 @@
 	org	$9000
 
 FPU	set	1
+FATMUL  set     0
 
 	setdp	R0/256
 	
@@ -27,8 +28,6 @@ init	jmp	crt0
 
 R0	FDB	0,0
 R1	FDB	0,0	; 
-
-CLK	FDB	0,0	; clock register (1/10 sec)
 
 go_vm	puls	u
 	pulu	pc
@@ -894,8 +893,8 @@ crt0	pshs	d,x,y,u,dp,cc
 	sts	__exit+2
 	
 	clra
-	std	<CLK	; clear clock
-	std	<CLK+1
+	std	CLK	; clear clock
+	std	CLK+1
 	tfr	d,x	; clear ac,av
 	pshs	d,x
 	pshs	d,x
@@ -929,10 +928,12 @@ STATUS	 EQU   $6019
 IRQPT	 EQU   $6021
 KBIN	 EQU   $E830
 
+CLK	FDB	0,0	; clock register (1/10 sec)
+
 stopCLK orcc	#$50
 	ldx	#STATUS
 	ldb	,x
-	andb	#%11011011
+	andb	#%11011111
 stopCL1 orb	#0	  
 	stb	,x
 stopCL2 ldd	#0
@@ -948,6 +949,9 @@ startCLK
 	
 	ldd	TIMEPT-STATUS,x
 	std	stopCL2+1
+
+	ldd	#interCLK
+	std	TIMEPT-STATUS,x
 	
 	tfr	cc,b
 	andb	#$50
@@ -955,32 +959,30 @@ startCLK
 
 	orcc	#$50
 	ldb	,x
-	andb	#%00100100
+	andb	#$20
 	stb	stopCL1+1
 	ldb	,x 
-	orb	#%00100100
+	orb	#$20
 	stb	,x	
-	
-	ldd	#interCLK
-	std	TIMEPT-STATUS,x
+        
 	andcc	#$AF
 	rts
 
 interCLK
-	inc	<CLK+3
+	inc	CLK+3
 	bne	interCLK0
-	inc	<CLK+2
+	inc	CLK+2
 	bne	interCLK0
-	inc	<CLK+1
+	inc	CLK+1
 	bne	interCLK0
-	inc	<CLK
+	inc	CLK
 interCLK0
 	jmp	KBIN
 
 opLDCLK pshs	cc
 	orcc	#$50
-	ldd	<CLK
-	ldx	<CLK+2
+	ldd	CLK
+	ldx	CLK+2
 	puls	cc
 	std	<R0
 	stx	<R0+2

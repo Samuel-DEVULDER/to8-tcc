@@ -35,7 +35,13 @@ int palette(int a, int x, int y) {
 	return r;
 }
 
-void puts(char *s) {
+extern unsigned readMillis(void);
+asm("_readMillis set  *	; \n"
+    "	LDCLK 		; read clock (1/10ms)\n"
+    "	MULi	0,100	; mul by 100 --> ms\n"
+    "	RET			;");
+
+void puts(unsigned char *s) {
 	while(*s)  putc(*s++);
 }
 
@@ -74,6 +80,7 @@ void paper(int col) {
 void border(int col) {
 	esc(col + (col>=8 ? 0x78 : 0x60));
 }
+
 /*
 void setRGB8(int col, int rgb) {
 	int c;
@@ -116,6 +123,7 @@ void setPalette(void) {
 	setRGB8(15, 0xffffff);
 }
 
+/*
 void pattern() {
 	int x,y,mask=15;
 	for(y=0;y<200;++y) {
@@ -123,6 +131,15 @@ void pattern() {
 			plot(x,y,(x^(y>>1))&mask);
 		}
 	}
+}
+*/
+
+void putu(unsigned t)  {
+	unsigned  r = t/10u;
+	if(r) putu(r);
+	r *= 10u;
+	t += '0';
+	putc(t - r);
 }
 
 // ==================== CONFIG ====================
@@ -186,18 +203,51 @@ void mandelbrot(void) {
     }
 }
 
+void print_time(unsigned t) {
+	char *sep="", *bl=" ";
+	if(t>3600000) {
+		puts(sep); sep=bl;
+		putu(t/3600000);
+		t %= 3600000;
+		puts("h");
+	}
+	if(t>60000) {
+		puts(sep); sep=bl;
+		putu(t/60000);
+		t %= 60000;
+		puts("m");
+	}
+	if(t>1000) {
+		puts(sep); sep=bl;
+		putu(t/1000);
+		t %= 1000;
+		puts("s");
+	}
+	if(t>0) {
+		puts(sep);
+		putu(t);
+		puts("ms");
+	}
+}
+
 void main(int ac,  char **av) {
+	unsigned t;
 	cursor(0);
 	border(0);
 	esc(GFX_MODE_BM16);
 	setPalette();
 	//pattern();
+	t = readMillis();
 	mandelbrot();
+	t = readMillis() - t;
 	beep();
 	while(!getc());
 	esc(GFX_MODE_40);
 	paper(0);ink(15);cls();
-	puts("hello, world!\r\n");
+	puts("Mandelbrot computed in ");
+//	print_time(t);
+	putu((t+500)/1000);
+	puts(" secs.\r\n");
 }
 
 
