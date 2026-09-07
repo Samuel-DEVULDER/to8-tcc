@@ -1,8 +1,23 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.21.0 (fix R0 clobber in v8.10.0 local/local fast path)
+ * Version: 8.22.0 (fix in to8_peephole_merge_adj (v8.8.0))
  *
  * Changelog:
+ * - v8.22.0 CORRECTNESS FIX in to8_peephole_merge_adj (v8.8.0): the four
+ *   materialization sites only rewrote candidate->imm_val, leaving the ADJ
+ *   at its emission position (right after the last CALL of the chain) while
+ *   the "+= defer" bookkeeping applied to crossed slot lines assumed it
+ *   executes at the break point. The stack was thus released too early, and
+ *   every slot access between the last merged call and the break point
+ *   addressed `defer` bytes too high - silently: offsets stay in range and
+ *   the misread values look plausible. Repro: any -O function with calls, a
+ *   label/jump closing a merge chain, and a local access after it (seen on
+ *   mandel's timing printout: "t = readMillis() - t" clobbered t itself).
+ *   Fix: new to8_materialize_adj() helper - all four sites now move the ADJ
+ *   to the materialization point before writing its immediate; the
+ *   end-of-list site needs no move (no slot access follows the last
+ *   positive ADJ).
+ *
  * - v8.21.0 CORRECTNESS FIX: the v8.10.0 local/local fast path in
  *   gen_opi() (`LD lslot ; <op> rslot`) writes R0 directly, bypassing
  *   gv()/get_reg() and therefore TCC's save_reg() - so a value from an
@@ -1135,7 +1150,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.21.0"
+#define TO8_GEN_VERSION "8.22.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3730,6 +3745,42 @@ static int to8_peephole_jump_inversion(void)
     return changed;
 }
 
+/* Materialize the pending ADJ-chain candidate: bake the deferred sum
+ * into its immediate, and MOVE the line right before `before`
+ * (before==NULL: no move, see below).
+ *
+ * The move is the correctness fix, not decoration: the "+= defer"
+ * applied to crossed ARG_SLOT/ARG_SLOT2 lines while the chain is
+ * pending assumes the ADJ EXECUTES at the materialization point.
+ * Left at its emission position (right after the last CALL of the
+ * chain), a materialized ADJ would release the stack too early and
+ * double-count `defer` for every slot access in between.
+ *
+ * Safe by construction: the scan loop breaks on the first
+ * is_target/ARG_JMP, so no label or jump exists between candidate
+ * and `before` - the move crosses no join point, and since candidate
+ * strictly precedes `before`, before->prev != NULL. Fall-through sees
+ * the ADJ right before `before`; taken branches never execute it, and
+ * every ARG_JMP is itself a break point, so the argument stack is
+ * still empty at every label/branch, exactly as in unmerged code.
+ *
+ * before==NULL (end of list): no move. The candidate is then the last
+ * positive ADJ; no slot access follows it in the list, so the "+= defer"
+ * already applied to earlier lines stays valid with the ADJ left where
+ * it is (it still executes after them).
+ */
+static void to8_materialize_adj(to8_line *candidate, to8_line *before, int defer)
+{
+    if (!candidate)
+        return;
+    if (before) {
+        to8_unlink(candidate);
+        to8_insert_after(before->prev, candidate);
+    }
+    candidate->imm_val = defer;
+    imm_comment(candidate->comment, sizeof candidate->comment, OP_ADJ, defer);
+}
+
 static int to8_peephole_merge_adj(void) {
     int changed = 0, defer = 0;
     to8_line *candidate = NULL;
@@ -3737,10 +3788,7 @@ static int to8_peephole_merge_adj(void) {
 
     for (cur = g_head; cur; cur = cur->next) {
         if (cur->is_target || cur->kind == ARG_JMP) {
-            if (candidate) {
-                candidate->imm_val = defer;
-                imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJ, defer);
-            }
+            to8_materialize_adj(candidate, cur, defer);
             candidate = NULL;
             defer = 0;
             continue;
@@ -3776,9 +3824,8 @@ static int to8_peephole_merge_adj(void) {
                  to8_final_slot(cur->slot_b, cur->push_depth + defer) > 127))
                 over = 1;
 
-            if (over && candidate) {
-                candidate->imm_val = defer;
-                imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJ, defer);
+            if (over) {
+				to8_materialize_adj(candidate, cur, defer);
                 candidate = NULL;
                 defer = 0;
             }
@@ -3796,10 +3843,7 @@ static int to8_peephole_merge_adj(void) {
                #1 above - exactly the remaining gap that let main() in
                dhry_1.c still fail at offset=172 after Guard #1 alone. */
             if (defer + cur->imm_val > 127 || defer + cur->imm_val < -128) {
-                if (candidate) {
-                    candidate->imm_val = defer;
-                    imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJ, defer);
-                }
+                to8_materialize_adj(candidate, cur, defer);
                 defer = 0;
                 candidate = NULL;
             }
@@ -3812,11 +3856,9 @@ static int to8_peephole_merge_adj(void) {
         }
     }
     
-    if (candidate) {
-        candidate->imm_val = defer;
-        imm_comment(candidate->comment, sizeof(candidate->comment), OP_ADJ, defer);
-    }            
-
+    /* End of list: no move needed (see to8_materialize_adj). */
+    to8_materialize_adj(candidate, NULL, defer);
+	
     return changed;
 }
 
