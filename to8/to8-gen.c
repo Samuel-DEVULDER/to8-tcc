@@ -1,8 +1,24 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.24.0 (new opcodes for constants fix ARG_SYM name resolved at render time)
+ * Version: 8.25.0 (new peephole: redundant R0 const re-loads removed)
  *
  * Changelog:
+ * - v8.25.0 R0-tracking restructured into one-invariant-per-pass passes,
+ *   matching the useless_ldf() precedent: to8_peephole_useless_ld() keeps
+ *   only the slot tracker, now updated by effect via the new shared
+ *   predicates to8_writes_r0()/to8_reads_r0() (ST1-4/PUSHr/JCC/ITOF/F-family
+ *   no longer kill the tracker despite never writing R0; raw asm() lines
+ *   are a hard barrier - dead_r0_load previously scanned THROUGH them).
+ *   New to8_peephole_useless_const(): drops redundant constant re-loads
+ *   (LDi ARG_IMM and the LDi_0/1/m1 forms via to8_line_const_load()) across
+ *   any window where R0 provably still holds the value - ST/PUSHr/JCC read
+ *   R0, ADJ/PUSH/MOV/F-family never touch it. "int a = 0, b = 0;" now emits
+ *   one load, not two. n one-tracker passes over one n-tracker pass: unlink
+ *   never changes R0, so each pass's tracker survives its own unlinks by
+ *   construction - no per-(unlink, tracker) audit, unlike the merged
+ *   variant. Cross-pass chains (redundant LD masking a redundant LDi)
+ *   converge through the existing fixed-point driver in one extra round;
+ *   identical fixed point either way.
  *
  * - v8.24.0 new operand-less constant-load opcodes: LDi_0/LDi_1/LDi_m1
  *   (R0 = 0/1/-1) and LDFi_0/LDGi_01 (F/G = 0.0f), plus
@@ -1174,7 +1190,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.24.0"
+#define TO8_GEN_VERSION "8.25.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3454,20 +3470,135 @@ static int to8_peephole_mov(void)
     return changed;
 }
 
+/* ---- Single source of truth: what each opcode does to R0. ----
+ * writes_r0: puts a NEW value into R0 (any R0 tracker must die).
+ *   Defaults to TRUE: an opcode forgotten here only loses an
+ *   optimization, never miscompiles.
+ * reads_r0: observes R0 without changing it (trackers survive;
+ *   the dead_r0_load scan must STOP - the pending load is consumed).
+ *   Defaults to FALSE.
+ * Raw inline asm (is_raw_text) is arbitrarily dangerous: forced to
+ * write R0 so every consumer treats it as a full barrier.
+ */
+static int to8_writes_r0(const to8_line *ln)
+{
+    if (ln->is_raw_text)
+        return 1;
+
+    switch (ln->op) {
+    /* untouched for R0: never WRITES R0 - includes the pure readers
+     * (ST/PUSHr/JCC read it, ITOF consumes it into F) plus the F/G
+     * family and slot-only transfers. Trackers may survive all of
+     * these. Pure readers also appear in to8_reads_r0(), which is
+     * what dead_r0_load-style consumers must check. */
+    case OP_NOP: case OP_MOV: case OP_ADJ:
+    case OP_PUSH: case OP_PUSHi:
+    case OP_JRA:
+    case OP_ST: case OP_ST1: case OP_ST2: case OP_ST4:      /* NEW */
+    case OP_ST1m: case OP_ST2m: case OP_ST4m:               /* NEW */
+    case OP_PUSHr:                                          /* NEW */
+    case OP_JEQ: case OP_JNE: case OP_JLT:                  /* NEW */
+    case OP_JGT: case OP_JLE: case OP_JGE:                  /* NEW */
+    case OP_FMOV: case OP_ITOF:
+    case OP_LDFi: case OP_LDGi:
+    case OP_LDF4: case OP_LDG4: case OP_LDF8: case OP_LDG8:
+    case OP_LDF4m: case OP_LDG4m: case OP_LDF8m: case OP_LDG8m:
+    case OP_STF4: case OP_STF8: case OP_STF4m: case OP_STF8m:
+    case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
+    case OP_FSCALEi:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
+static int to8_reads_r0(const to8_line *ln)
+{
+    if (ln->is_raw_text)
+        return 1;
+    switch (ln->op) {
+    case OP_ST: case OP_ST1: case OP_ST2: case OP_ST4:
+    case OP_ST1m: case OP_ST2m: case OP_ST4m:
+    case OP_PUSHr:
+    case OP_JEQ: case OP_JNE: case OP_JLT:
+    case OP_JGT: case OP_JLE: case OP_JGE:
+    case OP_ITOF:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* If `ln` loads a compile-time constant into R0, set *val to it and
+ * return 1; return 0 otherwise. Single definition of "const load".
+ * Return flag, never a sentinel value in *val: -1 is a legal
+ * constant. ARG_SYM is NOT a const load: it carries an ADDRESS. */
+static int to8_line_const_load(const to8_line *ln, int *val)
+{
+    switch (ln->op) {
+    case OP_LDi:
+        if (ln->kind == ARG_IMM) { *val = ln->imm_val; return 1; }
+        return 0;
+    case OP_LDi_0:  *val = 0;  return 1;
+    case OP_LDi_1:  *val = 1;  return 1;
+    case OP_LDi_m1: *val = -1; return 1;
+    default:
+        return 0;
+    }
+}
+
+/* v8.25.0: remove redundant constant re-loads. One invariant: R0
+ * provably holds compile-time constant k (LDi ARG_IMM / LDi_0/1/m1
+ * forms, per to8_line_const_load). Tracker dies ONLY on: a jump
+ * target (alternate entry path may carry a different R0) or any
+ * R0-writing line (to8_writes_r0). It survives everything else -
+ * ST/PUSHr/JCC read R0, ADJ/PUSH/MOV/F-family never touch it.
+ * Same one-invariant-per-pass structure as useless_ldf(); unlink
+ * never changes R0, so the tracker is left untouched after it. */
+static int to8_peephole_useless_const(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+    int active = 0, val = 0;
+
+    while (cur) {
+        to8_line *nxt = cur->next;
+        int cval;
+
+        if (cur->is_target)
+            active = 0;
+
+        if (active && to8_line_const_load(cur, &cval) && cval == val) {
+            to8_unlink(cur);
+            changed = 1;
+            cur = nxt;
+            continue;               /* tracker unchanged: R0 still holds k */
+        }
+
+        if (to8_line_const_load(cur, &cval)) {
+            active = 1;
+            val = cval;
+        } else if (to8_writes_r0(cur)) {
+            active = 0;
+        }
+
+        cur = nxt;
+    }
+    return changed;
+}
+
 static int to8_peephole_useless_ld(void)
 {
     int changed = 0;
     to8_line *cur = g_head;
-    int r0_holds_slot = -1;  /* -1 = unknown, otherwise R0 holds that slot */
-    
+    int r0_holds_slot = -1;   /* -1 = unknown, else R0 == slot N's content */
+
     while (cur) {
         to8_line *nxt = cur->next;
-        
-        /* A jump target invalidates our knowledge */
+
         if (cur->is_target)
             r0_holds_slot = -1;
-        
-        /* Check for useless LD */
+
         if (cur->op == OP_LD && cur->kind == ARG_SLOT &&
             r0_holds_slot != -1 && cur->slot_a == r0_holds_slot) {
             to8_unlink(cur);
@@ -3475,35 +3606,23 @@ static int to8_peephole_useless_ld(void)
             cur = nxt;
             continue;
         }
-        
-        /* Update tracking */
-        switch (cur->op) {
-        case OP_LD:
-            if (cur->kind == ARG_SLOT)
-                r0_holds_slot = cur->slot_a;
-            else
-                r0_holds_slot = -1;
-            break;
-        case OP_ST:
-            if (cur->kind == ARG_SLOT)
-                r0_holds_slot = cur->slot_a;
-        /* fall through */
-        case OP_ST1:
-        case OP_ST2:
-        case OP_ST4:
-            break;
-        case OP_MOV:
-            if (cur->kind == ARG_SLOT2 && cur->slot_a == r0_holds_slot)
-                r0_holds_slot = -1;
-            break;
-        default:
+
+        /* Tracker update by effect: LD/ST characterize (R0 == that
+         * slot now), MOV may clobber the tracked SLOT (never R0),
+         * generic R0 writers kill, everything else preserves. */
+        if (cur->op == OP_LD && cur->kind == ARG_SLOT) {
+            r0_holds_slot = cur->slot_a;
+        } else if (cur->op == OP_ST && cur->kind == ARG_SLOT) {
+            r0_holds_slot = cur->slot_a;
+        } else if (cur->op == OP_MOV && cur->kind == ARG_SLOT2 &&
+                   cur->slot_a == r0_holds_slot) {
             r0_holds_slot = -1;
-            break;
+        } else if (to8_writes_r0(cur)) {
+            r0_holds_slot = -1;
         }
-        
+
         cur = nxt;
     }
-    
     return changed;
 }
 
@@ -4282,6 +4401,7 @@ static void to8_peephole_run(void)
         changed |= to8_peephole_ext();
         changed |= to8_peephole_mov();
         changed |= to8_peephole_useless_ld();
+	changed |= to8_peephole_useless_const();   /* NEW v8.26.0 */
         changed |= to8_peephole_useless_ldf(); /* NEW v8.0.1 */
 	changed |= to8_peephole_cst(); /* V8.24.0 */
         changed |= to8_peephole_fmov(); /* v8.4.0 */
