@@ -47,6 +47,8 @@ git-pull-all:
 	sed -n '/\* TO8 backend/,/\* --- end of asm ---/p' >> $@
 	@echo "	echo Code  size = &(*-__start) bytes (&((*-__start+1023)/1024) kb)" >>$@
 	@echo "__start set __start+0" >>$@
+	@echo "	echo Free  size = &($E000-*) bytes (&(($E000-*)/1024) kb)" >>$@
+	@echo " echo" >>$@
 	@echo "	echo Total size = &(*-init) bytes (&((*-init+1023)/1024) kb)" >>$@
 	@echo "	end	init" >>$@
 	@rm '.$(shell basename "$*").o'

@@ -1,6 +1,17 @@
-* to8-vm.asm kind of crt0.o
+* to8-vm.asm 32bit virtual machine for thomson to8.
 *
 * Lightweight. No banking system here.
+
+* VM dispatch model: U is the instruction-stream pointer. The stream is
+* a flat sequence of 2-byte HANDLER ADDRESSES and inline operands. Each
+* handler is entered with U pointing at its own operand bytes (the
+* dispatching pulu pc consumed the address). A handler eats its operands
+* with pulu and dispatches the next opcode either with
+* "pulu ...,y ; jmp ,y" (operands + return address in ONE pull) or a
+* bare "pulu pc" when nothing of this instruction remains.
+*
+* All VM state (R0,R1) sits on the DP page (setdp): every access is
+* 2-byte direct.
 
 	org	$9000
 
@@ -76,7 +87,18 @@ opNEGx	com	,x
 	inc	,x
 opNEGx0 rts
 		
-* bool
+* boolean
+* ========                
+
+* Booleanize R0 to normalized 0/1 (unlike CMP, which leaves a
+* sign_class value). Low word tested first - R0+2 nonzero is the
+* common case. DELIBERATE fall-throughs: opSNE -> opLDi_1,
+* opSEQ -> opLDi_0; the physical block order is part of the logic.
+* opSGT/opSLE: bgt works ONLY because ldd clears V - bgt is then
+* exactly "high word > 0 signed". Never "simplify" to bpl (always
+* taken after an untaken bmi: N=0 already) or bhi (reads the stale
+* carry of the subd that produced R0).
+
 opSNE	ldd	<R0+2
 	bne	opLDi_1
 	ldd	<R0
@@ -124,6 +146,21 @@ opSLE	ldd	<R0
 	beq	opLDi_1
 	bra	opLDi_0
 
+* Comparison
+* ==========
+
+* R0 = sign_class(R0-y): only R0's SIGN and ZERO-NESS are defined
+* afterwards (ISA note); magnitude unspecified. On the high-word-
+* differing paths only R0[0] ($01/$FF) is written - stale bytes are
+* harmless because high!=0 guarantees "not equal", and zero-ness on
+* the equal path is exact via opLD_LH (D=0).
+* opCMP: bgt/blt right after subd = the CPU's N xor V - exact signed
+* order across 16-bit wrap ($7FFF... vs $8000...).
+* opUCMP: bcs/bhi - the borrow IS the unsigned order, C survives subd.
+* Shared low-word tiebreak opUCMPc: equal high words make the 32-bit
+* order IDENTICAL to the unsigned low-word order in both signed and
+* unsigned mode - one body serves both families.
+
 opCMP2	pulu	d
 	leax	a,s
 	leay	b,s
@@ -170,6 +207,26 @@ opUCMPb ldd	,x
 	bra	opUCMPc
 
 * load
+* ====
+
+* LDi: [imm:4][ret:2] eaten by one pulu d,x,y.
+* LEA: slot high byte guaranteed 0 (final slots in [0..127]), so
+*       leax b,s builds the address from B alone; clrb: A assumed 0.
+* LD:   32-bit load through D/X; opSTR0 tail shared with LEA.
+* MOV:  operand read IN PLACE (ldd ,u) for the two leax; the final
+*       "pulu d,pc" discards it AND dispatches in one instruction.
+*
+* Three addressing forms per size (slot / pointer-in-R0 / pointer-
+* in-stream) converge to one body with X = effective pointer.
+* Sign/zero extension is FUSED: the body falls through into the
+* opEXT* handler below. SKIP2X is the trick: executed as "LDX #imm",
+* it swallows the FIRST instruction of the EXT handler (2 bytes,
+* redundant here - the data is already in D/B) with no branch and
+* lands right after it. When opEXT* is dispatched directly from the
+* stream, that first instruction runs normally and reloads from R0.
+* (opEXTu2 starts with a 3-byte ldd # - nothing redundant to absorb,
+* so opLDu2a falls through without a SKIP.)
+*
 opLDi	pulu	d,x,y
 	std	<R0
 	stx	<R0+2
@@ -308,6 +365,12 @@ opST	pulu	d,y
 	jmp	,y
 
 * stack
+* =====
+
+* ADJ: leax b,s with B SIGN-extended (8-bit indexed mode) handles both
+* prologue (negative frame alloc) and call cleanup (positive release)
+* in one instruction;
+
 opADJ	pulu	d,y
 	leas	b,s
 	jmp	,y
@@ -329,6 +392,13 @@ opPUSHi pulu	d,x,y
 	jmp	,y
 
 * call
+* ====
+*
+* U doubles as the VM program counter: a call saves the caller's U
+* (pshs d,u - D = bank, TODO) and loads U = callee entry; RET
+* restores it. CALLm/CALLr likewise just retarget U, then pulu pc
+* dispatches the callee's first opcode.
+*
 opRET	puls	d,u	; TODO banking
 	pulu	pc
 
@@ -347,6 +417,13 @@ opCALLb	leau	,x	; TODO banking
 	pulu	pc
 	
 * jump
+* ====
+*
+* JRA: "ldu ,u" reloads U straight from the stream (the operand IS
+* the new instruction pointer). JRN: "pulu y,pc" discards the target
+* operand and dispatches - the not-taken tail shared by all JCC.
+* opJGT/opJLE need bgt (not bpl) exactly like opSGT/opSLE above.
+*
 opJNE	ldd	<R0+2
 	bne	opJRA
 	ldd	<R0
@@ -387,6 +464,14 @@ opJLE	ldd	<R0
 	pulu	y,pc
 	
 * arith
+* =====
+*
+* 32-bit add/sub in two halves on the DP page; C carries the
+* cross-word carry/borrow (ldd preserves it). opADD: the +1 carry
+* propagation is folded into the high operand BEFORE the add, and
+* "beq" skips the whole high add when it is a no-op (the common
+* small-constant case: high word $0000).
+*
 opADD2	pulu	d
 	leax	a,s
 	leay	b,s
@@ -470,6 +555,12 @@ op\0b	ldd	2,x
 	opLOG	AND
 	opLOG	OR
 	opLOG	EOR
+
+* 16x16 multiply, full 32-bit result: diagonal products (33, 22)
+* into both words, cross products (23, 32) added into bytes 1..2
+* with carry into R0[0]. PREREQUISITE: both HIGH words must be zero
+* - guaranteed by the only call site (opMUL1 tests both words
+* first); products 13/31 and low halves of 03/12/21/30 are absent.
 
 opMUL16 lda	3,x
 	ldb	3,y
@@ -618,6 +709,9 @@ opMULc	lda	a,x
 	stb	<R0
 	rts
 	endc
+* C99 truncating semantics: save both signs on stack, make operands
+* positive (opNEG), run the shared opUDIVy, reapply signs. MOD
+* negates the remainder with the DIVIDEND's sign only (C99 %).
 
 opDIV2	pulu	d
 	leax	a,s
@@ -744,7 +838,16 @@ opUMODa jsr	<opUDIVy
 	std	<R0+2
 	pulu	pc	  
 
-* shifts
+* shift
+* =====
+*
+* Shift amount = low BYTE of the slot (read in place via "ldb b,s" -
+* B-offset indexed, no leax needed). Same SKIP2X trick as the EXT
+* family: the fall-through absorbs opSHLi's redundant "pulu d,y".
+* Shift itself: binary decomposition - lsr <R1 emits amount bits
+* LSB-first into C, each set bit applies the pre-unrolled partial
+* shift. Shortcut when one 16-bit half of R0 is zero.
+*
 lslR0	macro
 	lslb
 	rola
@@ -953,7 +1056,14 @@ opSAR_32
 	jmp	,y
 
 	echo	VM    size = &(*-R0) bytes
-       
+    
+* crt0: saves regs, setdp, self-modifying "sts __exit+2" patches the
+* return address; EXTRAMON cold-reset + VALTYP/DBLFLG init when FPU.
+* Timer: the 10Hz IRQ vector is retargeted to interCLK (CLK = 4-byte
+* 1/10s counter); startCLK/stopCLK patch their own orcc/andcc
+* immediates to restore exactly the previous IRQ state. opLDCLK
+* reads CLK atomically under orcc #$50.
+    
 crt0	pshs	d,x,y,u,dp,cc
 	ldd	#R0&$FF00
 	tfr	a,dp
