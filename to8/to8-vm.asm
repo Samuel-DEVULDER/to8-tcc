@@ -5,7 +5,7 @@
 	org	$9000
 
 FPU	set	1
-FATMUL  set     1
+FATMUL	set	1
 
 	setdp	R0/256
 	
@@ -75,32 +75,32 @@ opNEGx	com	,x
 	bcc	opNEGx0
 	inc	,x
 opNEGx0 rts
-                
+		
 * bool
 opSNE	ldd	<R0+2
 	bne	opLDi_1
 	ldd	<R0
 	beq	opLDi_D
 
-opLDi_1 ldd     #1
-        std     <R0+2
-        clrb
-        std     <R0
-        pulu    pc
+opLDi_1 ldd	#1
+	std	<R0+2
+	clrb
+	std	<R0
+	pulu	pc
 
 opLDi_m1
-        ldd     #-1
-        bra     opLDi_D
+	ldd	#-1
+	bra	opLDi_D
 	
 opSEQ	ldd	<R0+2
 	bne	opLDi_0
 	ldd	<R0
 	beq	opLDi_1
 
-opLDi_0 ldd     #0
-opLDi_D std     <R0+2
-        std     <R0
-        pulu    pc
+opLDi_0 ldd	#0
+opLDi_D std	<R0+2
+	std	<R0
+	pulu	pc
 	
 opSGE	lda	<R0
 	bpl	opLDi_1
@@ -321,7 +321,7 @@ opJRA	ldu	,u	; TODO banking
 	
 opJGE	lda	<R0
 	bpl	opJRA
-	pulu	d,pc    ; D = trash address
+	pulu	d,pc	; D = trash address
 
 opJLT	lda	<R0
 	bmi	opJRA
@@ -345,37 +345,37 @@ opJLE	ldd	<R0
 opADD2	pulu	d
 	leax	a,s
 	leay	b,s
-        ldd     2,x
-        addd    2,y
-        std     <R0+2
-        ldd     ,x
-        adcb    1,y
-        adca    ,y
-        std     <R0
-        pulu    pc
-        
+	ldd	2,x
+	addd	2,y
+	std	<R0+2
+	ldd	,x
+	adcb	1,y
+	adca	,y
+	std	<R0
+	pulu	pc
+	
 opADDi	leay	,u
 	leau	6,u
-        ldx     -2,u
+	ldx	-2,u
 	bra	opADDa
 
 opADD	pulu	d,x
-	leay	b,s        
+	leay	b,s	   
 opADDa	ldd	<R0+2
 	addd	2,y
 	std	<R0+2
 	ldd	,y
-        bcc     opADDb
-        addd    #1
-opADDb  beq     opADDc
-	addd    <R0
+	bcc	opADDb
+	addd	#1
+opADDb	beq	opADDc
+	addd	<R0
 	std	<R0
-opADDc	jmp     ,x
+opADDc	jmp	,x
 	
 opSUB2	pulu	d
 	leax	a,s
 	leay	b,s
-        ldd	2,x
+	ldd	2,x
 	subd	2,y
 	std	<R0+2
 	ldd	,x
@@ -383,12 +383,12 @@ opSUB2	pulu	d
 	sbca	,y
 	std	<R0
 	pulu	pc
-        
+	
 opSUBi	leay	,u
 	leau	6,u
-        ldx     -2,u
-        bra	opSUBa
-        
+	ldx	-2,u
+	bra	opSUBa
+	
 opSUB	pulu	d,x
 	leay	b,s
 opSUBa	ldd	<R0+2
@@ -398,7 +398,7 @@ opSUBa	ldd	<R0+2
 	sbcb	1,y
 	sbca	,y
 	std	<R0
-	jmp     ,x
+	jmp	,x
 
 opLOG	macro
 op\02	pulu	d
@@ -506,18 +506,18 @@ opMUL	pulu	d
 opMUL0	ldd	<R0+2
 	std	<R1+2
 	ldd	<R0
-        std     <R1
-        ldx	#R1
-opMUL1  ldd     ,x
+	std	<R1
+	ldx	#R1
+opMUL1	ldd	,x
 	bne	opMUL3
 	ldd	,y
 	beq	opMUL16
-        ldb     1,x
-        
-*        0123
-*        0123
-*        
-*        33*
+	ldb	1,x
+	
+*	 0123
+*	 0123
+*	 
+*	 33*
 *      23
 *      32
 *    13*
@@ -528,11 +528,11 @@ opMUL1  ldd     ,x
 *  21
 *  30
 
-CROSSa  macro
-        ifeq    FATMUL
+CROSSa	macro
+	ifeq	FATMUL
 	ldd	#\0*256+\1
 	bsr	opMULa
-        else
+	else
 	lda	\0,x
 	ldb	\1,y
 	mul
@@ -541,34 +541,34 @@ CROSSa  macro
 	bcc	opMUL\0\1
 	inc	<R0
 opMUL\0\1
-        endc
-        endm
+	endc
+	endm
 
-CROSSb  macro
-        ifeq    FATMUL
+CROSSb	macro
+	ifeq	FATMUL
 	ldd	#\0*256+\1
 	bsr	opMULb
-        else
-        lda	\0,x
+	else
+	lda	\0,x
 	ldb	\1,y
 	mul
 	addd	<R0
 	std	<R0
-        endc
-        endm
+	endc
+	endm
 
-CROSSc  macro
-        ifeq    FATMUL
+CROSSc	macro
+	ifeq	FATMUL
 	ldd	#\0*256+\1
 	bsr	opMULc
-        else
+	else
 	lda	\0,x
 	ldb	\1,y
 	mul
 	addb	<R0
 	stb	<R0
-        endc
-        endm
+	endc
+	endm
 
 opMUL3	lda	3,y
 	mul
@@ -579,19 +579,19 @@ opMUL3	lda	3,y
 	mul
 	std	<R0+2
 
-        CROSSa  3,2
-        CROSSa  2,3
+	CROSSa	3,2
+	CROSSa	2,3
 
-	CROSSb  2,2
-        CROSSb  3,1
+	CROSSb	2,2
+	CROSSb	3,1
 	
-	CROSSc  0,3
-        CROSSc  1,2
-        CROSSc  2,1
-        CROSSc  3,0
+	CROSSc	0,3
+	CROSSc	1,2
+	CROSSc	2,1
+	CROSSc	3,0
 	pulu	pc
 
-        ifeq    FATMUL
+	ifeq	FATMUL
 opMULa	lda	a,x
 	ldb	b,y
 	mul
@@ -599,7 +599,7 @@ opMULa	lda	a,x
 	std	<R0+1
 	bcc	opMULd
 	inc	<R0
-opMULd  rts	   
+opMULd	rts	   
 
 opMULb	lda	a,x
 	ldb	b,y
@@ -614,7 +614,7 @@ opMULc	lda	a,x
 	addb	<R0
 	stb	<R0
 	rts
-        endc
+	endc
 
 opDIV2	pulu	d
 	leax	a,s
@@ -749,7 +749,7 @@ lslR0	macro
 	rol	<R0
 	endm
 opSHL	pulu	d,y
-        addb    #3
+	addb	#3
 	LDB	b,s
 	SKIP2X
 opSHLi	pulu	d,y
@@ -785,7 +785,7 @@ opSHL_16
 	std	<R0+2
 opSHL_32
 	jmp	,y
-        
+	
 opSHL_half
 	ldd	<R0
 	lsr	<R1
@@ -822,7 +822,7 @@ opSHL_half16
 opSHL_half32
 	std	<R0
 	jmp	,y
-        
+	
 lsrR0	macro
 	lsra
 	rorb
@@ -830,7 +830,7 @@ lsrR0	macro
 	ror	<R0+3
 	endm
 opSHR	pulu	d,y
-        addb    #3
+	addb	#3
 	ldb	b,s
 	SKIP2X
 opSHRi	pulu	d,y
@@ -866,7 +866,7 @@ opSHR_0 ldd	#0
 	std	<R0
 opSHR_32
 	jmp	,y
-        
+	
 opSHR_half
 	ldd	<R0+2
 	lsr	<R1
@@ -911,7 +911,7 @@ asrR0	macro
 	ror	<R0+3
 	endm
 opSAR	pulu	d,y
-	addb    #3
+	addb	#3
 	LDB	b,s
 	SKIP2X
 opSARi	pulu	d,y
@@ -1028,7 +1028,7 @@ startCLK
 	ldb	,x 
 	orb	#$20
 	stb	,x	
-        
+	
 	andcc	#$AF
 	rts
 
