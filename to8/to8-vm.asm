@@ -374,14 +374,14 @@ opJLT	lda	<R0
 	  
 opJGT	ldd	<R0
 	bmi	opJRN
-	bpl	opJRA
+	bgt	opJRA
 	ldd	<R0+2
 	bne	opJRA
 	pulu	y,pc
 	
 opJLE	ldd	<R0
 	bmi	opJRA
-	bpl	opJRN
+	bgt	opJRN
 	ldd	<R0+2
 	beq	opJRA
 	pulu	y,pc
