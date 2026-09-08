@@ -5,7 +5,7 @@
 	org	$9000
 
 FPU	set	1
-FATMUL  set     0
+FATMUL  set     1
 
 	setdp	R0/256
 	
@@ -468,6 +468,32 @@ opUCMPb ldd	,x
 	BLO	opSET_1
 	BRA	opCMPc	
 
+opMUL16 lda	3,x
+	ldb	3,y
+	mul
+	std	<R0+2
+	lda	2,x
+	ldb	2,y
+	mul
+	std	<R0
+	lda	2,x
+	beq	opMULe
+	ldb	3,y
+	mul
+	addd	<R0+1
+	std	<R0+1
+	bcc	opMULe
+	inc	<R0
+opMULe	ldb	2,y
+	beq	opMULf
+	lda	3,x
+	mul
+	addd	<R0+1
+	std	<R0+1
+	bcc	opMULf
+	inc	<R0
+opMULf	pulu	pc
+
 opMUL2	pulu	d
 	leax	a,s
 	leay	b,s
@@ -501,7 +527,49 @@ opMUL1  ldd     ,x
 *  12
 *  21
 *  30
-        
+
+CROSSa  macro
+        ifeq    FATMUL
+	ldd	#\0*256+\1
+	bsr	opMULa
+        else
+	lda	\0,x
+	ldb	\1,y
+	mul
+	addd	<R0+1
+	std	<R0+1
+	bcc	opMUL\0\1
+	inc	<R0
+opMUL\0\1
+        endc
+        endm
+
+CROSSb  macro
+        ifeq    FATMUL
+	ldd	#\0*256+\1
+	bsr	opMULb
+        else
+        lda	\0,x
+	ldb	\1,y
+	mul
+	addd	<R0
+	std	<R0
+        endc
+        endm
+
+CROSSc  macro
+        ifeq    FATMUL
+	ldd	#\0*256+\1
+	bsr	opMULc
+        else
+	lda	\0,x
+	ldb	\1,y
+	mul
+	addb	<R0
+	stb	<R0
+        endc
+        endm
+
 opMUL3	lda	3,y
 	mul
 	std	<R0
@@ -510,27 +578,20 @@ opMUL3	lda	3,y
 	ldb	3,x
 	mul
 	std	<R0+2
-	
-	ldd	#$0302
-	bsr	opMULa
-	ldd	#$0203
-	bsr	opMULa	
 
-	ldd	#$0202
-	bsr	opMULb
-	ldd	#$0301
-	bsr	opMULb
+        CROSSa  3,2
+        CROSSa  2,3
+
+	CROSSb  2,2
+        CROSSb  3,1
 	
-	ldd	#$0003
-	bsr	opMULc
-	ldd	#$0102
-	bsr	opMULc
-	ldd	#$0201
-	bsr	opMULc
-	ldd	#$0300
-	bsr	opMULc
+	CROSSc  0,3
+        CROSSc  1,2
+        CROSSc  2,1
+        CROSSc  3,0
 	pulu	pc
 
+        ifeq    FATMUL
 opMULa	lda	a,x
 	ldb	b,y
 	mul
@@ -553,32 +614,7 @@ opMULc	lda	a,x
 	addb	<R0
 	stb	<R0
 	rts
-
-opMUL16 lda	3,x
-	ldb	3,y
-	mul
-	std	<R0+2
-	lda	2,x
-	ldb	2,y
-	mul
-	std	<R0
-	lda	2,x
-	beq	opMULe
-	ldb	3,y
-	mul
-	addd	<R0+1
-	std	<R0+1
-	bcc	opMULe
-	inc	<R0
-opMULe	ldb	2,y
-	beq	opMULf
-	lda	3,x
-	mul
-	addd	<R0+1
-	std	<R0+1
-	bcc	opMULf
-	inc	<R0
-opMULf	pulu	pc
+        endc
 
 opDIV2	pulu	d
 	leax	a,s
