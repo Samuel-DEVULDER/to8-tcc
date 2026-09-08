@@ -345,33 +345,37 @@ opJLE	ldd	<R0
 opADD2	pulu	d
 	leax	a,s
 	leay	b,s
-	bra	opADD1
+        ldd     2,x
+        addd    2,y
+        std     <R0+2
+        ldd     ,x
+        adcb    1,y
+        adca    ,y
+        std     <R0
+        pulu    pc
+        
 opADDi	leay	,u
-	leau	4,u
-	bra	opADD0
-opADD	pulu	d
-	leay	b,s
-opADD0	ldx	#R0
-opADD1	ldd	2,x
+	leau	6,u
+        ldx     -2,u
+	bra	opADDa
+
+opADD	pulu	d,x
+	leay	b,s        
+opADDa	ldd	<R0+2
 	addd	2,y
 	std	<R0+2
-	ldd	,x
-	adcb	1,y
-	adca	,y
+	ldd	,y
+        bcc     opADDb
+        addd    #1
+opADDb  beq     opADDc
+	addd    <R0
 	std	<R0
-	pulu	pc
+opADDc	jmp     ,x
 	
 opSUB2	pulu	d
 	leax	a,s
 	leay	b,s
-	bra	opSUB1
-opSUBi	leay	,u
-	leau	4,u
-	bra	opSUB0
-opSUB	pulu	d
-	leay	b,s
-opSUB0	ldx	#R0
-opSUB1	ldd	2,x
+        ldd	2,x
 	subd	2,y
 	std	<R0+2
 	ldd	,x
@@ -379,6 +383,22 @@ opSUB1	ldd	2,x
 	sbca	,y
 	std	<R0
 	pulu	pc
+        
+opSUBi	leay	,u
+	leau	6,u
+        ldx     -2,u
+        bra	opSUBa
+        
+opSUB	pulu	d,x
+	leay	b,s
+opSUBa	ldd	<R0+2
+	subd	2,y
+	std	<R0+2
+	ldd	<R0
+	sbcb	1,y
+	sbca	,y
+	std	<R0
+	jmp     ,x
 
 opLOG	macro
 op\02	pulu	d
@@ -514,24 +534,21 @@ opMUL3	lda	3,y
 opMULa	lda	a,x
 	ldb	b,y
 	mul
-	beq	opMULd
 	addd	<R0+1
 	std	<R0+1
 	bcc	opMULd
 	inc	<R0
-opMULd	rts	   
+opMULd  rts	   
 
 opMULb	lda	a,x
 	ldb	b,y
 	mul
-	beq	opMULd
 	addd	<R0
 	std	<R0
 	rts	   
 
 opMULc	lda	a,x
 	ldb	b,y
-	beq	opMULd
 	mul
 	addb	<R0
 	stb	<R0
@@ -553,9 +570,9 @@ opMUL16 lda	3,x
 	std	<R0+1
 	bcc	opMULe
 	inc	<R0
-opMULe	lda	3,x
-	ldb	2,y
+opMULe	ldb	2,y
 	beq	opMULf
+	lda	3,x
 	mul
 	addd	<R0+1
 	std	<R0+1
