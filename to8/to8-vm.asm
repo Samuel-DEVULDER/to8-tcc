@@ -80,7 +80,7 @@ opNEGx0 rts
 opSNE	ldd	<R0+2
 	bne	opLDi_1
 	ldd	<R0
-	beq	opLDi_D
+	beq	opLD_LH
 
 opLDi_1 ldd	#1
 	std	<R0+2
@@ -90,7 +90,7 @@ opLDi_1 ldd	#1
 
 opLDi_m1
 	ldd	#-1
-	bra	opLDi_D
+	bra	opLD_LH
 	
 opSEQ	ldd	<R0+2
 	bne	opLDi_0
@@ -98,8 +98,8 @@ opSEQ	ldd	<R0+2
 	beq	opLDi_1
 
 opLDi_0 ldd	#0
-opLDi_D std	<R0+2
-	std	<R0
+opLD_LH std	<R0+2
+opLD_H	std	<R0
 	pulu	pc
 	
 opSGE	lda	<R0
@@ -112,17 +112,62 @@ opSLT	lda	<R0
 	  
 opSGT	ldd	<R0
 	bmi	opLDi_0
-	bpl	opLDi_1
+	bgt	opLDi_1
 	ldd	<R0+2
-	beq	opLDi_D
+	beq	opLD_H
 	bra	opLDi_1
 	
 opSLE	ldd	<R0
 	bmi	opLDi_1
-	bpl	opLDi_0
+	bgt	opLDi_0
 	ldd	<R0+2
 	beq	opLDi_1
 	bra	opLDi_0
+
+opCMP2	pulu	d
+	leax	a,s
+	leay	b,s
+	bra	opCMPb
+opCMPi	leay	,u
+	leau	4,u
+	bra	opCMPa
+opCMP	pulu	d
+	leay	b,s
+opCMPa	ldx	#R0
+opCMPb	ldd	,x
+	subd	,y
+	bgt	opCMP_1
+        blt     opCMP_m1
+opUCMPc	ldd	2,x
+	subd	2,y
+        bcs     opCMP_m1
+        bhi     opCMP_1
+        bra     opLD_LH
+
+* stores onlysignj  info. Oneb yte is enough.
+opCMP_1 lda     #1
+        sta     <R0
+        pulu    pc
+opCMP_m1 
+        lda     #-1
+        sta     <R0
+        pulu    pc
+
+opUCMP2 pulu	d
+	leax	a,s
+	leay	b,s
+	bra	opUCMPb
+opUCMPi leay	,u
+	leau	4,u
+	bra	opUCMPa
+opUCMP	pulu	d
+	leay	b,s
+opUCMPa ldx	#R0
+opUCMPb ldd	,x
+	subd	,y
+        bcs     opCMP_m1
+        bhi     opCMP_1
+	bra	opUCMPc
 
 * load
 opLDi	pulu	d,x,y
@@ -425,48 +470,6 @@ op\0b	ldd	2,x
 	opLOG	AND
 	opLOG	OR
 	opLOG	EOR
-
-opCMP2	pulu	d
-	leax	a,s
-	leay	b,s
-	bra	opCMPb
-opCMPi	leay	,u
-	leau	4,u
-	bra	opCMPa
-opCMP	pulu	d
-	leay	b,s
-opCMPa	ldx	#R0
-opCMPb	ldd	,x
-	SUBD	,y
-	BGT	opSET1
-	BLT	opSET_1
-opCMPc	ldd	2,x
-	subd	2,y
-	BHI	opSET1
-	BLO	opSET_1
-opCMPd	std	<R0
-	std	<R0+2
-	pulu	pc
-opSET1	ldd	#1
-	bra	opCMPd	;writes $00010001 which makes B<CC> faster
-opSET_1 ldd	#-1
-	bra	opCMPd
-	
-opUCMP2 pulu	d
-	leax	a,s
-	leay	b,s
-	bra	opUCMPb
-opUCMPi leay	,u
-	leau	4,u
-	bra	opUCMPa
-opUCMP	pulu	d
-	leay	b,s
-opUCMPa ldx	#R0
-opUCMPb ldd	,x
-	SUBD	,y
-	BHI	opSET1
-	BLO	opSET_1
-	BRA	opCMPc	
 
 opMUL16 lda	3,x
 	ldb	3,y
