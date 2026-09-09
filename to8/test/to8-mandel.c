@@ -182,10 +182,10 @@ void putu(unsigned t)  {
 
 // ==================== MANDELBROT ====================
 void mandelbrot(void) {
-    int x, y, ci, cr;
+    int x, y, ci, cr, sr = -STEP_X, si = STEP_Y, one = 1;
     
-    for(ci = CI_BASE, y = HEIGHT-1; y>=0; ci +=  STEP_Y, --y) {
-        for(cr = CR_BASE, x = WIDTH-1; x>=0; cr -= STEP_X, --x) {
+    for(ci = CI_BASE, y = HEIGHT-1; y>=0; ci += si, y -= one) {
+        for(cr = CR_BASE, x = WIDTH-1; x>=0; cr += sr, x -= one) {
 	    unsigned zr2 = 0, zi2 = 0;
             int zr = 0, zi = 0;
             int iter = MAX_ITER;
@@ -196,7 +196,9 @@ void mandelbrot(void) {
 		    
                 zr2 = ((unsigned)(zr * zr)) >> FIX_MUL_SHIFT;
                 zi2 = ((unsigned)(zi * zi)) >> FIX_MUL_SHIFT;
-            } while(--iter && (zr2 + zi2) < (FIX_FOUR+1));
+		
+		iter -= one;
+            } while(iter && (zr2 + zi2) < (FIX_FOUR+1));
            
 	    plot(x,y, iter ? (MAX_ITER - iter + ((x^y)&1))>>1 : 0);
         }

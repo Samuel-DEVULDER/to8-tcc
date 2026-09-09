@@ -226,7 +226,7 @@ opUCMPb ldd	,x
 * stream, that first instruction runs normally and reloads from R0.
 * (opEXTu2 starts with a 3-byte ldd # - nothing redundant to absorb,
 * so opLDu2a falls through without a SKIP.)
-*
+
 opLDi	pulu	d,x,y
 	std	<R0
 	stx	<R0+2
@@ -357,12 +357,12 @@ opST4a	ldd	<R0
 	jmp	,y
 
 opST	pulu	d,y
-	leax	b,s
-	ldd	<R0
-	std	,x
-	ldd	<R0+2
-	std	2,x
-	jmp	,y
+        ldx     <R0
+        stx     b,s
+        addb    #2
+        ldx     <R0+2
+        stx     b,s
+        jmp	,y
 
 * stack
 * =====
