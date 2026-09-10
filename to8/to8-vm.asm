@@ -275,14 +275,14 @@ opSTR0	std	<R0hi
 	stx	<R0lo
 	jmp	,y
 
-opMOV	ldd	,u
-	leax	a,s
-	leay	b,s
-	ldd	,y
-	std	,x
-	ldd	2,y
-	std	2,x
-	pulu	d,pc
+opMOV	pulu    d,y
+	ldx	b,s
+	stx	a,s
+        adda    #2
+        addb    #2
+        ldx	b,s
+	stx	a,s
+        jmp     ,y
 
 opLD1m	pulu	x
 	bra	opLD1a
