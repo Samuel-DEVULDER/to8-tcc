@@ -143,7 +143,7 @@ void putu(unsigned t)  {
 }
 
 // ==================== CONFIG ====================
-#define FIX_FRAC 13
+#define FIX_FRAC 13 /* 8  = fast  13 = accurate */
 #define FIX_ONE (1 << FIX_FRAC)
 
 // Conversion float → fixed-point à la compilation
@@ -191,11 +191,11 @@ void mandelbrot(void) {
             int iter = MAX_ITER;
             
 	    do {
-		zi = ((zr * zi) >> FIX_2MUL_SHIFT) + ci;
-		zr = zr2 - zi2 + cr;
+		zi = ci + ((zr * zi) >> FIX_2MUL_SHIFT);
+		zr = cr + (zr2 - zi2);
 		    
-                zr2 = ((unsigned)(zr * zr)) >> FIX_MUL_SHIFT;
                 zi2 = ((unsigned)(zi * zi)) >> FIX_MUL_SHIFT;
+                zr2 = ((unsigned)(zr * zr)) >> FIX_MUL_SHIFT;
 		
 		iter -= one;
             } while(iter && (zr2 + zi2) < (FIX_FOUR+1));
