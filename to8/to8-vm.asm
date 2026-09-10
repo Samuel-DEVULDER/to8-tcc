@@ -13,99 +13,99 @@
 * All VM state (R0,R1) sits on the DP page (setdp): every access is
 * 2-byte direct.
 
-	org	$9000
+        org     $9000
 
-FPU	set	1
-FATMUL	set	1
+FPU     set     1
+FATMUL  set     1
 
-	setdp	R0hi/256
+        setdp   R0hi/256
 
-SKIP1	macro
-	fcb	$81	; CMPA #
-	endm
+SKIP1   macro
+        fcb     $81     ; CMPA #
+        endm
 
-SKIP2X	macro
-	fcb	$8e	; LDX #
-	endm
+SKIP2X  macro
+        fcb     $8e     ; LDX #
+        endm
 
-EXTRA	equ	$EC0C
-NBANK	equ	$618c
-MODELE	equ	$627B
+EXTRA   equ     $EC0C
+NBANK   equ     $618c
+MODELE  equ     $627B
 
-VALTYP	equ	$6105
-DBLFLG	equ	$6103
+VALTYP  equ     $6105
+DBLFLG  equ     $6103
 
-init	jmp	crt0
+init    jmp     crt0
 
-opST	pulu	b,y
-	ldx	#0
-R0hi	set	*-2
-	stx	b,s
-	addb	#2
-	ldx	#0
-R0lo	set	*-2
-	stx	b,s
-	jmp	,y
+opST    pulu    b,y
+        ldx     #0
+R0hi    set     *-2
+        stx     b,s
+        addb    #2
+        ldx     #0
+R0lo    set     *-2
+        stx     b,s
+        jmp     ,y
 
-R1	FDB	0,0	;
+R1      FDB     0,0     ;
 
-go_vm	puls	u
-	pulu	pc
+go_vm   puls    u
+        pulu    pc
 
 * Unsigned division of R0 by integer pointed by y.
 * Remainder in R1, /Quotient in {R0, carry}
-UDIV_Y	clra	       ; no ldd here in dp
-	clrb	       ; 1 byte maters
-	std	<R1
-	std	<R1+2
-	ldx	#32
-UDIV_l	rol	<R0lo+1
-	rol	<R0lo
-	rol	<R0hi+1
-	rol	<R0hi
-	ldd	<R1+2
-	rolb
-	rola
-	std	<R1+2
-	rol	<R1+1
-	rol	<R1
-	subd	2,y
-	std	<UDIV_0+1
-	ldd	<R1
-	sbcb	1,y
-	sbca	,y
-	bcs	UDIV_1
-	std	<R1
-UDIV_0	ldd	#0
-	std	<R1+2
-UDIV_1	leax	-1,x
-	bne	UDIV_l
-	rts
+UDIV_Y  clra           ; no ldd here in dp
+        clrb           ; 1 byte maters
+        std     <R1
+        std     <R1+2
+        ldx     #32
+UDIV_l  rol     <R0lo+1
+        rol     <R0lo
+        rol     <R0hi+1
+        rol     <R0hi
+        ldd     <R1+2
+        rolb
+        rola
+        std     <R1+2
+        rol     <R1+1
+        rol     <R1
+        subd    2,y
+        std     <UDIV_0+1
+        ldd     <R1
+        sbcb    1,y
+        sbca    ,y
+        bcs     UDIV_1
+        std     <R1
+UDIV_0  ldd     #0
+        std     <R1+2
+UDIV_1  leax    -1,x
+        bne     UDIV_l
+        rts
 
 * negate R0 or int at "x"
-NEG_	com	<R0hi
-	com	<R0hi+1
-	com	<R0lo
-	neg	<R0lo+1
-	bcc	NEG_Yx
-	inc	<R0lo
-	bcc	NEG_Yx
-	inc	<R0hi+1
-	bcc	NEG_Yx
-	inc	<R0hi
-	rts
+NEG_    com     <R0hi
+        com     <R0hi+1
+        com     <R0lo
+        neg     <R0lo+1
+        bcc     NEG_Yx
+        inc     <R0lo
+        bcc     NEG_Yx
+        inc     <R0hi+1
+        bcc     NEG_Yx
+        inc     <R0hi
+        rts
 
-NEG_Y	com	,y
-	com	1,y
-	com	2,y
-	neg	3,y
-	bcc	NEG_Yx
-	inc	2,y
-	bcc	NEG_Yx
-	inc	1,y
-	bcc	NEG_Yx
-	inc	,y
-NEG_Yx	rts
+NEG_Y   com     ,y
+        com     1,y
+        com     2,y
+        neg     3,y
+        bcc     NEG_Yx
+        inc     2,y
+        bcc     NEG_Yx
+        inc     1,y
+        bcc     NEG_Yx
+        inc     ,y
+NEG_Yx  rts
 
 * boolean
 * ========
@@ -119,52 +119,52 @@ NEG_Yx	rts
 * taken after an untaken bmi: N=0 already) or bhi (reads the stale
 * carry of the subd that produced R0).
 
-opSNE	ldd	<R0lo
-	bne	opLDi_1
-	ldd	<R0hi
-	beq	opLD_LH
+opSNE   ldd     <R0lo
+        bne     opLDi_1
+        ldd     <R0hi
+        beq     opLD_LH
 
-opLDi_1 ldd	#1
-	std	<R0lo
-	clrb
-	std	<R0hi
-	pulu	pc
+opLDi_1 ldd     #1
+        std     <R0lo
+        clrb
+        std     <R0hi
+        pulu    pc
 
 opLDi_m1
-	ldd	#-1
-	bra	opLD_LH
+        ldd     #-1
+        bra     opLD_LH
 
-opSEQ	ldd	<R0lo
-	bne	opLDi_0
-	ldd	<R0hi
-	beq	opLDi_1
+opSEQ   ldd     <R0lo
+        bne     opLDi_0
+        ldd     <R0hi
+        beq     opLDi_1
 
-opLDi_0 ldd	#0
-opLD_LH std	<R0lo
-opLD_H	std	<R0hi
-	pulu	pc
+opLDi_0 ldd     #0
+opLD_LH std     <R0lo
+opLD_H  std     <R0hi
+        pulu    pc
 
-opSGE	lda	<R0hi
-	bpl	opLDi_1
-	bra	opLDi_0
+opSGE   lda     <R0hi
+        bpl     opLDi_1
+        bra     opLDi_0
 
-opSLT	lda	<R0hi
-	bmi	opLDi_1
-	bra	opLDi_0
+opSLT   lda     <R0hi
+        bmi     opLDi_1
+        bra     opLDi_0
 
-opSGT	ldd	<R0hi
-	bmi	opLDi_0
-	bgt	opLDi_1
-	ldd	<R0lo
-	beq	opLD_H
-	bra	opLDi_1
+opSGT   ldd     <R0hi
+        bmi     opLDi_0
+        bgt     opLDi_1
+        ldd     <R0lo
+        beq     opLD_H
+        bra     opLDi_1
 
-opSLE	ldd	<R0hi
-	bmi	opLDi_1
-	bgt	opLDi_0
-	ldd	<R0lo
-	beq	opLDi_1
-	bra	opLDi_0
+opSLE   ldd     <R0hi
+        bmi     opLDi_1
+        bgt     opLDi_0
+        ldd     <R0lo
+        beq     opLDi_1
+        bra     opLDi_0
 
 * Comparison
 * ==========
@@ -181,70 +181,70 @@ opSLE	ldd	<R0hi
 * order IDENTICAL to the unsigned low-word order in both signed and
 * unsigned mode - one body serves both families.
 
-opCMP2	pulu	d
-	leax	a,s
-	leay	b,s
-	ldd	,x
-	subd	,y
-	bgt	opCMP_1
-	blt	opCMP_m1
-	ldd	2,x
-opUCMPc subd	2,y
-	bcs	opCMP_m1
-	bhi	opCMP_1
-	bra	opLD_LH
+opCMP2  pulu    d
+        leax    a,s
+        leay    b,s
+        ldd     ,x
+        subd    ,y
+        bgt     opCMP_1
+        blt     opCMP_m1
+        ldd     2,x
+opUCMPc subd    2,y
+        bcs     opCMP_m1
+        bhi     opCMP_1
+        bra     opLD_LH
 
-opCMPi	leay	,u
-	leau	4,u
-	bra	opCMPa
-opCMP	pulu	b
-	leay	b,s
-opCMPa	ldd	<R0hi
-	subd	,y
-	bgt	opCMP_1
-	blt	opCMP_m1
-	ldd	<R0lo
-	bra	opUCMPc
+opCMPi  leay    ,u
+        leau    4,u
+        bra     opCMPa
+opCMP   pulu    b
+        leay    b,s
+opCMPa  ldd     <R0hi
+        subd    ,y
+        bgt     opCMP_1
+        blt     opCMP_m1
+        ldd     <R0lo
+        bra     opUCMPc
 
 * stores only sign class. One byteis enough.
-opCMP_1 lda	#1
-	sta	<R0hi
-	pulu	pc
+opCMP_1 lda     #1
+        sta     <R0hi
+        pulu    pc
 opCMP_m1
-	lda	#-1
-	sta	<R0hi
-	pulu	pc
+        lda     #-1
+        sta     <R0hi
+        pulu    pc
 
-opUCMP2 pulu	d
-	leax	a,s
-	leay	b,s
-opUCMPb ldd	,x
-	subd	,y
-	bcs	opCMP_m1
-	bhi	opCMP_1
-	bra	opUCMPc-2
+opUCMP2 pulu    d
+        leax    a,s
+        leay    b,s
+opUCMPb ldd     ,x
+        subd    ,y
+        bcs     opCMP_m1
+        bhi     opCMP_1
+        bra     opUCMPc-2
 
-opUCMPi leay	,u
-	leau	4,u
-	bra	opUCMPa
-opUCMP	pulu	b
-	leay	b,s
-opUCMPa ldd	<R0hi
-	subd	,y
-	bcs	opCMP_m1
-	bhi	opCMP_1
-	ldd	<R0lo
-	bra	opUCMPc
+opUCMPi leay    ,u
+        leau    4,u
+        bra     opUCMPa
+opUCMP  pulu    b
+        leay    b,s
+opUCMPa ldd     <R0hi
+        subd    ,y
+        bcs     opCMP_m1
+        bhi     opCMP_1
+        ldd     <R0lo
+        bra     opUCMPc
 
 * load
 * ====
 
 * LDi: [imm:4][ret:2] eaten by one pulu d,x,y.
 * LEA: slot high byte guaranteed 0 (final slots in [0..127]), so
-*	leax b,s builds the address from B alone; clrb: A assumed 0.
-* LD:	32-bit load through D/X; opSTR0 tail shared with LEA.
-* MOV:	operand read IN PLACE (ldd ,u) for the two leax; the final
-*	"pulu d,pc" discards it AND dispatches in one instruction.
+*       leax b,s builds the address from B alone; clrb: A assumed 0.
+* LD:   32-bit load through D/X; opSTR0 tail shared with LEA.
+* MOV:  operand read IN PLACE (ldd ,u) for the two leax; the final
+*       "pulu d,pc" discards it AND dispatches in one instruction.
 *
 * Three addressing forms per size (slot / pointer-in-R0 / pointer-
 * in-stream) converge to one body with X = effective pointer.
@@ -257,140 +257,140 @@ opUCMPa ldd	<R0hi
 * (opEXTu2 starts with a 3-byte ldd # - nothing redundant to absorb,
 * so opLDu2a falls through without a SKIP.)
 
-opLDi	pulu	d,x,y
-	std	<R0hi
-	stx	<R0lo
-	jmp	,y
+opLDi   pulu    d,x,y
+        std     <R0hi
+        stx     <R0lo
+        jmp     ,y
 
-opLEA	pulu	b,y
-	leax	b,s
-	clrb		;assuming  a=0
-	bra	opSTR0
+opLEA   pulu    b,y
+        leax    b,s
+        clrb            ;assuming  a=0
+        bra     opSTR0
 
-opLD	pulu	b,y
-	leax	b,s
-	ldd	,x
-	ldx	2,x
-opSTR0	std	<R0hi
-	stx	<R0lo
-	jmp	,y
+opLD    pulu    b,y
+        leax    b,s
+        ldd     ,x
+        ldx     2,x
+opSTR0  std     <R0hi
+        stx     <R0lo
+        jmp     ,y
 
-opMOV	pulu	d,y
-	ldx	b,s
-	stx	a,s
-	adda	#2
-	addb	#2
-	ldx	b,s
-	stx	a,s
-	jmp	,y
+opMOV   pulu    d,y
+        ldx     b,s
+        stx     a,s
+        adda    #2
+        addb    #2
+        ldx     b,s
+        stx     a,s
+        jmp     ,y
 
-opLD1m	pulu	x,y
-	bra	opLD1a
-opLD1r	pulu	y
-	ldx	#R0lo-2
-	bra	opLD1a
-opLD1	pulu	b,y
-	leax	b,s
-opLD1a	ldb	[2,x]	; TODO banking
-	SKIP2X
-opEXT1	ldb	<R0lo+1
-	sex
-	std	<R0lo
-	sta	<R0hi+1
-	sta	<R0hi
-	jmp	,y
+opLD1m  pulu    x,y
+        bra     opLD1a
+opLD1r  pulu    y
+        ldx     #R0lo-2
+        bra     opLD1a
+opLD1   pulu    b,y
+        leax    b,s
+opLD1a  ldb     [2,x]   ; TODO banking
+        SKIP2X
+opEXT1  ldb     <R0lo+1
+        sex
+        std     <R0lo
+        sta     <R0hi+1
+        sta     <R0hi
+        jmp     ,y
 
-opLDu1m pulu	x,y
-	bra	opLDu1a
-opLDu1r pulu	y
-	ldx	#R0lo-2
-	bra	opLDu1a
-opLDu1	pulu	b,y
-	leax	b,s
-opLDu1a ldb	[2,x]	; TODO banking
-	SKIP2X
-opEXTu1 ldb	<R0lo+1
-	clra
-	std	<R0lo
-	clrb
-	std	<R0hi
-	jmp	,y
+opLDu1m pulu    x,y
+        bra     opLDu1a
+opLDu1r pulu    y
+        ldx     #R0lo-2
+        bra     opLDu1a
+opLDu1  pulu    b,y
+        leax    b,s
+opLDu1a ldb     [2,x]   ; TODO banking
+        SKIP2X
+opEXTu1 ldb     <R0lo+1
+        clra
+        std     <R0lo
+        clrb
+        std     <R0hi
+        jmp     ,y
 
-opLD2m	pulu	x,y
-	bra	opLD2a
-opLD2r	pulu	y
-	ldx	#R0lo-2
-	bra	opLD2a
-opLD2	pulu	b,y
-	leax	b,s
-opLD2a	ldd	[2,x]	; TODO banking
-	std	<R0lo
-	SKIP2X
-opEXT2	ldb	<R0lo
-	bpl	opLD2c
-	ldb	#-1
-	SKIP1
-opLD2c	clrb
-	sex
-	std	<R0hi
-	jmp	,y
+opLD2m  pulu    x,y
+        bra     opLD2a
+opLD2r  pulu    y
+        ldx     #R0lo-2
+        bra     opLD2a
+opLD2   pulu    b,y
+        leax    b,s
+opLD2a  ldd     [2,x]   ; TODO banking
+        std     <R0lo
+        SKIP2X
+opEXT2  ldb     <R0lo
+        bpl     opLD2c
+        ldb     #-1
+        SKIP1
+opLD2c  clrb
+        sex
+        std     <R0hi
+        jmp     ,y
 
-opLDu2m pulu	x,y
-	bra	opLDu2a
-opLDu2r pulu	y
-	ldx	#R0lo-1
-	bra	opLDu2a
-opLDu2	pulu	b,y
-	leax	b,s
-opLDu2a ldd	[2,x]	; TODO banking
-	std	<R0lo
-opEXTu2 ldd	#0
-	std	<R0hi
-	jmp,y
+opLDu2m pulu    x,y
+        bra     opLDu2a
+opLDu2r pulu    y
+        ldx     #R0lo-1
+        bra     opLDu2a
+opLDu2  pulu    b,y
+        leax    b,s
+opLDu2a ldd     [2,x]   ; TODO banking
+        std     <R0lo
+opEXTu2 ldd     #0
+        std     <R0hi
+        jmp,y
 
-opLD4r	pulu	y
-	ldd	<R0hi
-	LDX	<R0lo
-	bra	opLD4b
+opLD4r  pulu    y
+        ldd     <R0hi
+        LDX     <R0lo
+        bra     opLD4b
 
-opLD4m	pulu	x,y
-	bra	opLD4a
-pLD4	pulu	b,y
-	leax	b,s
-opLD4a	ldx	2,x    ; TODO banking
-	ldd	,x
-	ldx	2,x
-opLD4b	std	<R0hi
-	stx	<R0lo
-	jmp	,y
+opLD4m  pulu    x,y
+        bra     opLD4a
+pLD4    pulu    b,y
+        leax    b,s
+opLD4a  ldx     2,x    ; TODO banking
+        ldd     ,x
+        ldx     2,x
+opLD4b  std     <R0hi
+        stx     <R0lo
+        jmp     ,y
 
 * store
-opST1m	pulu	x,y
-	bra	opST1a
-opST1	pulu	b,y
-	leax	b,s
-opST1a	lda	<R0lo+1
-	sta	[2,x]	; TODO banking
-	jmp	,y
+opST1m  pulu    x,y
+        bra     opST1a
+opST1   pulu    b,y
+        leax    b,s
+opST1a  lda     <R0lo+1
+        sta     [2,x]   ; TODO banking
+        jmp     ,y
 
-opST2m	pulu	x,y
-	bra	opST2a
-opST2	pulu	b,y
-	leax	b,s
-opST2a	ldd	<R0lo
-	std	[2,x]	; TODO banking
-	jmp	,y
+opST2m  pulu    x,y
+        bra     opST2a
+opST2   pulu    b,y
+        leax    b,s
+opST2a  ldd     <R0lo
+        std     [2,x]   ; TODO banking
+        jmp     ,y
 
-opST4m	pulu	x,y
-	bra	opST4a
-opST4	pulu	b,y
-	addb	#2
-	ldx	b,s
-opST4a	ldd	<R0hi
-	std	,x
-	ldd	<R0lo
-	std	2,x
-	jmp	,y
+opST4m  pulu    x,y
+        bra     opST4a
+opST4   pulu    b,y
+        addb    #2
+        ldx     b,s
+opST4a  ldd     <R0hi
+        std     ,x
+        ldd     <R0lo
+        std     2,x
+        jmp     ,y
 
 * stack
 * =====
@@ -399,25 +399,25 @@ opST4a	ldd	<R0hi
 * prologue (negative frame alloc) and call cleanup (positive release)
 * in one instruction;
 
-opADJ	pulu	b,y
-	leas	b,s
-	jmp	,y
+opADJ   pulu    b,y
+        leas    b,s
+        jmp     ,y
 
-opPUSH	pulu	b,y
-	leax	b,s
-	ldd	,x
-	ldx	2,x
-	pshs	d,x
-	jmp	,y
+opPUSH  pulu    b,y
+        leax    b,s
+        ldd     ,x
+        ldx     2,x
+        pshs    d,x
+        jmp     ,y
 
-opPUSHr ldd	<R0hi
-	ldx	<R0lo
-	pshs	d,x
-	pulu	pc
+opPUSHr ldd     <R0hi
+        ldx     <R0lo
+        pshs    d,x
+        pulu    pc
 
-opPUSHi pulu	d,x,y
-	pshs	d,x
-	jmp	,y
+opPUSHi pulu    d,x,y
+        pshs    d,x
+        jmp     ,y
 
 * call
 * ====
@@ -427,20 +427,20 @@ opPUSHi pulu	d,x,y
 * restores it. CALLm/CALLr likewise just retarget U, then pulu pc
 * dispatches the callee's first opcode.
 *
-opRET	puls	d,u	; TODO banking
-	pulu	pc
+opRET   puls    d,u     ; TODO banking
+        pulu    pc
 
-opCALLr ldx	<R0lo
-*	ldd	<R0hi
-	bra	opCALLb
-opCALL	pulu	b
-	leax	b,s
-	ldx	2,x	; TODO banking
-	bra	opCALLb
-opCALLm pulu	x	; TODO load B with curr BANK
-opCALLb pshs	d,u
-	leau	,x	; TODO banking
-	pulu	pc
+opCALLr ldx     <R0lo
+*       ldd     <R0hi
+        bra     opCALLb
+opCALL  pulu    b
+        leax    b,s
+        ldx     2,x     ; TODO banking
+        bra     opCALLb
+opCALLm pulu    x       ; TODO load B with curr BANK
+opCALLb pshs    d,u
+        leau    ,x      ; TODO banking
+        pulu    pc
 
 * jump
 * ====
@@ -450,42 +450,42 @@ opCALLb pshs	d,u
 * operand and dispatches - the not-taken tail shared by all JCC.
 * opJGT/opJLE need bgt (not bpl) exactly like opSGT/opSLE above.
 *
-opJNE	ldd	<R0lo
-	bne	opJRA
-	ldd	<R0hi
-	bne	opJRA
-	pulu	y,pc
+opJNE   ldd     <R0lo
+        bne     opJRA
+        ldd     <R0hi
+        bne     opJRA
+        pulu    y,pc
 
-opJEQ	ldd	<R0lo
-	beq	opJEQa
-opJNX	pulu	y,pc
-opJEQa	ldd	<R0hi
-	bne	opJNX
+opJEQ   ldd     <R0lo
+        beq     opJEQa
+opJNX   pulu    y,pc
+opJEQa  ldd     <R0hi
+        bne     opJNX
 
-opJRA	ldu	,u	; TODO banking
-	pulu	pc
+opJRA   ldu     ,u      ; TODO banking
+        pulu    pc
 
-opJGE	lda	<R0hi
-	bpl	opJRA
-	pulu	d,pc	; D = trash address
+opJGE   lda     <R0hi
+        bpl     opJRA
+        pulu    d,pc    ; D = trash address
 
-opJLT	lda	<R0hi
-	bmi	opJRA
-	pulu	d,pc
+opJLT   lda     <R0hi
+        bmi     opJRA
+        pulu    d,pc
 
-opJGT	ldd	<R0hi
-	bmi	opJNX
-	bgt	opJRA
-	ldd	<R0lo
-	bne	opJRA
-	pulu	y,pc
+opJGT   ldd     <R0hi
+        bmi     opJNX
+        bgt     opJRA
+        ldd     <R0lo
+        bne     opJRA
+        pulu    y,pc
 
-opJLE	ldd	<R0hi
-	bmi	opJRA
-	bgt	opJNX
-	ldd	<R0lo
-	beq	opJRA
-	pulu	y,pc
+opJLE   ldd     <R0hi
+        bmi     opJRA
+        bgt     opJNX
+        ldd     <R0lo
+        beq     opJRA
+        pulu    y,pc
 
 * arith
 * =====
@@ -496,94 +496,94 @@ opJLE	ldd	<R0hi
 * "beq" skips the whole high add when it is a no-op (the common
 * small-constant case: high word $0000).
 
-opADD2	pulu	d
-	leax	a,s
-	leay	b,s
-	ldd	2,x
-	addd	2,y
-	std	<R0lo
-	ldd	,x
-	adcb	1,y
-	adca	,y
-	std	<R0hi
-	pulu	pc
+opADD2  pulu    d
+        leax    a,s
+        leay    b,s
+        ldd     2,x
+        addd    2,y
+        std     <R0lo
+        ldd     ,x
+        adcb    1,y
+        adca    ,y
+        std     <R0hi
+        pulu    pc
 
-opADDi	leay	,u
-	leau	6,u
-	ldx	-2,u
-	bra	opADDa
+opADDi  leay    ,u
+        leau    6,u
+        ldx     -2,u
+        bra     opADDa
 
-opADD	pulu	b,x
-	leay	b,s
-opADDa	ldd	<R0lo
-	addd	2,y
-	std	<R0lo
-	ldd	,y
-	bcc	opADDb
-	addd	#1
-opADDb	beq	opADDc
-	addd	<R0hi
-	std	<R0hi
-opADDc	jmp	,x
+opADD   pulu    b,x
+        leay    b,s
+opADDa  ldd     <R0lo
+        addd    2,y
+        std     <R0lo
+        ldd     ,y
+        bcc     opADDb
+        addd    #1
+opADDb  beq     opADDc
+        addd    <R0hi
+        std     <R0hi
+opADDc  jmp     ,x
 
-opSUB2	pulu	d
-	leax	a,s
-	leay	b,s
-	ldd	2,x
-	subd	2,y
-	std	<R0lo
-	ldd	,x
-	sbcb	1,y
-	sbca	,y
-	std	<R0hi
-	pulu	pc
+opSUB2  pulu    d
+        leax    a,s
+        leay    b,s
+        ldd     2,x
+        subd    2,y
+        std     <R0lo
+        ldd     ,x
+        sbcb    1,y
+        sbca    ,y
+        std     <R0hi
+        pulu    pc
 
-opSUBi	leay	,u
-	leau	6,u
-	ldx	-2,u
-	bra	opSUBa
+opSUBi  leay    ,u
+        leau    6,u
+        ldx     -2,u
+        bra     opSUBa
 
-opSUB	pulu	b,x
-	leay	b,s
-opSUBa	ldd	<R0lo
-	subd	2,y
-	std	<R0lo
-	ldd	<R0hi
-	sbcb	1,y
-	sbca	,y
-	std	<R0hi
-	jmp	,x
+opSUB   pulu    b,x
+        leay    b,s
+opSUBa  ldd     <R0lo
+        subd    2,y
+        std     <R0lo
+        ldd     <R0hi
+        sbcb    1,y
+        sbca    ,y
+        std     <R0hi
+        jmp     ,x
 
-opLOG	macro
-op\02	pulu	d
-	leax	a,s
-	leay	b,s
-	ldd	2,x
-	\0B	3,y
-	\0A	2,y
-	std	<R0lo
-	ldd	,x
-op\0a	\0B	1,y
-	\0A	,y
-	std	<R0hi
-	pulu	pc
+opLOG   macro
+op\02   pulu    d
+        leax    a,s
+        leay    b,s
+        ldd     2,x
+        \0B     3,y
+        \0A     2,y
+        std     <R0lo
+        ldd     ,x
+op\0a   \0B     1,y
+        \0A     ,y
+        std     <R0hi
+        pulu    pc
 
-op\0i	leay	,u
-	leau	4,u
-	bra	op\0b
-op\0	pulu	b
-	leay	b,s
-op\0b	ldd	<R0lo
-	\0B	3,y
-	\0A	2,y
-	std	<R0lo
-	ldd	<R0hi
-	bra	op\0a
-	endm
+op\0i   leay    ,u
+        leau    4,u
+        bra     op\0b
+op\0    pulu    b
+        leay    b,s
+op\0b   ldd     <R0lo
+        \0B     3,y
+        \0A     2,y
+        std     <R0lo
+        ldd     <R0hi
+        bra     op\0a
+        endm
 
-	opLOG	AND
-	opLOG	OR
-	opLOG	EOR
+        opLOG   AND
+        opLOG   OR
+        opLOG   EOR
 
 * 16x16 multiply, full 32-bit result: diagonal products (33, 22)
 * into both words, cross products (23, 32) added into bytes 1..2
@@ -591,60 +591,60 @@ op\0b	ldd	<R0lo
 * - guaranteed by the only call site (opMUL1 tests both words
 * first); products 13/31 and low halves of 03/12/21/30 are absent.
 
-opMUL16 lda	3,x
-	ldb	3,y
-	mul
-	std	<R0lo
-	lda	2,x
-	ldb	2,y
-	mul
-	std	<R0hi
-	lda	2,x
-	beq	opMULe
-	ldb	3,y
-	mul
-	addb	<R0lo
-	stb	<R0lo
-	adca	<R0hi+1
-	sta	<R0hi+1
-	bcc	opMULe
-	inc	<R0hi
-opMULe	ldb	2,y
-	beq	opMULf
-	lda	3,x
-	mul
-	addb	<R0lo
-	stb	<R0lo
-	adca	<R0hi+1
-	sta	<R0hi+1
-	bcc	opMULf
-	inc	<R0hi
-opMULf	pulu	pc
+opMUL16 lda     3,x
+        ldb     3,y
+        mul
+        std     <R0lo
+        lda     2,x
+        ldb     2,y
+        mul
+        std     <R0hi
+        lda     2,x
+        beq     opMULe
+        ldb     3,y
+        mul
+        addb    <R0lo
+        stb     <R0lo
+        adca    <R0hi+1
+        sta     <R0hi+1
+        bcc     opMULe
+        inc     <R0hi
+opMULe  ldb     2,y
+        beq     opMULf
+        lda     3,x
+        mul
+        addb    <R0lo
+        stb     <R0lo
+        adca    <R0hi+1
+        sta     <R0hi+1
+        bcc     opMULf
+        inc     <R0hi
+opMULf  pulu    pc
 
-opMUL2	pulu	d
-	leax	a,s
-	leay	b,s
-	bra	opMUL1
-opMULi	leay	,u
-	leau	4,u
-	bra	opMUL0
-opMUL	pulu	b
-	leay	b,s
-opMUL0	ldd	<R0lo
-	std	<R1+2
-	ldd	<R0hi
-	std	<R1
-	ldx	#R1
-opMUL1	ldd	,x
-	bne	opMUL3
-	ldd	,y
-	beq	opMUL16
-	ldb	1,x
+opMUL2  pulu    d
+        leax    a,s
+        leay    b,s
+        bra     opMUL1
+opMULi  leay    ,u
+        leau    4,u
+        bra     opMUL0
+opMUL   pulu    b
+        leay    b,s
+opMUL0  ldd     <R0lo
+        std     <R1+2
+        ldd     <R0hi
+        std     <R1
+        ldx     #R1
+opMUL1  ldd     ,x
+        bne     opMUL3
+        ldd     ,y
+        beq     opMUL16
+        ldb     1,x
 
-*	 0123
-*	 0123
+*        0123
+*        0123
 *
-*	 33*
+*        33*
 *      23
 *      32
 *    13*
@@ -655,221 +655,221 @@ opMUL1	ldd	,x
 *  21
 *  30
 
-CROSSa	macro
-	ifeq	FATMUL
-	ldd	#\0*256+\1
-	bsr	opMULa
-	else
-	lda	\0,x
-	ldb	\1,y
-	mul
-	addb	<R0lo
-	stb	<R0lo
-	adca	<R0hi+1
-	sta	<R0hi+1
-	bcc	opMUL\0\1
-	inc	<R0hi
+CROSSa  macro
+        ifeq    FATMUL
+        ldd     #\0*256+\1
+        bsr     opMULa
+        else
+        lda     \0,x
+        ldb     \1,y
+        mul
+        addb    <R0lo
+        stb     <R0lo
+        adca    <R0hi+1
+        sta     <R0hi+1
+        bcc     opMUL\0\1
+        inc     <R0hi
 opMUL\0\1
-	endc
-	endm
+        endc
+        endm
 
-CROSSb	macro
-	ifeq	FATMUL
-	ldd	#\0*256+\1
-	bsr	opMULb
-	else
-	lda	\0,x
-	ldb	\1,y
-	mul
-	addd	<R0hi
-	std	<R0hi
-	endc
-	endm
+CROSSb  macro
+        ifeq    FATMUL
+        ldd     #\0*256+\1
+        bsr     opMULb
+        else
+        lda     \0,x
+        ldb     \1,y
+        mul
+        addd    <R0hi
+        std     <R0hi
+        endc
+        endm
 
-CROSSc	macro
-	ifeq	FATMUL
-	ldd	#\0*256+\1
-	bsr	opMULc
-	else
-	lda	\0,x
-	ldb	\1,y
-	mul
-	addb	<R0hi
-	stb	<R0hi
-	endc
-	endm
+CROSSc  macro
+        ifeq    FATMUL
+        ldd     #\0*256+\1
+        bsr     opMULc
+        else
+        lda     \0,x
+        ldb     \1,y
+        mul
+        addb    <R0hi
+        stb     <R0hi
+        endc
+        endm
 
-opMUL3	lda	3,y
-	mul
-	std	<R0hi
+opMUL3  lda     3,y
+        mul
+        std     <R0hi
 
-	lda	3,y
-	ldb	3,x
-	mul
-	std	<R0lo
+        lda     3,y
+        ldb     3,x
+        mul
+        std     <R0lo
 
-	CROSSa	3,2
-	CROSSa	2,3
+        CROSSa  3,2
+        CROSSa  2,3
 
-	CROSSb	2,2
-	CROSSb	3,1
+        CROSSb  2,2
+        CROSSb  3,1
 
-	CROSSc	0,3
-	CROSSc	1,2
-	CROSSc	2,1
-	CROSSc	3,0
-	pulu	pc
+        CROSSc  0,3
+        CROSSc  1,2
+        CROSSc  2,1
+        CROSSc  3,0
+        pulu    pc
 
-	ifeq	FATMUL
-opMULa	lda	a,x
-	ldb	b,y
-	mul
-	addb	<R0lo
-	stb	<R0lo
-	adca	<R0hi+1
-	sta	<R0hi+1
-	bcc	opMULd
-	inc	<R0hi
-opMULd	rts
+        ifeq    FATMUL
+opMULa  lda     a,x
+        ldb     b,y
+        mul
+        addb    <R0lo
+        stb     <R0lo
+        adca    <R0hi+1
+        sta     <R0hi+1
+        bcc     opMULd
+        inc     <R0hi
+opMULd  rts
 
-opMULb	lda	a,x
-	ldb	b,y
-	mul
-	addd	<R0hi
-	std	<R0hi
-	rts
+opMULb  lda     a,x
+        ldb     b,y
+        mul
+        addd    <R0hi
+        std     <R0hi
+        rts
 
-opMULc	lda	a,x
-	ldb	b,y
-	mul
-	addb	<R0hi
-	stb	<R0hi
-	rts
-	endc
+opMULc  lda     a,x
+        ldb     b,y
+        mul
+        addb    <R0hi
+        stb     <R0hi
+        rts
+        endc
 * C99 truncating semantics: save both signs on stack, make operands
 * positive (opNEG), run the shared opUDIVy, reapply signs. MOD
 * negates the remainder with the DIVIDEND's sign only (C99 %).
 
-opDIV2	pulu	d
-	leax	a,s
-	leay	b,s
-	ldd	,x
-	std	<R0hi
-	ldd	2,x
-	std	<R0lo
-	bra	opDIVa
-opDIVi	leay	,u
-	leau	4,u
-	bra	opDIVa
-opDIV	pulu	b
-	leay	b,s
-opDIVa	ldb	,y
-	stb	,-s
-	bpl	opDIVb
-	jsr	<NEG_
-	jsr	<NEG_Y
-opDIVb	ldb	<R0hi
-	stb	,-s
-	bpl	opDIVc
-	jsr	<NEG_
-opDIVc	jsr	<UDIV_Y
-	rol	<R0lo+1
-	rol	<R0lo
-	ldd	<R0hi
-	rolb
-	rola
-	comb
-	coma
-	std	<R0hi
-	com	<R0lo
-	com	<R0lo+1
-	ldb	,s+
-	bpl	opDIVd
-	jsr	<NEG_
-opDIVd	ldb	,s+
-	bpl	opDIVe
-	jsr	<NEG_Y
-opDIVe	pulu	pc
+opDIV2  pulu    d
+        leax    a,s
+        leay    b,s
+        ldd     ,x
+        std     <R0hi
+        ldd     2,x
+        std     <R0lo
+        bra     opDIVa
+opDIVi  leay    ,u
+        leau    4,u
+        bra     opDIVa
+opDIV   pulu    b
+        leay    b,s
+opDIVa  ldb     ,y
+        stb     ,-s
+        bpl     opDIVb
+        jsr     <NEG_
+        jsr     <NEG_Y
+opDIVb  ldb     <R0hi
+        stb     ,-s
+        bpl     opDIVc
+        jsr     <NEG_
+opDIVc  jsr     <UDIV_Y
+        rol     <R0lo+1
+        rol     <R0lo
+        ldd     <R0hi
+        rolb
+        rola
+        comb
+        coma
+        std     <R0hi
+        com     <R0lo
+        com     <R0lo+1
+        ldb     ,s+
+        bpl     opDIVd
+        jsr     <NEG_
+opDIVd  ldb     ,s+
+        bpl     opDIVe
+        jsr     <NEG_Y
+opDIVe  pulu    pc
 
-opMOD2	pulu	d
-	leay	b,s
-	leax	a,s
-	ldd	,x
-	std	<R0hi
-	ldd	2,x
-	std	<R0lo
-	bra	opMODa
-opMODi	leay	,u
-	leau	4,u
-	bra	opMODa
-opMOD	pulu	d
-	leay	b,s
-opMODa	ldb	<R0hi	; real	work starts here
-	stb	,-s	; save	R0 sign
-	bpl	opMODb
-	jsr	<NEG_	; make it positive
-opMODb	ldb	,y
-	stb	,-s	; save "y" sign
-	bpl	opMODc
-	jsr	<NEG_Y	; make "y" positive
-opMODc	jsr	<UDIV_Y
-	ldd	<R1	; move remainder to R0
-	std	<R0hi
-	ldd	<R1+2
-	std	<R0lo
-	ldb	,s+	; restore "y"  sign
-	bpl	opMODd
-	jsr	<NEG_Y
-opMODd	ldb	,s+	; get initial sign of R0
-	bpl	opMODe
-	jsr	<NEG_	; make (R0%y)of the samesign as R0
-opMODe	pulu	pc
+opMOD2  pulu    d
+        leay    b,s
+        leax    a,s
+        ldd     ,x
+        std     <R0hi
+        ldd     2,x
+        std     <R0lo
+        bra     opMODa
+opMODi  leay    ,u
+        leau    4,u
+        bra     opMODa
+opMOD   pulu    d
+        leay    b,s
+opMODa  ldb     <R0hi   ; real  work starts here
+        stb     ,-s     ; save  R0 sign
+        bpl     opMODb
+        jsr     <NEG_   ; make it positive
+opMODb  ldb     ,y
+        stb     ,-s     ; save "y" sign
+        bpl     opMODc
+        jsr     <NEG_Y  ; make "y" positive
+opMODc  jsr     <UDIV_Y
+        ldd     <R1     ; move remainder to R0
+        std     <R0hi
+        ldd     <R1+2
+        std     <R0lo
+        ldb     ,s+     ; restore "y"  sign
+        bpl     opMODd
+        jsr     <NEG_Y
+opMODd  ldb     ,s+     ; get initial sign of R0
+        bpl     opMODe
+        jsr     <NEG_   ; make (R0%y)of the samesign as R0
+opMODe  pulu    pc
 
-opUDIV2 pulu	d
-	leax	a,s
-	leay	b,s
-	ldd	,x
-	std	<R0hi
-	ldd	2,x
-	std	<R0lo
-	bra	opUDIVa
-opUDIVi leay	,u
-	leau	4,u
-	bra	opUDIVa
-opUDIV	pulu	b
-	leay	b,s
-opUDIVa jsr	<UDIV_Y
-	rol	<R0lo+1
-	rol	<R0lo
-	ldd	<R0hi
-	rolb
-	rola
-	comb
-	coma
-	std	<R0hi
-	com	<R0lo+1
-	com	<R0lo
-	pulu	pc
+opUDIV2 pulu    d
+        leax    a,s
+        leay    b,s
+        ldd     ,x
+        std     <R0hi
+        ldd     2,x
+        std     <R0lo
+        bra     opUDIVa
+opUDIVi leay    ,u
+        leau    4,u
+        bra     opUDIVa
+opUDIV  pulu    b
+        leay    b,s
+opUDIVa jsr     <UDIV_Y
+        rol     <R0lo+1
+        rol     <R0lo
+        ldd     <R0hi
+        rolb
+        rola
+        comb
+        coma
+        std     <R0hi
+        com     <R0lo+1
+        com     <R0lo
+        pulu    pc
 
-opUMOD2 pulu	d
-	leay	b,s
-	leax	a,s
-	ldd	,x
-	std	<R0hi
-	ldd	2,x
-	std	<R0lo
-	bra	opUMODa
-opUMODi leay	,u
-	leau	4,u
-	bra	opUMODa
-opUMOD	pulu	b
-	leay	b,s
-opUMODa jsr	<UDIV_Y
-	ldd	<R1	; move remainder to R0
-	std	<R0hi
-	ldd	<R1+2
-	std	<R0lo
-	pulu	pc
+opUMOD2 pulu    d
+        leay    b,s
+        leax    a,s
+        ldd     ,x
+        std     <R0hi
+        ldd     2,x
+        std     <R0lo
+        bra     opUMODa
+opUMODi leay    ,u
+        leau    4,u
+        bra     opUMODa
+opUMOD  pulu    b
+        leay    b,s
+opUMODa jsr     <UDIV_Y
+        ldd     <R1     ; move remainder to R0
+        std     <R0hi
+        ldd     <R1+2
+        std     <R0lo
+        pulu    pc
 
 * shift
 * =====
@@ -881,402 +881,402 @@ opUMODa jsr	<UDIV_Y
 * LSB-first into C, each set bit applies the pre-unrolled partial
 * shift. Shortcut when one 16-bit half of R0 is zero.
 *
-lslR0	macro
-	lslb
-	rola
-	rol	<R0hi+1
-	rol	<R0hi
-	endm
-opSHL	pulu	b,y
-	addb	#3
-	LDB	b,s
-	SKIP2X
-opSHLi	pulu	b,y
-	stb	<R1
-	ldd	<R0lo
-	beq	opSHL_half
-	lsr	<R1
-	bcc	opSHL_2
-	lslR0
-opSHL_2 lsr	<R1
-	bcc	opSHL_4
-	lslR0
-	lslR0
-opSHL_4 lsr	<R1
-	bcc	opSHL_8
-	lslR0
-	lslR0
-	lslR0
-	lslR0
-opSHL_8 std	<R0lo
-	lsr	<R1
-	bcc	opSHL_16
-	ldb	<R0lo
-	lda	<R0hi+1
-	std	<R0hi
-	lda	<R0lo+1
-	clrb
-	std	<R0lo
+lslR0   macro
+        lslb
+        rola
+        rol     <R0hi+1
+        rol     <R0hi
+        endm
+opSHL   pulu    b,y
+        addb    #3
+        LDB     b,s
+        SKIP2X
+opSHLi  pulu    b,y
+        stb     <R1
+        ldd     <R0lo
+        beq     opSHL_half
+        lsr     <R1
+        bcc     opSHL_2
+        lslR0
+opSHL_2 lsr     <R1
+        bcc     opSHL_4
+        lslR0
+        lslR0
+opSHL_4 lsr     <R1
+        bcc     opSHL_8
+        lslR0
+        lslR0
+        lslR0
+        lslR0
+opSHL_8 std     <R0lo
+        lsr     <R1
+        bcc     opSHL_16
+        ldb     <R0lo
+        lda     <R0hi+1
+        std     <R0hi
+        lda     <R0lo+1
+        clrb
+        std     <R0lo
 opSHL_16
-	lsr	<R1
-	bcc	opSHL_32
-	std	<R0hi
-	ldd	#0
-	std	<R0lo
+        lsr     <R1
+        bcc     opSHL_32
+        std     <R0hi
+        ldd     #0
+        std     <R0lo
 opSHL_32
-	jmp	,y
+        jmp     ,y
 
 opSHL_half
-	ldd	<R0hi
-	lsr	<R1
-	bcc	opSHL_half2
-	lslb
-	rola
+        ldd     <R0hi
+        lsr     <R1
+        bcc     opSHL_half2
+        lslb
+        rola
 opSHL_half2
-	lsr	<R1
-	bcc	opSHL_half4
-	lslb
-	rola
-	lslb
-	rola
+        lsr     <R1
+        bcc     opSHL_half4
+        lslb
+        rola
+        lslb
+        rola
 opSHL_half4
-	lsr	<R1
-	bcc	opSHL_half8
-	lslb
-	rola
-	lslb
-	rola
-	lslb
-	rola
-	lslb
-	rola
+        lsr     <R1
+        bcc     opSHL_half8
+        lslb
+        rola
+        lslb
+        rola
+        lslb
+        rola
+        lslb
+        rola
 opSHL_half8
-	lsr	<R1
-	bcc	opSHL_half16
-	tfr	b,a
-	clrb
+        lsr     <R1
+        bcc     opSHL_half16
+        tfr     b,a
+        clrb
 opSHL_half16
-	lsr	<R1
-	bcc	opSHL_half32
-	ldd	#0
+        lsr     <R1
+        bcc     opSHL_half32
+        ldd     #0
 opSHL_half32
-	std	<R0hi
-	jmp	,y
+        std     <R0hi
+        jmp     ,y
 
-lsrR0	macro
-	lsra
-	rorb
-	ror	<R0lo
-	ror	<R0lo+1
-	endm
-opSHR	pulu	b,y
-	addb	#3
-	ldb	b,s
-	SKIP2X
-opSHRi	pulu	b,y
-	stb	<R1
-	ldd	<R0hi
-	beq	opSHR_half
-	lsr	<R1
-	bcc	opSHR_2
-	lsrR0
-opSHR_2 lsr	<R1
-	bcc	opSHR_4
-	lsrR0
-	lsrR0
-opSHR_4 lsr	<R1
-	bcc	opSHR_8
-	lsrR0
-	lsrR0
-	lsrR0
-	lsrR0
-opSHR_8 std	<R0hi
-	lsr	<R1
-	bcc	opSHR_16
-	ldb	<R0lo
-	lda	<R0hi+1
-	std	<R0lo
-	ldb	<R0hi
-	clra
-	std	<R0hi
+lsrR0   macro
+        lsra
+        rorb
+        ror     <R0lo
+        ror     <R0lo+1
+        endm
+opSHR   pulu    b,y
+        addb    #3
+        ldb     b,s
+        SKIP2X
+opSHRi  pulu    b,y
+        stb     <R1
+        ldd     <R0hi
+        beq     opSHR_half
+        lsr     <R1
+        bcc     opSHR_2
+        lsrR0
+opSHR_2 lsr     <R1
+        bcc     opSHR_4
+        lsrR0
+        lsrR0
+opSHR_4 lsr     <R1
+        bcc     opSHR_8
+        lsrR0
+        lsrR0
+        lsrR0
+        lsrR0
+opSHR_8 std     <R0hi
+        lsr     <R1
+        bcc     opSHR_16
+        ldb     <R0lo
+        lda     <R0hi+1
+        std     <R0lo
+        ldb     <R0hi
+        clra
+        std     <R0hi
 opSHR_16
-	lsr	<R1
-	bcc	opSHR_32
-	std	<R0lo
-opSHR_0 ldd	#0
-	std	<R0hi
+        lsr     <R1
+        bcc     opSHR_32
+        std     <R0lo
+opSHR_0 ldd     #0
+        std     <R0hi
 opSHR_32
-	jmp	,y
+        jmp     ,y
 
 opSHR_half
-	ldd	<R0lo
-	lsr	<R1
-	bcc	opSHR_half2
-	lsra
-	rorb
+        ldd     <R0lo
+        lsr     <R1
+        bcc     opSHR_half2
+        lsra
+        rorb
 opSHR_half2
-	lsr	<R1
-	bcc	opSHR_half4
-	lsra
-	rorb
-	lsra
-	rorb
+        lsr     <R1
+        bcc     opSHR_half4
+        lsra
+        rorb
+        lsra
+        rorb
 opSHR_half4
-	lsr	<R1
-	bcc	opSHR_half8
-	lsra
-	rorb
-	lsra
-	rorb
-	lsra
-	rorb
-	lsra
-	rorb
+        lsr     <R1
+        bcc     opSHR_half8
+        lsra
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
 opSHR_half8
-	lsr	<R1
-	bcc	opSHR_half16
-	tfr	a,b
-	clra
+        lsr     <R1
+        bcc     opSHR_half16
+        tfr     a,b
+        clra
 opSHR_half16
-	lsr	<R1
-	bcc	opSHR_half32
-	ldd	#0
+        lsr     <R1
+        bcc     opSHR_half32
+        ldd     #0
 opSHR_half32
-	std	<R0lo
-	jmp	,y
+        std     <R0lo
+        jmp     ,y
 
-asrR0	macro
-	asra
-	rorb
-	ror	<R0lo
-	ror	<R0lo+1
-	endm
-opSAR	pulu	b,y
-	addb	#3
-	LDB	b,s
-	SKIP2X
-opSARi	pulu	b,y
-	stb	<R1
-	ldd	<R0hi
-	beq	opSHR_half
-	lsr	<R1
-	bcc	opSAR_2
-	asrR0
-opSAR_2 lsr	<R1
-	bcc	opSAR_4
-	asrR0
-	asrR0
-opSAR_4 lsr	<R1
-	bcc	opSAR_8
-	asrR0
-	asrR0
-	asrR0
-	asrR0
-opSAR_8 std	<R0hi
-	lsr	<R1
-	bcc	opSAR_16
-	ldb	<R0lo
-	lda	<R0hi+1
-	std	<R0lo
-	ldb	<R0hi
-	sex
-	std	<R0hi
+asrR0   macro
+        asra
+        rorb
+        ror     <R0lo
+        ror     <R0lo+1
+        endm
+opSAR   pulu    b,y
+        addb    #3
+        LDB     b,s
+        SKIP2X
+opSARi  pulu    b,y
+        stb     <R1
+        ldd     <R0hi
+        beq     opSHR_half
+        lsr     <R1
+        bcc     opSAR_2
+        asrR0
+opSAR_2 lsr     <R1
+        bcc     opSAR_4
+        asrR0
+        asrR0
+opSAR_4 lsr     <R1
+        bcc     opSAR_8
+        asrR0
+        asrR0
+        asrR0
+        asrR0
+opSAR_8 std     <R0hi
+        lsr     <R1
+        bcc     opSAR_16
+        ldb     <R0lo
+        lda     <R0hi+1
+        std     <R0lo
+        ldb     <R0hi
+        sex
+        std     <R0hi
 opSAR_16
-	lsr	<R1
-	bcc	opSAR_32
-	std	<R0lo
-	lbpl	opSHR_0
-	ldd	#-1
-	std	<R0hi
+        lsr     <R1
+        bcc     opSAR_32
+        std     <R0lo
+        lbpl    opSHR_0
+        ldd     #-1
+        std     <R0hi
 opSAR_32
-	jmp	,y
+        jmp     ,y
 
-	ifne	FPU
+        ifne    FPU
 * floating point
-FACEXP	equ	$614E
-FACHO	equ	FACEXP+1
-FACSGN	equ	$6156
+FACEXP  equ     $614E
+FACHO   equ     FACEXP+1
+FACSGN  equ     $6156
 
-ARGEXP	equ	$6159
-ARGHO	equ	ARGEXP+1
-ARGSGN	equ	$6161
+ARGEXP  equ     $6159
+ARGHO   equ     ARGEXP+1
+ARGSGN  equ     $6161
 
-opFMOV	ldx	#FACSGN
-	ldd	FACEXP-FACSGN,X
-	std	ARGEXP-FACSGN,X
-	ldd	2+FACEXP-FACSGN,X
-	std	2+ARGEXP-FACSGN,X
-	ldb	FACSGN-FACSGN,X
-	stb	ARGSGN-FACSGN,X
-	pulu	pc
+opFMOV  ldx     #FACSGN
+        ldd     FACEXP-FACSGN,X
+        std     ARGEXP-FACSGN,X
+        ldd     2+FACEXP-FACSGN,X
+        std     2+ARGEXP-FACSGN,X
+        ldb     FACSGN-FACSGN,X
+        stb     ARGSGN-FACSGN,X
+        pulu    pc
 
-opLDG4m pulu	y
-	bra	opLDGa
-opLDGi	leay	,u
-	leau	4,u
-	bra	opLDGa
-opLDG	pulu	d
-	leay	b,s
-opLDGa	ldx	#ARGEXP
-	bra	opLDFb
+opLDG4m pulu    y
+        bra     opLDGa
+opLDGi  leay    ,u
+        leau    4,u
+        bra     opLDGa
+opLDG   pulu    d
+        leay    b,s
+opLDGa  ldx     #ARGEXP
+        bra     opLDFb
 
-opLDF4m pulu	y
-	bra	opLDFa
-opLDFi	leay	,u
-	leau	4,u
-	bra	opLDFa
-opLDF4	pulu	d
-	leay	b,s
-opLDFa	ldx	#FACEXP
+opLDF4m pulu    y
+        bra     opLDFa
+opLDFi  leay    ,u
+        leau    4,u
+        bra     opLDFa
+opLDF4  pulu    d
+        leay    b,s
+opLDFa  ldx     #FACEXP
 
-opLDFb	ldd	,y
-	sta	FACSGN-FACEXP,x
-	lslb
-	rola
-	beq	opLDFz
-	adda	#2	; correct bias
-	beq	opLDFw
-	sta	FACEXP-FACEXP,x
-	coma
-	rorb		; set b7
-	stb	FACHO-FACEXP,x
-	ldd	2,y
-	std	1+FACHO-FACEXP,x
-	pulu	pc
+opLDFb  ldd     ,y
+        sta     FACSGN-FACEXP,x
+        lslb
+        rola
+        beq     opLDFz
+        adda    #2      ; correct bias
+        beq     opLDFw
+        sta     FACEXP-FACEXP,x
+        coma
+        rorb            ; set b7
+        stb     FACHO-FACEXP,x
+        ldd     2,y
+        std     1+FACHO-FACEXP,x
+        pulu    pc
 
-opLDFw	ldd	#$FFFF		; maxfloat
-	std	FACEXP-FACEXP,x
-	std	2+FACEXP-FACEXP,x
-	pulu	pc
+opLDFw  ldd     #$FFFF          ; maxfloat
+        std     FACEXP-FACEXP,x
+        std     2+FACEXP-FACEXP,x
+        pulu    pc
 
-	clra			; zero
-opLDFz	sta	FACHO-FACEXP,x
-	pulu	pc
+        clra                    ; zero
+opLDFz  sta     FACHO-FACEXP,x
+        pulu    pc
 
-opSTF4m pulu	y
-	bra	opSTF4a
-opSTF4	pulu	d
-	leay	b,s
-opSTF4a ldx	#FACEXP
-	ldd	FACEXP-FACEXP,x
-	tstb
-	beq	opSTFz+1	  ; FACHO==0 -> IEEE +0.0 (the ONLY reliable test)
-	suba	#2
-	bcs	opSTFz		  ; FACEXP was 1 -> underflow, flush to zero
-	lslb			  ; B<<=1, drop explicit leading bit into carry (discard)
-	lsra			  ; A>>=1, carry_out = ieee exponent's bit0
-	rorb			  ; carry_in -> B bit7 : B = byte1
-	std	,y
-	lda	FACSGN-FACEXP,x
-	anda	#%10000000		  ; isolate sign bit
-	ora	,y		  ; A |= sign (A's bit7 is 0 after lsra, safe)
-	sta	,y		  ; byte0 done
-	ldd	1+FACHO-FACEXP,x
-	std	2,y		  ; bytes 2,3: straight copy
-	pulu	pc
+opSTF4m pulu    y
+        bra     opSTF4a
+opSTF4  pulu    d
+        leay    b,s
+opSTF4a ldx     #FACEXP
+        ldd     FACEXP-FACEXP,x
+        tstb
+        beq     opSTFz+1          ; FACHO==0 -> IEEE +0.0 (the ONLY reliable test)
+        suba    #2
+        bcs     opSTFz            ; FACEXP was 1 -> underflow, flush to zero
+        lslb                      ; B<<=1, drop explicit leading bit into carry (discard)
+        lsra                      ; A>>=1, carry_out = ieee exponent's bit0
+        rorb                      ; carry_in -> B bit7 : B = byte1
+        std     ,y
+        lda     FACSGN-FACEXP,x
+        anda    #%10000000                ; isolate sign bit
+        ora     ,y                ; A |= sign (A's bit7 is 0 after lsra, safe)
+        sta     ,y                ; byte0 done
+        ldd     1+FACHO-FACEXP,x
+        std     2,y               ; bytes 2,3: straight copy
+        pulu    pc
 
-opSTFz	clrb
-	clra
-	std	,y
-	std	2,y
-	pulu	pc
+opSTFz  clrb
+        clra
+        std     ,y
+        std     2,y
+        pulu    pc
 
-opLDG8m pulu	y
-	bra	opLDG8a
-opLDG8	pulu	d
-	leay	b,s
-opLDG8a ldx	#ARGEXP
-	bra	opLDF8c
+opLDG8m pulu    y
+        bra     opLDG8a
+opLDG8  pulu    d
+        leay    b,s
+opLDG8a ldx     #ARGEXP
+        bra     opLDF8c
 
-opLDF8m pulu	y
-	bra	opLDF8b
-opLDF8	pulu	d
-	leay	b,s
-opLDF8b ldx	#FACEXP
+opLDF8m pulu    y
+        bra     opLDF8b
+opLDF8  pulu    d
+        leay    b,s
+opLDF8b ldx     #FACEXP
 
-opLDF8c ldd	,y
-	sta	FACSGN-FACEXP,x
-	anda	#%01111111
-	andb	#%11110000
-	subd	#0
-	beq	opLDFz
-	lsra
-	rorb
-	lsra
-	rorb
-	lsra
-	rorb
-	lsra
-	rorb
-	subd	#1023-128	;  bias 127
-	ble	opLDFz-1
-	tsta
-	bne	opLDFw
-	stb	FACEXP-FACEXP,x
+opLDF8c ldd     ,y
+        sta     FACSGN-FACEXP,x
+        anda    #%01111111
+        andb    #%11110000
+        subd    #0
+        beq     opLDFz
+        lsra
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
+        subd    #1023-128       ;  bias 127
+        ble     opLDFz-1
+        tsta
+        bne     opLDFw
+        stb     FACEXP-FACEXP,x
 
-	ldd	3,y
-	std	2+FACHO-FACEXP,x
-	ldd	1,y
-	anda	#%00001111
-	ora	#%00010000
-opLDF8d lsl	3+FACHO-FACEXP,x
-	rol	2+FACHO-FACEXP,x
-	rolb
-	rola
-	bpl	opLDF8d
-	std	FACHO-FACEXP,x
-	pulu	pc
+        ldd     3,y
+        std     2+FACHO-FACEXP,x
+        ldd     1,y
+        anda    #%00001111
+        ora     #%00010000
+opLDF8d lsl     3+FACHO-FACEXP,x
+        rol     2+FACHO-FACEXP,x
+        rolb
+        rola
+        bpl     opLDF8d
+        std     FACHO-FACEXP,x
+        pulu    pc
 
-opSTF8m pulu	y
-	bra	opSTF8e
-opSTF8	pulu	d
-	leay	b,s
-opSTF8e ldx	#FACEXP
-	clra
-	ldb	FACHO-FACEXP,x
-	bne	opSTF8f
-	std	,y		; FACHO==0 -> IEEE double +0.0
-	std	2,y
-	std	4,y
-	std	6,y
-	pulu	pc
+opSTF8m pulu    y
+        bra     opSTF8e
+opSTF8  pulu    d
+        leay    b,s
+opSTF8e ldx     #FACEXP
+        clra
+        ldb     FACHO-FACEXP,x
+        bne     opSTF8f
+        std     ,y              ; FACHO==0 -> IEEE double +0.0
+        std     2,y
+        std     4,y
+        std     6,y
+        pulu    pc
 opSTF8f clrb
-	std	6,y
-	std	4,y
+        std     6,y
+        std     4,y
 
-	ldb	FACEXP-FACEXP,x
-	addd	#1023-128	; D = ieee_biased_exp (11 bits, max 1149, safe)
-	lslb			; A=exp[10:4], B=exp[3:0]000
-	rola
-	lslb
-	rola
-	lslb
-	rola
-	lslb
-	rola
-	std	,y
-	lda	#%10000000
-	anda	FACSGN-FACEXP,x ; isolate sign
-	ora	,y		; inject
-	sta	,y		; store
+        ldb     FACEXP-FACEXP,x
+        addd    #1023-128       ; D = ieee_biased_exp (11 bits, max 1149, safe)
+        lslb                    ; A=exp[10:4], B=exp[3:0]000
+        rola
+        lslb
+        rola
+        lslb
+        rola
+        lslb
+        rola
+        std     ,y
+        lda     #%10000000
+        anda    FACSGN-FACEXP,x ; isolate sign
+        ora     ,y              ; inject
+        sta     ,y              ; store
 
-	lda	2+FACHO-FACEXP,x
-	sta	3,y
-	ldd	FACHO-FACEXP,x
+        lda     2+FACHO-FACEXP,x
+        sta     3,y
+        ldd     FACHO-FACEXP,x
 opSTF8g lsra
-	rorb
-	ror	3,y
-	ror	4,y
-	bita	#%11100000
-	bne	opSTF8g
-	anda	#%00001111
-	ora	1,y
-	std	1,y
-	pulu	pc
+        rorb
+        ror     3,y
+        ror     4,y
+        bita    #%11100000
+        bne     opSTF8g
+        anda    #%00001111
+        ora     1,y
+        std     1,y
+        pulu    pc
 
-	endc
+        endc
 
-	echo	VM    size = &(*-init) bytes
+        echo    VM    size = &(*-init) bytes
 
 * crt0: saves regs, setdp, self-modifying "sts __exit+2" patches the
 * return address; EXTRAMON cold-reset + VALTYP/DBLFLG init when FPU.
@@ -1285,464 +1285,464 @@ opSTF8g lsra
 * immediates to restore exactly the previous IRQ state. opLDCLK
 * reads CLK atomically under orcc #$50.
 
-crt0	pshs	d,x,y,u,dp,cc
-	ldd	#R0hi&$FF00
-	tfr	a,dp
-	sts	__exit+2
+crt0    pshs    d,x,y,u,dp,cc
+        ldd     #R0hi&$FF00
+        tfr     a,dp
+        sts     __exit+2
 
-	clra
-	std	CLK	; clear clock
-	std	CLK+1
-	tfr	d,x	; clear ac,av
-	pshs	d,x
-	pshs	d,x
-	ldx	#__exit-2
-	pshs	d,x	; return to __exit
+        clra
+        std     CLK     ; clear clock
+        std     CLK+1
+        tfr     d,x     ; clear ac,av
+        pshs    d,x
+        pshs    d,x
+        ldx     #__exit-2
+        pshs    d,x     ; return to __exit
 
-	ifne	FPU
-	lda	MODELE
-	bne	*+5
-	jsr	>EXTRA	; cold reset of EXTRAMON
+        ifne    FPU
+        lda     MODELE
+        bne     *+5
+        jsr     >EXTRA  ; cold reset of EXTRAMON
 
-	ldd	#4
-	sta	>DBLFLG
-	stb	>VALTYP
-	endc
+        ldd     #4
+        sta     >DBLFLG
+        stb     >VALTYP
+        endc
 
-	bsr	startCLK
+        bsr     startCLK
 
-	ldu	#_main	; jmp to main
-	pulu	pc
-	fdb	__exit
-__exit	lds	#0
-	bsr	stopCLK
-	puls	d,x,y,u,dp,cc,pc
+        ldu     #_main  ; jmp to main
+        pulu    pc
+        fdb     __exit
+__exit  lds     #0
+        bsr     stopCLK
+        puls    d,x,y,u,dp,cc,pc
 
 ***************************************
 * Timer
 ***************************************
-TIMEPT	 EQU   $6027
-STATUS	 EQU   $6019
-IRQPT	 EQU   $6021
-KBIN	 EQU   $E830
+TIMEPT   EQU   $6027
+STATUS   EQU   $6019
+IRQPT    EQU   $6021
+KBIN     EQU   $E830
 
-CLK	FDB	0,0	; clock register (1/10 sec)
+CLK     FDB     0,0     ; clock register (1/10 sec)
 
-stopCLK orcc	#$50
-	ldx	#STATUS
-	ldb	,x
-	andb	#%11011111
-stopCL1 orb	#0
-	stb	,x
-stopCL2 ldd	#0
-	std	TIMEPT-STATUS,x
-	tfr	cc,b
-	andb	#$AF
-stopCL3 orb	#0
-	tfr	b,cc
-	rts
+stopCLK orcc    #$50
+        ldx     #STATUS
+        ldb     ,x
+        andb    #%11011111
+stopCL1 orb     #0
+        stb     ,x
+stopCL2 ldd     #0
+        std     TIMEPT-STATUS,x
+        tfr     cc,b
+        andb    #$AF
+stopCL3 orb     #0
+        tfr     b,cc
+        rts
 
 startCLK
-	ldx	#STATUS
+        ldx     #STATUS
 
-	ldd	TIMEPT-STATUS,x
-	std	stopCL2+1
+        ldd     TIMEPT-STATUS,x
+        std     stopCL2+1
 
-	ldd	#interCLK
-	std	TIMEPT-STATUS,x
+        ldd     #interCLK
+        std     TIMEPT-STATUS,x
 
-	tfr	cc,b
-	andb	#$50
-	stb	stopCL3+1
+        tfr     cc,b
+        andb    #$50
+        stb     stopCL3+1
 
-	orcc	#$50
-	ldb	,x
-	andb	#$20
-	stb	stopCL1+1
-	ldb	,x
-	orb	#$20
-	stb	,x
+        orcc    #$50
+        ldb     ,x
+        andb    #$20
+        stb     stopCL1+1
+        ldb     ,x
+        orb     #$20
+        stb     ,x
 
-	andcc	#$AF
-	rts
+        andcc   #$AF
+        rts
 
 interCLK
-	inc	CLK+3
-	bne	interCLK0
-	inc	CLK+2
-	bne	interCLK0
-	inc	CLK+1
-	bne	interCLK0
-	inc	CLK
+        inc     CLK+3
+        bne     interCLK0
+        inc     CLK+2
+        bne     interCLK0
+        inc     CLK+1
+        bne     interCLK0
+        inc     CLK
 interCLK0
-	jmp	KBIN
+        jmp     KBIN
 
-opLDCLK pshs	cc
-	orcc	#$50
-	ldd	CLK
-	ldx	CLK+2
-	puls	cc
-	std	<R0hi
-	stx	<R0lo
-	pulu	pc
+opLDCLK pshs    cc
+        orcc    #$50
+        ldd     CLK
+        ldx     CLK+2
+        puls    cc
+        std     <R0hi
+        stx     <R0lo
+        pulu    pc
 
-	echo	CRT0  size = &(*-crt0) bytes
+        echo    CRT0  size = &(*-crt0) bytes
 
 *************************************************************************
 * macros
 *************************************************************************
 
 * load
-LDi_0	macro
-	fdb	opLDi_0
-	endm
-LDi_1	macro
-	fdb	opLDi_1
-	endm
-LDi_m1	macro
-	fdb	opLDi_m1
-	endm
-LDi	macro
-	fdb	opLDi,\0,\1
-	endm
-LEA	macro
-	fdb	opLEA
-	fcb	\0
-	endm
-MOV	macro
-	fdb	opMOV,\0*256+\1
-	endm
-LD	macro
-	fdb	opLD
-	fcb	\0
-	endm
-LD1	macro
-	fdb	opLD1
-	fcb	\0
-	endm
-LD2	macro
-	fdb	opLD2
-	fcb	\0
-	endm
-LD4	macro
-	fdb	opLD4
-	fcb	\0
-	endm
-LD1r	macro
-	fdb	opLD1r
-	endm
-LD2r	macro
-	fdb	opLD2r
-	endm
-LD4r	macro
-	fdb	opLD4r
-	endm
-LD1m	macro
-	fdb	opLD1m,\1
-	endm
-LD2m	macro
-	fdb	opLD2m,\1
-	endm
-LD4m	macro
-	fdb	opLD4m,\1
-	endm
+LDi_0   macro
+        fdb     opLDi_0
+        endm
+LDi_1   macro
+        fdb     opLDi_1
+        endm
+LDi_m1  macro
+        fdb     opLDi_m1
+        endm
+LDi     macro
+        fdb     opLDi,\0,\1
+        endm
+LEA     macro
+        fdb     opLEA
+        fcb     \0
+        endm
+MOV     macro
+        fdb     opMOV,\0*256+\1
+        endm
+LD      macro
+        fdb     opLD
+        fcb     \0
+        endm
+LD1     macro
+        fdb     opLD1
+        fcb     \0
+        endm
+LD2     macro
+        fdb     opLD2
+        fcb     \0
+        endm
+LD4     macro
+        fdb     opLD4
+        fcb     \0
+        endm
+LD1r    macro
+        fdb     opLD1r
+        endm
+LD2r    macro
+        fdb     opLD2r
+        endm
+LD4r    macro
+        fdb     opLD4r
+        endm
+LD1m    macro
+        fdb     opLD1m,\1
+        endm
+LD2m    macro
+        fdb     opLD2m,\1
+        endm
+LD4m    macro
+        fdb     opLD4m,\1
+        endm
 
-LDu1	macro
-	fdb	opLDu1
-	fcb	\0
-	endm
-LDu2	macro
-	fdb	opLDu2
-	fcb	\0
-	endm
-LDu1r	macro
-	fdb	opLDu1r
-	endm
-LDu2r	macro
-	fdb	opLDu2r
-	endm
-LDu1m	macro
-	fdb	opLDu1m,\1
-	endm
-LDu2m	macro
-	fdb	opLDu2m,\1
-	endm
+LDu1    macro
+        fdb     opLDu1
+        fcb     \0
+        endm
+LDu2    macro
+        fdb     opLDu2
+        fcb     \0
+        endm
+LDu1r   macro
+        fdb     opLDu1r
+        endm
+LDu2r   macro
+        fdb     opLDu2r
+        endm
+LDu1m   macro
+        fdb     opLDu1m,\1
+        endm
+LDu2m   macro
+        fdb     opLDu2m,\1
+        endm
 
 * store
-ST	macro
-	fdb	opST
-	fcb	\0
-	endm
-ST1	macro
-	fdb	opST1
-	fcb	\0
-	endm
-ST2	macro
-	fdb	opST2
-	fcb	\0
-	endm
-ST4	macro
-	fdb	opST4
-	fcb	\0
-	endm
-ST1m	macro
-	fdb	opST1m,\1
-	endm
-ST2m	macro
-	fdb	opST2m,\1
-	endm
-ST4m	macro
-	fdb	opST4m,\1
-	endm
+ST      macro
+        fdb     opST
+        fcb     \0
+        endm
+ST1     macro
+        fdb     opST1
+        fcb     \0
+        endm
+ST2     macro
+        fdb     opST2
+        fcb     \0
+        endm
+ST4     macro
+        fdb     opST4
+        fcb     \0
+        endm
+ST1m    macro
+        fdb     opST1m,\1
+        endm
+ST2m    macro
+        fdb     opST2m,\1
+        endm
+ST4m    macro
+        fdb     opST4m,\1
+        endm
 
 * stack
-ADJ	macro
-	fdb	opADJ
-	fcb	\0
-	endm
-PUSH	macro
-	fdb	opPUSH
-	fcb	\0
-	endm
-PUSHi	macro
-	fdb	opPUSHi,\0,\1
-	endm
-PUSHr	macro
-	fdb	opPUSHr
-	endm
+ADJ     macro
+        fdb     opADJ
+        fcb     \0
+        endm
+PUSH    macro
+        fdb     opPUSH
+        fcb     \0
+        endm
+PUSHi   macro
+        fdb     opPUSHi,\0,\1
+        endm
+PUSHr   macro
+        fdb     opPUSHr
+        endm
 
 * subroutine
-RET	macro
-	fdb	opRET
-	endm
-CALL_	macro
-	fdb	opCALL
-	fcb	\0
-	endm
-CALLm	macro
-	fdb	opCALLm,\1
-	endm
-CALLr	macro
-	fdb	opCALLr
-	endm
+RET     macro
+        fdb     opRET
+        endm
+CALL_   macro
+        fdb     opCALL
+        fcb     \0
+        endm
+CALLm   macro
+        fdb     opCALLm,\1
+        endm
+CALLr   macro
+        fdb     opCALLr
+        endm
 
 * bool
-SEQ	macro
-	fdb	opSEQ
-	endm
-SNE	macro
-	fdb	opSNE
-	endm
-SLT	macro
-	fdb	opSLT
-	endm
-SGT	macro
-	fdb	opSGT
-	endm
-SGE	macro
-	fdb	opSGE
-	endm
-SLE	macro
-	fdb	opSLE
-	endm
+SEQ     macro
+        fdb     opSEQ
+        endm
+SNE     macro
+        fdb     opSNE
+        endm
+SLT     macro
+        fdb     opSLT
+        endm
+SGT     macro
+        fdb     opSGT
+        endm
+SGE     macro
+        fdb     opSGE
+        endm
+SLE     macro
+        fdb     opSLE
+        endm
 
 * jump
-JRA	macro
-	fdb	opJRA,\0
-	endm
-JEQ	macro
-	fdb	opJEQ,\0
-	endm
-JNE	macro
-	fdb	opJNE,\0
-	endm
-JLT	macro
-	fdb	opJLT,\0
-	endm
-JGT	macro
-	fdb	opJGT,\0
-	endm
-JGE	macro
-	fdb	opJGE,\0
-	endm
-JLE	macro
-	fdb	opJLE,\0
-	endm
+JRA     macro
+        fdb     opJRA,\0
+        endm
+JEQ     macro
+        fdb     opJEQ,\0
+        endm
+JNE     macro
+        fdb     opJNE,\0
+        endm
+JLT     macro
+        fdb     opJLT,\0
+        endm
+JGT     macro
+        fdb     opJGT,\0
+        endm
+JGE     macro
+        fdb     opJGE,\0
+        endm
+JLE     macro
+        fdb     opJLE,\0
+        endm
 
 
 * operations
-ADD	macro
-	fdb	opADD
-	fcb	\0
-	endm
-SUB	macro
-	fdb	opSUB
-	fcb	\0
-	endm
-AND	macro
-	fdb	opAND
-	fcb	\0
-	endm
-OR	macro
-	fdb	opOR
-	fcb	\0
-	endm
-XOR	macro
-	fdb	opEOR
-	fcb	\0
-	endm
-MUL_	macro
-	fdb	opMUL
-	fcb	\0
-	endm
-DIV	macro
-	fdb	opDIV
-	fcb	\0
-	endm
-MOD	macro
-	fdb	opMOD
-	fcb	\0
-	endm
-UDIV	macro
-	fdb	opUDIV
-	fcb	\0
-	endm
-UMOD	macro
-	fdb	opUMOD
-	fcb	\0
-	endm
-SHL	macro
-	FDB	opSHL
-	fcb	\0
-	endm
-SHR	macro
-	FDB	opSHR
-	fcb	\0
-	endm
-SAR	macro
-	FDB	opSAR
-	fcb	\0
-	endm
-CMP	macro
-	fdb	opCMP
-	fcb	\0
-	endm
-UCMP	macro
-	fdb	opUCMP
-	fcb	\0
-	endm
+ADD     macro
+        fdb     opADD
+        fcb     \0
+        endm
+SUB     macro
+        fdb     opSUB
+        fcb     \0
+        endm
+AND     macro
+        fdb     opAND
+        fcb     \0
+        endm
+OR      macro
+        fdb     opOR
+        fcb     \0
+        endm
+XOR     macro
+        fdb     opEOR
+        fcb     \0
+        endm
+MUL_    macro
+        fdb     opMUL
+        fcb     \0
+        endm
+DIV     macro
+        fdb     opDIV
+        fcb     \0
+        endm
+MOD     macro
+        fdb     opMOD
+        fcb     \0
+        endm
+UDIV    macro
+        fdb     opUDIV
+        fcb     \0
+        endm
+UMOD    macro
+        fdb     opUMOD
+        fcb     \0
+        endm
+SHL     macro
+        FDB     opSHL
+        fcb     \0
+        endm
+SHR     macro
+        FDB     opSHR
+        fcb     \0
+        endm
+SAR     macro
+        FDB     opSAR
+        fcb     \0
+        endm
+CMP     macro
+        fdb     opCMP
+        fcb     \0
+        endm
+UCMP    macro
+        fdb     opUCMP
+        fcb     \0
+        endm
 
-ADDi	macro
-	fdb	opADDi,\0,\1
-	endm
-SUBi	macro
-	fdb	opSUBi,\0,\1
-	endm
-ANDi	macro
-	fdb	opANDi,\0,\1
-	endm
-ORi	macro
-	fdb	opORi,\0,\1
-	endm
-XORi	macro
-	fdb	opEORi,\0,\1
-	endm
-MULi	macro
-	fdb	opMULi,\0,\1
-	endm
-DIVi	macro
-	fdb	opDIVi,\0,\1
-	endm
-MODi	macro
-	fdb	opMODi,\0,\1
-	endm
-UDIVi	macro
-	fdb	opUDIVi,\0,\1
-	endm
-UMODi	macro
-	fdb	opUMODi,\0,\1
-	endm
-SHLi	macro
-	FDB	opSHLi
-	fcb	\1
-	endm
-SHRi	macro
-	FDB	opSHRi
-	fcb	\1
-	endm
-SARi	macro
-	FDB	opSARi
-	fcb	\1
-	endm
-CMPi	macro
-	fdb	opCMPi,\0,\1
-	endm
-UCMPi	macro
-	fdb	opUCMPi,\0,\1
-	endm
+ADDi    macro
+        fdb     opADDi,\0,\1
+        endm
+SUBi    macro
+        fdb     opSUBi,\0,\1
+        endm
+ANDi    macro
+        fdb     opANDi,\0,\1
+        endm
+ORi     macro
+        fdb     opORi,\0,\1
+        endm
+XORi    macro
+        fdb     opEORi,\0,\1
+        endm
+MULi    macro
+        fdb     opMULi,\0,\1
+        endm
+DIVi    macro
+        fdb     opDIVi,\0,\1
+        endm
+MODi    macro
+        fdb     opMODi,\0,\1
+        endm
+UDIVi   macro
+        fdb     opUDIVi,\0,\1
+        endm
+UMODi   macro
+        fdb     opUMODi,\0,\1
+        endm
+SHLi    macro
+        FDB     opSHLi
+        fcb     \1
+        endm
+SHRi    macro
+        FDB     opSHRi
+        fcb     \1
+        endm
+SARi    macro
+        FDB     opSARi
+        fcb     \1
+        endm
+CMPi    macro
+        fdb     opCMPi,\0,\1
+        endm
+UCMPi   macro
+        fdb     opUCMPi,\0,\1
+        endm
 
-ADD2	macro
-	fdb	opADD2,256*\0+\1
-	endm
-SUB2	macro
-	fdb	opSUB2,256*\0+\1
-	endm
-MUL2	macro
-	fdb	opMUL2,256*\0+\1
-	endm
-DIV2	macro
-	fdb	opDIV2,256*\0+\1
-	endm
-MOD2	macro
-	fdb	opMOD2,256*\0+\1
-	endm
-UDIV2	macro
-	fdb	opUDIV2,256*\0+\1
-	endm
-UMOD2	macro
-	fdb	opUMOD2,256*\0+\1
-	endm
-AND2	macro
-	fdb	opAND2,256*\0+\1
-	endm
-OR2	macro
-	fdb	opOR2,256*\0+\1
-	endm
-XOR2	macro
-	fdb	opEOR2,256*\0+\1
-	endm
-CMP2	macro
-	fdb	opCMP2,256*\0+\1
-	endm
-UCMP2	macro
-	fdb	opUCMP2,256*\0+\1
-	endm
+ADD2    macro
+        fdb     opADD2,256*\0+\1
+        endm
+SUB2    macro
+        fdb     opSUB2,256*\0+\1
+        endm
+MUL2    macro
+        fdb     opMUL2,256*\0+\1
+        endm
+DIV2    macro
+        fdb     opDIV2,256*\0+\1
+        endm
+MOD2    macro
+        fdb     opMOD2,256*\0+\1
+        endm
+UDIV2   macro
+        fdb     opUDIV2,256*\0+\1
+        endm
+UMOD2   macro
+        fdb     opUMOD2,256*\0+\1
+        endm
+AND2    macro
+        fdb     opAND2,256*\0+\1
+        endm
+OR2     macro
+        fdb     opOR2,256*\0+\1
+        endm
+XOR2    macro
+        fdb     opEOR2,256*\0+\1
+        endm
+CMP2    macro
+        fdb     opCMP2,256*\0+\1
+        endm
+UCMP2   macro
+        fdb     opUCMP2,256*\0+\1
+        endm
 
 * cast
-EXT1	macro
-	fdb	opEXT1
-	endm
-EXT2	macro
-	fdb	opEXT2
-	endm
-EXTu1	macro
-	fdb	opEXTu1
-	endm
-EXTu2	macro
-	fdb	opEXTu2
-	endm
+EXT1    macro
+        fdb     opEXT1
+        endm
+EXT2    macro
+        fdb     opEXT2
+        endm
+EXTu1   macro
+        fdb     opEXTu1
+        endm
+EXTu2   macro
+        fdb     opEXTu2
+        endm
 
-	ifne	FPU
+        ifne    FPU
 * floating point
-	endc
+        endc
 
 * misc
-VM_OFF	macro
-	fdb	*+2
-	endm
-VM_ON	macro
-	jsr	<go_vm
-	endm
-LDCLK	macro
-	fdb	opLDCLK
-	endm
+VM_OFF  macro
+        fdb     *+2
+        endm
+VM_ON   macro
+        jsr     <go_vm
+        endm
+LDCLK   macro
+        fdb     opLDCLK
+        endm
