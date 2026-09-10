@@ -37,7 +37,7 @@ DBLFLG	equ	$6103
 
 init	jmp	crt0
 
-opST	pulu	d,y
+opST	pulu	b,y
 	ldx	#0
 R0hi	set	*-2
 	stx	b,s
@@ -197,7 +197,7 @@ opUCMPc subd	2,y
 opCMPi	leay	,u
 	leau	4,u
 	bra	opCMPa
-opCMP	pulu	d
+opCMP	pulu	b
 	leay	b,s
 opCMPa	ldd	<R0hi
 	subd	,y
@@ -227,7 +227,7 @@ opUCMPb ldd	,x
 opUCMPi leay	,u
 	leau	4,u
 	bra	opUCMPa
-opUCMP	pulu	d
+opUCMP	pulu	b
 	leay	b,s
 opUCMPa ldd	<R0hi
 	subd	,y
@@ -262,12 +262,12 @@ opLDi	pulu	d,x,y
 	stx	<R0lo
 	jmp	,y
 
-opLEA	pulu	d,y
+opLEA	pulu	b,y
 	leax	b,s
 	clrb		;assuming  a=0
 	bra	opSTR0
 
-opLD	pulu	d,y
+opLD	pulu	b,y
 	leax	b,s
 	ldd	,x
 	ldx	2,x
@@ -275,20 +275,21 @@ opSTR0	std	<R0hi
 	stx	<R0lo
 	jmp	,y
 
-opMOV	pulu    d,y
+opMOV	pulu	d,y
 	ldx	b,s
 	stx	a,s
-        adda    #2
-        addb    #2
-        ldx	b,s
+	adda	#2
+	addb	#2
+	ldx	b,s
 	stx	a,s
-        jmp     ,y
+	jmp	,y
 
-opLD1m	pulu	x
+opLD1m	pulu	x,y
 	bra	opLD1a
-opLD1r	ldx	#R0lo-2
+opLD1r	pulu	y
+	ldx	#R0lo-2
 	bra	opLD1a
-opLD1	pulu	d
+opLD1	pulu	b,y
 	leax	b,s
 opLD1a	ldb	[2,x]	; TODO banking
 	SKIP2X
@@ -297,13 +298,14 @@ opEXT1	ldb	<R0lo+1
 	std	<R0lo
 	sta	<R0hi+1
 	sta	<R0hi
-	pulu	pc
+	jmp	,y
 
-opLDu1m pulu	x
+opLDu1m pulu	x,y
 	bra	opLDu1a
-opLDu1r ldx	#R0lo-2
+opLDu1r pulu	y
+	ldx	#R0lo-2
 	bra	opLDu1a
-opLDu1	pulu	d
+opLDu1	pulu	b,y
 	leax	b,s
 opLDu1a ldb	[2,x]	; TODO banking
 	SKIP2X
@@ -312,13 +314,14 @@ opEXTu1 ldb	<R0lo+1
 	std	<R0lo
 	clrb
 	std	<R0hi
-	pulu	pc
+	jmp	,y
 
-opLD2m	pulu	x
+opLD2m	pulu	x,y
 	bra	opLD2a
-opLD2r	ldx	#R0lo-2
+opLD2r	pulu	y
+	ldx	#R0lo-2
 	bra	opLD2a
-opLD2	pulu	d
+opLD2	pulu	b,y
 	leax	b,s
 opLD2a	ldd	[2,x]	; TODO banking
 	std	<R0lo
@@ -330,19 +333,20 @@ opEXT2	ldb	<R0lo
 opLD2c	clrb
 	sex
 	std	<R0hi
-	pulu	pc
+	jmp	,y
 
-opLDu2m pulu	x
+opLDu2m pulu	x,y
 	bra	opLDu2a
-opLDu2r ldx	#R0lo-1
+opLDu2r pulu	y
+	ldx	#R0lo-1
 	bra	opLDu2a
-opLDu2	pulu	d
+opLDu2	pulu	b,y
 	leax	b,s
 opLDu2a ldd	[2,x]	; TODO banking
 	std	<R0lo
 opEXTu2 ldd	#0
 	std	<R0hi
-	pulu	pc
+	jmp,y
 
 opLD4r	pulu	y
 	ldd	<R0hi
@@ -351,7 +355,7 @@ opLD4r	pulu	y
 
 opLD4m	pulu	x,y
 	bra	opLD4a
-pLD4	pulu	d,y
+pLD4	pulu	b,y
 	leax	b,s
 opLD4a	ldx	2,x    ; TODO banking
 	ldd	,x
@@ -363,7 +367,7 @@ opLD4b	std	<R0hi
 * store
 opST1m	pulu	x,y
 	bra	opST1a
-opST1	pulu	d,y
+opST1	pulu	b,y
 	leax	b,s
 opST1a	lda	<R0lo+1
 	sta	[2,x]	; TODO banking
@@ -371,7 +375,7 @@ opST1a	lda	<R0lo+1
 
 opST2m	pulu	x,y
 	bra	opST2a
-opST2	pulu	d,y
+opST2	pulu	b,y
 	leax	b,s
 opST2a	ldd	<R0lo
 	std	[2,x]	; TODO banking
@@ -379,7 +383,7 @@ opST2a	ldd	<R0lo
 
 opST4m	pulu	x,y
 	bra	opST4a
-opST4	pulu	d,y
+opST4	pulu	b,y
 	addb	#2
 	ldx	b,s
 opST4a	ldd	<R0hi
@@ -395,11 +399,11 @@ opST4a	ldd	<R0hi
 * prologue (negative frame alloc) and call cleanup (positive release)
 * in one instruction;
 
-opADJ	pulu	d,y
+opADJ	pulu	b,y
 	leas	b,s
 	jmp	,y
 
-opPUSH	pulu	d,y
+opPUSH	pulu	b,y
 	leax	b,s
 	ldd	,x
 	ldx	2,x
@@ -429,7 +433,7 @@ opRET	puls	d,u	; TODO banking
 opCALLr ldx	<R0lo
 *	ldd	<R0hi
 	bra	opCALLb
-opCALL	pulu	d
+opCALL	pulu	b
 	leax	b,s
 	ldx	2,x	; TODO banking
 	bra	opCALLb
@@ -509,7 +513,7 @@ opADDi	leay	,u
 	ldx	-2,u
 	bra	opADDa
 
-opADD	pulu	d,x
+opADD	pulu	b,x
 	leay	b,s
 opADDa	ldd	<R0lo
 	addd	2,y
@@ -539,7 +543,7 @@ opSUBi	leay	,u
 	ldx	-2,u
 	bra	opSUBa
 
-opSUB	pulu	d,x
+opSUB	pulu	b,x
 	leay	b,s
 opSUBa	ldd	<R0lo
 	subd	2,y
@@ -567,7 +571,7 @@ op\0a	\0B	1,y
 op\0i	leay	,u
 	leau	4,u
 	bra	op\0b
-op\0	pulu	d
+op\0	pulu	b
 	leay	b,s
 op\0b	ldd	<R0lo
 	\0B	3,y
@@ -624,7 +628,7 @@ opMUL2	pulu	d
 opMULi	leay	,u
 	leau	4,u
 	bra	opMUL0
-opMUL	pulu	d
+opMUL	pulu	b
 	leay	b,s
 opMUL0	ldd	<R0lo
 	std	<R1+2
@@ -757,7 +761,7 @@ opDIV2	pulu	d
 opDIVi	leay	,u
 	leau	4,u
 	bra	opDIVa
-opDIV	pulu	d
+opDIV	pulu	b
 	leay	b,s
 opDIVa	ldb	,y
 	stb	,-s
@@ -832,7 +836,7 @@ opUDIV2 pulu	d
 opUDIVi leay	,u
 	leau	4,u
 	bra	opUDIVa
-opUDIV	pulu	d
+opUDIV	pulu	b
 	leay	b,s
 opUDIVa jsr	<UDIV_Y
 	rol	<R0lo+1
@@ -858,7 +862,7 @@ opUMOD2 pulu	d
 opUMODi leay	,u
 	leau	4,u
 	bra	opUMODa
-opUMOD	pulu	d
+opUMOD	pulu	b
 	leay	b,s
 opUMODa jsr	<UDIV_Y
 	ldd	<R1	; move remainder to R0
@@ -883,11 +887,11 @@ lslR0	macro
 	rol	<R0hi+1
 	rol	<R0hi
 	endm
-opSHL	pulu	d,y
+opSHL	pulu	b,y
 	addb	#3
 	LDB	b,s
 	SKIP2X
-opSHLi	pulu	d,y
+opSHLi	pulu	b,y
 	stb	<R1
 	ldd	<R0lo
 	beq	opSHL_half
@@ -965,11 +969,11 @@ lsrR0	macro
 	ror	<R0lo
 	ror	<R0lo+1
 	endm
-opSHR	pulu	d,y
+opSHR	pulu	b,y
 	addb	#3
 	ldb	b,s
 	SKIP2X
-opSHRi	pulu	d,y
+opSHRi	pulu	b,y
 	stb	<R1
 	ldd	<R0hi
 	beq	opSHR_half
@@ -1047,11 +1051,11 @@ asrR0	macro
 	ror	<R0lo
 	ror	<R0lo+1
 	endm
-opSAR	pulu	d,y
+opSAR	pulu	b,y
 	addb	#3
 	LDB	b,s
 	SKIP2X
-opSARi	pulu	d,y
+opSARi	pulu	b,y
 	stb	<R1
 	ldd	<R0hi
 	beq	opSHR_half
@@ -1086,116 +1090,6 @@ opSAR_16
 	std	<R0hi
 opSAR_32
 	jmp	,y
-
-	echo	VM    size = &(*-init) bytes
-
-* crt0: saves regs, setdp, self-modifying "sts __exit+2" patches the
-* return address; EXTRAMON cold-reset + VALTYP/DBLFLG init when FPU.
-* Timer: the 10Hz IRQ vector is retargeted to interCLK (CLK = 4-byte
-* 1/10s counter); startCLK/stopCLK patch their own orcc/andcc
-* immediates to restore exactly the previous IRQ state. opLDCLK
-* reads CLK atomically under orcc #$50.
-
-crt0	pshs	d,x,y,u,dp,cc
-	ldd	#R0hi&$FF00
-	tfr	a,dp
-	sts	__exit+2
-
-	clra
-	std	CLK	; clear clock
-	std	CLK+1
-	tfr	d,x	; clear ac,av
-	pshs	d,x
-	pshs	d,x
-	ldx	#__exit-2
-	pshs	d,x	; return to __exit
-
-	ifne	FPU
-	lda	MODELE
-	bne	*+5
-	jsr	>EXTRA	; cold reset of EXTRAMON
-
-	ldd	#4
-	sta	>DBLFLG
-	stb	>VALTYP
-	endc
-
-	bsr	startCLK
-
-	ldu	#_main	; jmp to main
-	pulu	pc
-	fdb	__exit
-__exit	lds	#0
-	bsr	stopCLK
-	puls	d,x,y,u,dp,cc,pc
-
-***************************************
-* Timer
-***************************************
-TIMEPT	 EQU   $6027
-STATUS	 EQU   $6019
-IRQPT	 EQU   $6021
-KBIN	 EQU   $E830
-
-CLK	FDB	0,0	; clock register (1/10 sec)
-
-stopCLK orcc	#$50
-	ldx	#STATUS
-	ldb	,x
-	andb	#%11011111
-stopCL1 orb	#0
-	stb	,x
-stopCL2 ldd	#0
-	std	TIMEPT-STATUS,x
-	tfr	cc,b
-	andb	#$AF
-stopCL3 orb	#0
-	tfr	b,cc
-	rts
-
-startCLK
-	ldx	#STATUS
-
-	ldd	TIMEPT-STATUS,x
-	std	stopCL2+1
-
-	ldd	#interCLK
-	std	TIMEPT-STATUS,x
-
-	tfr	cc,b
-	andb	#$50
-	stb	stopCL3+1
-
-	orcc	#$50
-	ldb	,x
-	andb	#$20
-	stb	stopCL1+1
-	ldb	,x
-	orb	#$20
-	stb	,x
-
-	andcc	#$AF
-	rts
-
-interCLK
-	inc	CLK+3
-	bne	interCLK0
-	inc	CLK+2
-	bne	interCLK0
-	inc	CLK+1
-	bne	interCLK0
-	inc	CLK
-interCLK0
-	jmp	KBIN
-
-opLDCLK pshs	cc
-	orcc	#$50
-	ldd	CLK
-	ldx	CLK+2
-	puls	cc
-	std	<R0hi
-	stx	<R0lo
-	pulu	pc
 
 	ifne	FPU
 * floating point
@@ -1382,6 +1276,116 @@ opSTF8g lsra
 
 	endc
 
+	echo	VM    size = &(*-init) bytes
+
+* crt0: saves regs, setdp, self-modifying "sts __exit+2" patches the
+* return address; EXTRAMON cold-reset + VALTYP/DBLFLG init when FPU.
+* Timer: the 10Hz IRQ vector is retargeted to interCLK (CLK = 4-byte
+* 1/10s counter); startCLK/stopCLK patch their own orcc/andcc
+* immediates to restore exactly the previous IRQ state. opLDCLK
+* reads CLK atomically under orcc #$50.
+
+crt0	pshs	d,x,y,u,dp,cc
+	ldd	#R0hi&$FF00
+	tfr	a,dp
+	sts	__exit+2
+
+	clra
+	std	CLK	; clear clock
+	std	CLK+1
+	tfr	d,x	; clear ac,av
+	pshs	d,x
+	pshs	d,x
+	ldx	#__exit-2
+	pshs	d,x	; return to __exit
+
+	ifne	FPU
+	lda	MODELE
+	bne	*+5
+	jsr	>EXTRA	; cold reset of EXTRAMON
+
+	ldd	#4
+	sta	>DBLFLG
+	stb	>VALTYP
+	endc
+
+	bsr	startCLK
+
+	ldu	#_main	; jmp to main
+	pulu	pc
+	fdb	__exit
+__exit	lds	#0
+	bsr	stopCLK
+	puls	d,x,y,u,dp,cc,pc
+
+***************************************
+* Timer
+***************************************
+TIMEPT	 EQU   $6027
+STATUS	 EQU   $6019
+IRQPT	 EQU   $6021
+KBIN	 EQU   $E830
+
+CLK	FDB	0,0	; clock register (1/10 sec)
+
+stopCLK orcc	#$50
+	ldx	#STATUS
+	ldb	,x
+	andb	#%11011111
+stopCL1 orb	#0
+	stb	,x
+stopCL2 ldd	#0
+	std	TIMEPT-STATUS,x
+	tfr	cc,b
+	andb	#$AF
+stopCL3 orb	#0
+	tfr	b,cc
+	rts
+
+startCLK
+	ldx	#STATUS
+
+	ldd	TIMEPT-STATUS,x
+	std	stopCL2+1
+
+	ldd	#interCLK
+	std	TIMEPT-STATUS,x
+
+	tfr	cc,b
+	andb	#$50
+	stb	stopCL3+1
+
+	orcc	#$50
+	ldb	,x
+	andb	#$20
+	stb	stopCL1+1
+	ldb	,x
+	orb	#$20
+	stb	,x
+
+	andcc	#$AF
+	rts
+
+interCLK
+	inc	CLK+3
+	bne	interCLK0
+	inc	CLK+2
+	bne	interCLK0
+	inc	CLK+1
+	bne	interCLK0
+	inc	CLK
+interCLK0
+	jmp	KBIN
+
+opLDCLK pshs	cc
+	orcc	#$50
+	ldd	CLK
+	ldx	CLK+2
+	puls	cc
+	std	<R0hi
+	stx	<R0lo
+	pulu	pc
+
 	echo	CRT0  size = &(*-crt0) bytes
 
 *************************************************************************
@@ -1402,22 +1406,27 @@ LDi	macro
 	fdb	opLDi,\0,\1
 	endm
 LEA	macro
-	fdb	opLEA,\0
+	fdb	opLEA
+	fcb	\0
 	endm
 MOV	macro
 	fdb	opMOV,\0*256+\1
 	endm
 LD	macro
-	fdb	opLD,\0
+	fdb	opLD
+	fcb	\0
 	endm
 LD1	macro
-	fdb	opLD1,\0
+	fdb	opLD1
+	fcb	\0
 	endm
 LD2	macro
-	fdb	opLD2,\0
+	fdb	opLD2
+	fcb	\0
 	endm
 LD4	macro
-	fdb	opLD4,\0
+	fdb	opLD4
+	fcb	\0
 	endm
 LD1r	macro
 	fdb	opLD1r
@@ -1439,10 +1448,12 @@ LD4m	macro
 	endm
 
 LDu1	macro
-	fdb	opLDu1,\0
+	fdb	opLDu1
+	fcb	\0
 	endm
 LDu2	macro
-	fdb	opLDu2,\0
+	fdb	opLDu2
+	fcb	\0
 	endm
 LDu1r	macro
 	fdb	opLDu1r
@@ -1459,16 +1470,20 @@ LDu2m	macro
 
 * store
 ST	macro
-	fdb	opST,\0
+	fdb	opST
+	fcb	\0
 	endm
 ST1	macro
-	fdb	opST1,\0
+	fdb	opST1
+	fcb	\0
 	endm
 ST2	macro
-	fdb	opST2,\0
+	fdb	opST2
+	fcb	\0
 	endm
 ST4	macro
-	fdb	opST4,\0
+	fdb	opST4
+	fcb	\0
 	endm
 ST1m	macro
 	fdb	opST1m,\1
@@ -1482,10 +1497,12 @@ ST4m	macro
 
 * stack
 ADJ	macro
-	fdb	opADJ,\0
+	fdb	opADJ
+	fcb	\0
 	endm
 PUSH	macro
-	fdb	opPUSH,\0
+	fdb	opPUSH
+	fcb	\0
 	endm
 PUSHi	macro
 	fdb	opPUSHi,\0,\1
@@ -1499,7 +1516,8 @@ RET	macro
 	fdb	opRET
 	endm
 CALL_	macro
-	fdb	opCALL,\0
+	fdb	opCALL
+	fcb	\0
 	endm
 CALLm	macro
 	fdb	opCALLm,\1
@@ -1554,49 +1572,64 @@ JLE	macro
 
 * operations
 ADD	macro
-	fdb	opADD,\0
+	fdb	opADD
+	fcb	\0
 	endm
 SUB	macro
-	fdb	opSUB,\0
+	fdb	opSUB
+	fcb	\0
 	endm
 AND	macro
-	fdb	opAND,\0
+	fdb	opAND
+	fcb	\0
 	endm
 OR	macro
-	fdb	opOR,\0
+	fdb	opOR
+	fcb	\0
 	endm
 XOR	macro
-	fdb	opEOR,\0
+	fdb	opEOR
+	fcb	\0
 	endm
 MUL_	macro
-	fdb	opMUL,\0
+	fdb	opMUL
+	fcb	\0
 	endm
 DIV	macro
-	fdb	opDIV,\0
+	fdb	opDIV
+	fcb	\0
 	endm
 MOD	macro
-	fdb	opMOD,\0
+	fdb	opMOD
+	fcb	\0
 	endm
 UDIV	macro
-	fdb	opUDIV,\0
+	fdb	opUDIV
+	fcb	\0
 	endm
 UMOD	macro
-	fdb	opUMOD,\0
+	fdb	opUMOD
+	fcb	\0
 	endm
 SHL	macro
-	FDB	opSHL,\0
+	FDB	opSHL
+	fcb	\0
 	endm
 SHR	macro
-	FDB	opSHR,\0
+	FDB	opSHR
+	fcb	\0
 	endm
 SAR	macro
-	FDB	opSAR,\0
+	FDB	opSAR
+	fcb	\0
 	endm
 CMP	macro
-	fdb	opCMP,\0
+	fdb	opCMP
+	fcb	\0
 	endm
 UCMP	macro
-	fdb	opUCMP,\0
+	fdb	opUCMP
+	fcb	\0
 	endm
 
 ADDi	macro
@@ -1630,13 +1663,16 @@ UMODi	macro
 	fdb	opUMODi,\0,\1
 	endm
 SHLi	macro
-	FDB	opSHLi,\1
+	FDB	opSHLi
+	fcb	\1
 	endm
 SHRi	macro
-	FDB	opSHRi,\1
+	FDB	opSHRi
+	fcb	\1
 	endm
 SARi	macro
-	FDB	opSARi,\1
+	FDB	opSARi
+	fcb	\1
 	endm
 CMPi	macro
 	fdb	opCMPi,\0,\1
