@@ -18,12 +18,12 @@
 FPU	set	1
 FATMUL	set	1
 
-	setdp	R0/256
-	
+	setdp	R0hi/256
+
 SKIP1	macro
 	fcb	$81	; CMPA #
 	endm
-	
+
 SKIP2X	macro
 	fcb	$8e	; LDX #
 	endm
@@ -34,61 +34,81 @@ MODELE	equ	$627B
 
 VALTYP	equ	$6105
 DBLFLG	equ	$6103
-	
+
 init	jmp	crt0
 
-R0	FDB	0,0
-R1	FDB	0,0	; 
+opST	pulu	d,y
+	ldx	#0
+R0hi	set	*-2
+	stx	b,s
+	addb	#2
+	ldx	#0
+R0lo	set	*-2
+	stx	b,s
+	jmp	,y
+
+R1	FDB	0,0	;
 
 go_vm	puls	u
 	pulu	pc
 
-* Unsigned division of R0 by integer pointed by y. 
+* Unsigned division of R0 by integer pointed by y.
 * Remainder in R1, /Quotient in {R0, carry}
-opUDIVy clra	       ; no ldd here in dp
+UDIV_Y	clra	       ; no ldd here in dp
 	clrb	       ; 1 byte maters
 	std	<R1
 	std	<R1+2
 	ldx	#32
-opUDIVl rol	<R0+3
-	rol	<R0+2
-	rol	<R0+1
-	rol	<R0
-	ldd	<R1+2	
+UDIV_l	rol	<R0lo+1
+	rol	<R0lo
+	rol	<R0hi+1
+	rol	<R0hi
+	ldd	<R1+2
 	rolb
 	rola
 	std	<R1+2
 	rol	<R1+1
 	rol	<R1
 	subd	2,y
-	std	<opUDIV0+1
+	std	<UDIV_0+1
 	ldd	<R1
 	sbcb	1,y
 	sbca	,y
-	bcs	opUDIV1
+	bcs	UDIV_1
 	std	<R1
-opUDIV0 ldd	#0
+UDIV_0	ldd	#0
 	std	<R1+2
-opUDIV1 leax	-1,x
-	bne	opUDIVl
+UDIV_1	leax	-1,x
+	bne	UDIV_l
 	rts
 
 * negate R0 or int at "x"
-opNEG	ldx	#R0
-opNEGx	com	,x
-	com	1,x
-	com	2,x
-	neg	3,x
-	bcc	opNEGx0
-	inc	2,x
-	bcc	opNEGx0
-	inc	1,x
-	bcc	opNEGx0
-	inc	,x
-opNEGx0 rts
-		
+NEG_	com	<R0hi
+	com	<R0hi+1
+	com	<R0lo
+	neg	<R0lo+1
+	bcc	NEG_Yx
+	inc	<R0lo
+	bcc	NEG_Yx
+	inc	<R0hi+1
+	bcc	NEG_Yx
+	inc	<R0hi
+	rts
+
+NEG_Y	com	,y
+	com	1,y
+	com	2,y
+	neg	3,y
+	bcc	NEG_Yx
+	inc	2,y
+	bcc	NEG_Yx
+	inc	1,y
+	bcc	NEG_Yx
+	inc	,y
+NEG_Yx	rts
+
 * boolean
-* ========                
+* ========
 
 * Booleanize R0 to normalized 0/1 (unlike CMP, which leaves a
 * sign_class value). Low word tested first - R0+2 nonzero is the
@@ -99,50 +119,50 @@ opNEGx0 rts
 * taken after an untaken bmi: N=0 already) or bhi (reads the stale
 * carry of the subd that produced R0).
 
-opSNE	ldd	<R0+2
+opSNE	ldd	<R0lo
 	bne	opLDi_1
-	ldd	<R0
+	ldd	<R0hi
 	beq	opLD_LH
 
 opLDi_1 ldd	#1
-	std	<R0+2
+	std	<R0lo
 	clrb
-	std	<R0
+	std	<R0hi
 	pulu	pc
 
 opLDi_m1
 	ldd	#-1
 	bra	opLD_LH
-	
-opSEQ	ldd	<R0+2
+
+opSEQ	ldd	<R0lo
 	bne	opLDi_0
-	ldd	<R0
+	ldd	<R0hi
 	beq	opLDi_1
 
 opLDi_0 ldd	#0
-opLD_LH std	<R0+2
-opLD_H	std	<R0
+opLD_LH std	<R0lo
+opLD_H	std	<R0hi
 	pulu	pc
-	
-opSGE	lda	<R0
+
+opSGE	lda	<R0hi
 	bpl	opLDi_1
 	bra	opLDi_0
 
-opSLT	lda	<R0
+opSLT	lda	<R0hi
 	bmi	opLDi_1
 	bra	opLDi_0
-	  
-opSGT	ldd	<R0
+
+opSGT	ldd	<R0hi
 	bmi	opLDi_0
 	bgt	opLDi_1
-	ldd	<R0+2
+	ldd	<R0lo
 	beq	opLD_H
 	bra	opLDi_1
-	
-opSLE	ldd	<R0
+
+opSLE	ldd	<R0hi
 	bmi	opLDi_1
 	bgt	opLDi_0
-	ldd	<R0+2
+	ldd	<R0lo
 	beq	opLDi_1
 	bra	opLDi_0
 
@@ -164,46 +184,56 @@ opSLE	ldd	<R0
 opCMP2	pulu	d
 	leax	a,s
 	leay	b,s
-	bra	opCMPb
+	ldd	,x
+	subd	,y
+	bgt	opCMP_1
+	blt	opCMP_m1
+	ldd	2,x
+opUCMPc subd	2,y
+	bcs	opCMP_m1
+	bhi	opCMP_1
+	bra	opLD_LH
+
 opCMPi	leay	,u
 	leau	4,u
 	bra	opCMPa
 opCMP	pulu	d
 	leay	b,s
-opCMPa	ldx	#R0
-opCMPb	ldd	,x
+opCMPa	ldd	<R0hi
 	subd	,y
 	bgt	opCMP_1
-        blt     opCMP_m1
-opUCMPc	ldd	2,x
-	subd	2,y
-        bcs     opCMP_m1
-        bhi     opCMP_1
-        bra     opLD_LH
+	blt	opCMP_m1
+	ldd	<R0lo
+	bra	opUCMPc
 
-* stores onlysignj  info. Oneb yte is enough.
-opCMP_1 lda     #1
-        sta     <R0
-        pulu    pc
-opCMP_m1 
-        lda     #-1
-        sta     <R0
-        pulu    pc
+* stores only sign class. One byteis enough.
+opCMP_1 lda	#1
+	sta	<R0hi
+	pulu	pc
+opCMP_m1
+	lda	#-1
+	sta	<R0hi
+	pulu	pc
 
 opUCMP2 pulu	d
 	leax	a,s
 	leay	b,s
-	bra	opUCMPb
+opUCMPb ldd	,x
+	subd	,y
+	bcs	opCMP_m1
+	bhi	opCMP_1
+	bra	opUCMPc-2
+
 opUCMPi leay	,u
 	leau	4,u
 	bra	opUCMPa
 opUCMP	pulu	d
 	leay	b,s
-opUCMPa ldx	#R0
-opUCMPb ldd	,x
+opUCMPa ldd	<R0hi
 	subd	,y
-        bcs     opCMP_m1
-        bhi     opCMP_1
+	bcs	opCMP_m1
+	bhi	opCMP_1
+	ldd	<R0lo
 	bra	opUCMPc
 
 * load
@@ -211,10 +241,10 @@ opUCMPb ldd	,x
 
 * LDi: [imm:4][ret:2] eaten by one pulu d,x,y.
 * LEA: slot high byte guaranteed 0 (final slots in [0..127]), so
-*       leax b,s builds the address from B alone; clrb: A assumed 0.
-* LD:   32-bit load through D/X; opSTR0 tail shared with LEA.
-* MOV:  operand read IN PLACE (ldd ,u) for the two leax; the final
-*       "pulu d,pc" discards it AND dispatches in one instruction.
+*	leax b,s builds the address from B alone; clrb: A assumed 0.
+* LD:	32-bit load through D/X; opSTR0 tail shared with LEA.
+* MOV:	operand read IN PLACE (ldd ,u) for the two leax; the final
+*	"pulu d,pc" discards it AND dispatches in one instruction.
 *
 * Three addressing forms per size (slot / pointer-in-R0 / pointer-
 * in-stream) converge to one body with X = effective pointer.
@@ -228,9 +258,9 @@ opUCMPb ldd	,x
 * so opLDu2a falls through without a SKIP.)
 
 opLDi	pulu	d,x,y
-	std	<R0
-	stx	<R0+2
-	jmp	,y	 
+	std	<R0hi
+	stx	<R0lo
+	jmp	,y
 
 opLEA	pulu	d,y
 	leax	b,s
@@ -238,11 +268,11 @@ opLEA	pulu	d,y
 	bra	opSTR0
 
 opLD	pulu	d,y
-	leax	b,s	   
+	leax	b,s
 	ldd	,x
 	ldx	2,x
-opSTR0	std	<R0
-	stx	<R0+2
+opSTR0	std	<R0hi
+	stx	<R0lo
 	jmp	,y
 
 opMOV	ldd	,u
@@ -255,77 +285,79 @@ opMOV	ldd	,u
 	pulu	d,pc
 
 opLD1m	pulu	x
-	bra	opLD1a	
-opLD1r	ldx	#R0
+	bra	opLD1a
+opLD1r	ldx	#R0lo-2
 	bra	opLD1a
 opLD1	pulu	d
 	leax	b,s
 opLD1a	ldb	[2,x]	; TODO banking
 	SKIP2X
-opEXT1	ldb	<R0+3
+opEXT1	ldb	<R0lo+1
 	sex
-	std	<R0+2
-	sta	<R0+1
-	sta	<R0
+	std	<R0lo
+	sta	<R0hi+1
+	sta	<R0hi
 	pulu	pc
 
 opLDu1m pulu	x
-	bra	opLDu1a	
-opLDu1r ldx	#R0
+	bra	opLDu1a
+opLDu1r ldx	#R0lo-2
 	bra	opLDu1a
 opLDu1	pulu	d
 	leax	b,s
 opLDu1a ldb	[2,x]	; TODO banking
 	SKIP2X
-opEXTu1 ldb	<R0
+opEXTu1 ldb	<R0lo+1
 	clra
-	std	<R0+2
+	std	<R0lo
 	clrb
-	std	<R0
+	std	<R0hi
 	pulu	pc
 
 opLD2m	pulu	x
-	bra	opLD2a	
-opLD2r	ldx	#R0
+	bra	opLD2a
+opLD2r	ldx	#R0lo-2
 	bra	opLD2a
 opLD2	pulu	d
 	leax	b,s
 opLD2a	ldd	[2,x]	; TODO banking
-	std	<R0+2
+	std	<R0lo
 	SKIP2X
-opEXT2	ldb	<R0+2  
-opLD2b	bge	opLD2c
+opEXT2	ldb	<R0lo
+	bpl	opLD2c
 	ldb	#-1
 	SKIP1
 opLD2c	clrb
-	sex	   
-	std	<R0
+	sex
+	std	<R0hi
 	pulu	pc
 
 opLDu2m pulu	x
-	bra	opLDu2a	
-opLDu2r ldx	#R0
+	bra	opLDu2a
+opLDu2r ldx	#R0lo-1
 	bra	opLDu2a
 opLDu2	pulu	d
 	leax	b,s
 opLDu2a ldd	[2,x]	; TODO banking
-	std	<R0+2
+	std	<R0lo
 opEXTu2 ldd	#0
-	std	<R0
+	std	<R0hi
 	pulu	pc
 
-opLD4m	pulu	x,y
-	bra	opLD4a	
 opLD4r	pulu	y
-	ldx	#R0
+	ldd	<R0hi
+	LDX	<R0lo
+	bra	opLD4b
+
+opLD4m	pulu	x,y
 	bra	opLD4a
-opLD4	pulu	d,y
+pLD4	pulu	d,y
 	leax	b,s
 opLD4a	ldx	2,x    ; TODO banking
 	ldd	,x
 	ldx	2,x
-	std	<R0
-	stx	<R0+2
+opLD4b	std	<R0hi
+	stx	<R0lo
 	jmp	,y
 
 * store
@@ -333,7 +365,7 @@ opST1m	pulu	x,y
 	bra	opST1a
 opST1	pulu	d,y
 	leax	b,s
-opST1a	lda	<R0+3
+opST1a	lda	<R0lo+1
 	sta	[2,x]	; TODO banking
 	jmp	,y
 
@@ -341,7 +373,7 @@ opST2m	pulu	x,y
 	bra	opST2a
 opST2	pulu	d,y
 	leax	b,s
-opST2a	ldd	<R0+2
+opST2a	ldd	<R0lo
 	std	[2,x]	; TODO banking
 	jmp	,y
 
@@ -350,19 +382,11 @@ opST4m	pulu	x,y
 opST4	pulu	d,y
 	addb	#2
 	ldx	b,s
-opST4a	ldd	<R0
+opST4a	ldd	<R0hi
 	std	,x
-	ldd	<R0+2
+	ldd	<R0lo
 	std	2,x
 	jmp	,y
-
-opST	pulu	d,y
-        ldx     <R0
-        stx     b,s
-        addb    #2
-        ldx     <R0+2
-        stx     b,s
-        jmp	,y
 
 * stack
 * =====
@@ -382,11 +406,11 @@ opPUSH	pulu	d,y
 	pshs	d,x
 	jmp	,y
 
-opPUSHr ldd	<R0
-	ldx	<R0+2
+opPUSHr ldd	<R0hi
+	ldx	<R0lo
 	pshs	d,x
 	pulu	pc
-	
+
 opPUSHi pulu	d,x,y
 	pshs	d,x
 	jmp	,y
@@ -402,20 +426,18 @@ opPUSHi pulu	d,x,y
 opRET	puls	d,u	; TODO banking
 	pulu	pc
 
-opCALLr	ldx	#R0
-	bra	opCALLa
+opCALLr ldx	<R0lo
+*	ldd	<R0hi
+	bra	opCALLb
 opCALL	pulu	d
 	leax	b,s
-opCALLa	clrb		; TODO banking
-	pshs	d,u
-	ldd	,x
 	ldx	2,x	; TODO banking
 	bra	opCALLb
-opCALLm	pulu	x	; TODO load B with curr BANK
-	pshs	d,u
-opCALLb	leau	,x	; TODO banking
+opCALLm pulu	x	; TODO load B with curr BANK
+opCALLb pshs	d,u
+	leau	,x	; TODO banking
 	pulu	pc
-	
+
 * jump
 * ====
 *
@@ -424,45 +446,43 @@ opCALLb	leau	,x	; TODO banking
 * operand and dispatches - the not-taken tail shared by all JCC.
 * opJGT/opJLE need bgt (not bpl) exactly like opSGT/opSLE above.
 *
-opJNE	ldd	<R0+2
+opJNE	ldd	<R0lo
 	bne	opJRA
-	ldd	<R0
+	ldd	<R0hi
 	bne	opJRA
 	pulu	y,pc
-	
-opJEQ	ldd	<R0+2
-	beq	opJEQ2
 
-opJRN	pulu	y,pc
+opJEQ	ldd	<R0lo
+	beq	opJEQa
+opJNX	pulu	y,pc
+opJEQa	ldd	<R0hi
+	bne	opJNX
 
-opJEQ2	ldd	<R0
-	bne	opJRN
-	
 opJRA	ldu	,u	; TODO banking
 	pulu	pc
-	
-opJGE	lda	<R0
+
+opJGE	lda	<R0hi
 	bpl	opJRA
 	pulu	d,pc	; D = trash address
 
-opJLT	lda	<R0
+opJLT	lda	<R0hi
 	bmi	opJRA
 	pulu	d,pc
-	  
-opJGT	ldd	<R0
-	bmi	opJRN
+
+opJGT	ldd	<R0hi
+	bmi	opJNX
 	bgt	opJRA
-	ldd	<R0+2
+	ldd	<R0lo
 	bne	opJRA
 	pulu	y,pc
-	
-opJLE	ldd	<R0
+
+opJLE	ldd	<R0hi
 	bmi	opJRA
-	bgt	opJRN
-	ldd	<R0+2
+	bgt	opJNX
+	ldd	<R0lo
 	beq	opJRA
 	pulu	y,pc
-	
+
 * arith
 * =====
 *
@@ -471,85 +491,90 @@ opJLE	ldd	<R0
 * propagation is folded into the high operand BEFORE the add, and
 * "beq" skips the whole high add when it is a no-op (the common
 * small-constant case: high word $0000).
-*
+
 opADD2	pulu	d
 	leax	a,s
 	leay	b,s
 	ldd	2,x
 	addd	2,y
-	std	<R0+2
+	std	<R0lo
 	ldd	,x
 	adcb	1,y
 	adca	,y
-	std	<R0
+	std	<R0hi
 	pulu	pc
-	
+
 opADDi	leay	,u
 	leau	6,u
 	ldx	-2,u
 	bra	opADDa
 
 opADD	pulu	d,x
-	leay	b,s	   
-opADDa	ldd	<R0+2
+	leay	b,s
+opADDa	ldd	<R0lo
 	addd	2,y
-	std	<R0+2
+	std	<R0lo
 	ldd	,y
 	bcc	opADDb
 	addd	#1
 opADDb	beq	opADDc
-	addd	<R0
-	std	<R0
+	addd	<R0hi
+	std	<R0hi
 opADDc	jmp	,x
-	
+
 opSUB2	pulu	d
 	leax	a,s
 	leay	b,s
 	ldd	2,x
 	subd	2,y
-	std	<R0+2
+	std	<R0lo
 	ldd	,x
 	sbcb	1,y
 	sbca	,y
-	std	<R0
+	std	<R0hi
 	pulu	pc
-	
+
 opSUBi	leay	,u
 	leau	6,u
 	ldx	-2,u
 	bra	opSUBa
-	
+
 opSUB	pulu	d,x
 	leay	b,s
-opSUBa	ldd	<R0+2
+opSUBa	ldd	<R0lo
 	subd	2,y
-	std	<R0+2
-	ldd	<R0
+	std	<R0lo
+	ldd	<R0hi
 	sbcb	1,y
 	sbca	,y
-	std	<R0
+	std	<R0hi
 	jmp	,x
 
 opLOG	macro
 op\02	pulu	d
 	leax	a,s
 	leay	b,s
-	bra	op\0b
-op\0i	leay	,u
-	leau	4,u
-	bra	op\0a
-op\0	pulu	d
-	leay	b,s
-op\0a	ldx	#R0
-op\0b	ldd	2,x
+	ldd	2,x
 	\0B	3,y
 	\0A	2,y
-	std	<R0+2
+	std	<R0lo
 	ldd	,x
-	\0B	1,y
+op\0a	\0B	1,y
 	\0A	,y
-	std	<R0
+	std	<R0hi
 	pulu	pc
+
+op\0i	leay	,u
+	leau	4,u
+	bra	op\0b
+op\0	pulu	d
+	leay	b,s
+op\0b	ldd	<R0lo
+	\0B	3,y
+	\0A	2,y
+	std	<R0lo
+	ldd	<R0hi
+	bra	op\0a
 	endm
 
 	opLOG	AND
@@ -565,27 +590,31 @@ op\0b	ldd	2,x
 opMUL16 lda	3,x
 	ldb	3,y
 	mul
-	std	<R0+2
+	std	<R0lo
 	lda	2,x
 	ldb	2,y
 	mul
-	std	<R0
+	std	<R0hi
 	lda	2,x
 	beq	opMULe
 	ldb	3,y
 	mul
-	addd	<R0+1
-	std	<R0+1
+	addb	<R0lo
+	stb	<R0lo
+	adca	<R0hi+1
+	sta	<R0hi+1
 	bcc	opMULe
-	inc	<R0
+	inc	<R0hi
 opMULe	ldb	2,y
 	beq	opMULf
 	lda	3,x
 	mul
-	addd	<R0+1
-	std	<R0+1
+	addb	<R0lo
+	stb	<R0lo
+	adca	<R0hi+1
+	sta	<R0hi+1
 	bcc	opMULf
-	inc	<R0
+	inc	<R0hi
 opMULf	pulu	pc
 
 opMUL2	pulu	d
@@ -597,9 +626,9 @@ opMULi	leay	,u
 	bra	opMUL0
 opMUL	pulu	d
 	leay	b,s
-opMUL0	ldd	<R0+2
+opMUL0	ldd	<R0lo
 	std	<R1+2
-	ldd	<R0
+	ldd	<R0hi
 	std	<R1
 	ldx	#R1
 opMUL1	ldd	,x
@@ -607,10 +636,10 @@ opMUL1	ldd	,x
 	ldd	,y
 	beq	opMUL16
 	ldb	1,x
-	
+
 *	 0123
 *	 0123
-*	 
+*
 *	 33*
 *      23
 *      32
@@ -630,10 +659,12 @@ CROSSa	macro
 	lda	\0,x
 	ldb	\1,y
 	mul
-	addd	<R0+1
-	std	<R0+1
+	addb	<R0lo
+	stb	<R0lo
+	adca	<R0hi+1
+	sta	<R0hi+1
 	bcc	opMUL\0\1
-	inc	<R0
+	inc	<R0hi
 opMUL\0\1
 	endc
 	endm
@@ -646,8 +677,8 @@ CROSSb	macro
 	lda	\0,x
 	ldb	\1,y
 	mul
-	addd	<R0
-	std	<R0
+	addd	<R0hi
+	std	<R0hi
 	endc
 	endm
 
@@ -659,26 +690,26 @@ CROSSc	macro
 	lda	\0,x
 	ldb	\1,y
 	mul
-	addb	<R0
-	stb	<R0
+	addb	<R0hi
+	stb	<R0hi
 	endc
 	endm
 
 opMUL3	lda	3,y
 	mul
-	std	<R0
-	
+	std	<R0hi
+
 	lda	3,y
 	ldb	3,x
 	mul
-	std	<R0+2
+	std	<R0lo
 
 	CROSSa	3,2
 	CROSSa	2,3
 
 	CROSSb	2,2
 	CROSSb	3,1
-	
+
 	CROSSc	0,3
 	CROSSc	1,2
 	CROSSc	2,1
@@ -689,24 +720,26 @@ opMUL3	lda	3,y
 opMULa	lda	a,x
 	ldb	b,y
 	mul
-	addd	<R0+1
-	std	<R0+1
+	addb	<R0lo
+	stb	<R0lo
+	adca	<R0hi+1
+	sta	<R0hi+1
 	bcc	opMULd
-	inc	<R0
-opMULd	rts	   
+	inc	<R0hi
+opMULd	rts
 
 opMULb	lda	a,x
 	ldb	b,y
 	mul
-	addd	<R0
-	std	<R0
-	rts	   
+	addd	<R0hi
+	std	<R0hi
+	rts
 
 opMULc	lda	a,x
 	ldb	b,y
 	mul
-	addb	<R0
-	stb	<R0
+	addb	<R0hi
+	stb	<R0hi
 	rts
 	endc
 * C99 truncating semantics: save both signs on stack, make operands
@@ -717,9 +750,9 @@ opDIV2	pulu	d
 	leax	a,s
 	leay	b,s
 	ldd	,x
-	std	<R0
+	std	<R0hi
 	ldd	2,x
-	std	<R0+2
+	std	<R0lo
 	bra	opDIVa
 opDIVi	leay	,u
 	leau	4,u
@@ -729,114 +762,110 @@ opDIV	pulu	d
 opDIVa	ldb	,y
 	stb	,-s
 	bpl	opDIVb
-	jsr	<opNEG
-	leax	,y
-	jsr	<opNEGx
-opDIVb	ldb	<R0
+	jsr	<NEG_
+	jsr	<NEG_Y
+opDIVb	ldb	<R0hi
 	stb	,-s
 	bpl	opDIVc
-	jsr	<opNEG
-opDIVc	jsr	<opUDIVy
-	rol	<R0+3
-	rol	<R0+2
-	ldd	<R0
+	jsr	<NEG_
+opDIVc	jsr	<UDIV_Y
+	rol	<R0lo+1
+	rol	<R0lo
+	ldd	<R0hi
 	rolb
 	rola
 	comb
 	coma
-	std	<R0
-	com	<R0+2
-	com	<R0+3
+	std	<R0hi
+	com	<R0lo
+	com	<R0lo+1
 	ldb	,s+
 	bpl	opDIVd
-	jsr	<opNEG
+	jsr	<NEG_
 opDIVd	ldb	,s+
 	bpl	opDIVe
-	leax	,y
-	jsr	<opNEGx
-opDIVe	pulu	pc	  
+	jsr	<NEG_Y
+opDIVe	pulu	pc
 
 opMOD2	pulu	d
 	leay	b,s
 	leax	a,s
 	ldd	,x
-	std	<R0
+	std	<R0hi
 	ldd	2,x
-	std	<R0+2
+	std	<R0lo
 	bra	opMODa
 opMODi	leay	,u
 	leau	4,u
 	bra	opMODa
 opMOD	pulu	d
 	leay	b,s
-opMODa	ldb	<R0	; real	work starts here
+opMODa	ldb	<R0hi	; real	work starts here
 	stb	,-s	; save	R0 sign
 	bpl	opMODb
-	jsr	<opNEG	; make it positive 
-opMODb	ldb	,y	
+	jsr	<NEG_	; make it positive
+opMODb	ldb	,y
 	stb	,-s	; save "y" sign
 	bpl	opMODc
-	leax	,y
-	jsr	<opNEGx ; make "y" positive
-opMODc	jsr	<opUDIVy
+	jsr	<NEG_Y	; make "y" positive
+opMODc	jsr	<UDIV_Y
 	ldd	<R1	; move remainder to R0
-	std	<R0
+	std	<R0hi
 	ldd	<R1+2
-	std	<R0+2
+	std	<R0lo
 	ldb	,s+	; restore "y"  sign
 	bpl	opMODd
-	leax	,y
-	jsr	<opNEGx
+	jsr	<NEG_Y
 opMODd	ldb	,s+	; get initial sign of R0
 	bpl	opMODe
-	jsr	<opNEG	; make (R0%y)of the samesign as R0
-opMODe	pulu	pc	  
+	jsr	<NEG_	; make (R0%y)of the samesign as R0
+opMODe	pulu	pc
 
 opUDIV2 pulu	d
 	leax	a,s
 	leay	b,s
 	ldd	,x
-	std	<R0
+	std	<R0hi
 	ldd	2,x
-	std	<R0+2
+	std	<R0lo
 	bra	opUDIVa
 opUDIVi leay	,u
 	leau	4,u
 	bra	opUDIVa
 opUDIV	pulu	d
 	leay	b,s
-opUDIVa jsr	<opUDIVy
-	rol	<R0+3
-	rol	<R0+2
-	ldd	<R0
+opUDIVa jsr	<UDIV_Y
+	rol	<R0lo+1
+	rol	<R0lo
+	ldd	<R0hi
 	rolb
 	rola
 	comb
 	coma
-	std	<R0
-	com	<R0+2
-	com	<R0+3
-	pulu	pc	  
+	std	<R0hi
+	com	<R0lo+1
+	com	<R0lo
+	pulu	pc
 
 opUMOD2 pulu	d
 	leay	b,s
 	leax	a,s
 	ldd	,x
-	std	<R0
+	std	<R0hi
 	ldd	2,x
-	std	<R0+2
+	std	<R0lo
 	bra	opUMODa
 opUMODi leay	,u
 	leau	4,u
 	bra	opUMODa
 opUMOD	pulu	d
 	leay	b,s
-opUMODa jsr	<opUDIVy
+opUMODa jsr	<UDIV_Y
 	ldd	<R1	; move remainder to R0
-	std	<R0
+	std	<R0hi
 	ldd	<R1+2
-	std	<R0+2
-	pulu	pc	  
+	std	<R0lo
+	pulu	pc
 
 * shift
 * =====
@@ -851,8 +880,8 @@ opUMODa jsr	<opUDIVy
 lslR0	macro
 	lslb
 	rola
-	rol	<R0+1
-	rol	<R0
+	rol	<R0hi+1
+	rol	<R0hi
 	endm
 opSHL	pulu	d,y
 	addb	#3
@@ -860,7 +889,7 @@ opSHL	pulu	d,y
 	SKIP2X
 opSHLi	pulu	d,y
 	stb	<R1
-	ldd	<R0+2
+	ldd	<R0lo
 	beq	opSHL_half
 	lsr	<R1
 	bcc	opSHL_2
@@ -875,25 +904,26 @@ opSHL_4 lsr	<R1
 	lslR0
 	lslR0
 	lslR0
-opSHL_8 std	<R0+2
+opSHL_8 std	<R0lo
 	lsr	<R1
 	bcc	opSHL_16
-	ldd	<R0+1
-	std	<R0
-	lda	<R0+3
+	ldb	<R0lo
+	lda	<R0hi+1
+	std	<R0hi
+	lda	<R0lo+1
 	clrb
-	std	<R0+2
+	std	<R0lo
 opSHL_16
 	lsr	<R1
 	bcc	opSHL_32
-	std	<R0	   
+	std	<R0hi
 	ldd	#0
-	std	<R0+2
+	std	<R0lo
 opSHL_32
 	jmp	,y
-	
+
 opSHL_half
-	ldd	<R0
+	ldd	<R0hi
 	lsr	<R1
 	bcc	opSHL_half2
 	lslb
@@ -926,14 +956,14 @@ opSHL_half16
 	bcc	opSHL_half32
 	ldd	#0
 opSHL_half32
-	std	<R0
+	std	<R0hi
 	jmp	,y
-	
+
 lsrR0	macro
 	lsra
 	rorb
-	ror	<R0+2
-	ror	<R0+3
+	ror	<R0lo
+	ror	<R0lo+1
 	endm
 opSHR	pulu	d,y
 	addb	#3
@@ -941,7 +971,7 @@ opSHR	pulu	d,y
 	SKIP2X
 opSHRi	pulu	d,y
 	stb	<R1
-	ldd	<R0
+	ldd	<R0hi
 	beq	opSHR_half
 	lsr	<R1
 	bcc	opSHR_2
@@ -956,25 +986,26 @@ opSHR_4 lsr	<R1
 	lsrR0
 	lsrR0
 	lsrR0
-opSHR_8 std	<R0
+opSHR_8 std	<R0hi
 	lsr	<R1
 	bcc	opSHR_16
-	ldd	<R0+1
-	std	<R0+2
-	ldb	<R0
+	ldb	<R0lo
+	lda	<R0hi+1
+	std	<R0lo
+	ldb	<R0hi
 	clra
-	std	<R0
+	std	<R0hi
 opSHR_16
 	lsr	<R1
 	bcc	opSHR_32
-	std	<R0+2
+	std	<R0lo
 opSHR_0 ldd	#0
-	std	<R0
+	std	<R0hi
 opSHR_32
 	jmp	,y
-	
+
 opSHR_half
-	ldd	<R0+2
+	ldd	<R0lo
 	lsr	<R1
 	bcc	opSHR_half2
 	lsra
@@ -1007,14 +1038,14 @@ opSHR_half16
 	bcc	opSHR_half32
 	ldd	#0
 opSHR_half32
-	std	<R0+2
+	std	<R0lo
 	jmp	,y
 
 asrR0	macro
 	asra
 	rorb
-	ror	<R0+2
-	ror	<R0+3
+	ror	<R0lo
+	ror	<R0lo+1
 	endm
 opSAR	pulu	d,y
 	addb	#3
@@ -1022,7 +1053,7 @@ opSAR	pulu	d,y
 	SKIP2X
 opSARi	pulu	d,y
 	stb	<R1
-	ldd	<R0
+	ldd	<R0hi
 	beq	opSHR_half
 	lsr	<R1
 	bcc	opSAR_2
@@ -1037,38 +1068,39 @@ opSAR_4 lsr	<R1
 	asrR0
 	asrR0
 	asrR0
-opSAR_8 std	<R0
+opSAR_8 std	<R0hi
 	lsr	<R1
 	bcc	opSAR_16
-	ldd	<R0+1
-	std	<R0+2
-	ldb	<R0
+	ldb	<R0lo
+	lda	<R0hi+1
+	std	<R0lo
+	ldb	<R0hi
 	sex
-	std	<R0
+	std	<R0hi
 opSAR_16
 	lsr	<R1
 	bcc	opSAR_32
-	std	<R0+2
+	std	<R0lo
 	lbpl	opSHR_0
 	ldd	#-1
-	std	<R0
+	std	<R0hi
 opSAR_32
 	jmp	,y
 
-	echo	VM    size = &(*-R0) bytes
-    
+	echo	VM    size = &(*-init) bytes
+
 * crt0: saves regs, setdp, self-modifying "sts __exit+2" patches the
 * return address; EXTRAMON cold-reset + VALTYP/DBLFLG init when FPU.
 * Timer: the 10Hz IRQ vector is retargeted to interCLK (CLK = 4-byte
 * 1/10s counter); startCLK/stopCLK patch their own orcc/andcc
 * immediates to restore exactly the previous IRQ state. opLDCLK
 * reads CLK atomically under orcc #$50.
-    
+
 crt0	pshs	d,x,y,u,dp,cc
-	ldd	#R0&$FF00
+	ldd	#R0hi&$FF00
 	tfr	a,dp
 	sts	__exit+2
-	
+
 	clra
 	std	CLK	; clear clock
 	std	CLK+1
@@ -1077,19 +1109,19 @@ crt0	pshs	d,x,y,u,dp,cc
 	pshs	d,x
 	ldx	#__exit-2
 	pshs	d,x	; return to __exit
-	
+
 	ifne	FPU
 	lda	MODELE
 	bne	*+5
-	jsr	>EXTRA	; cold reset of EXTRAMON	
+	jsr	>EXTRA	; cold reset of EXTRAMON
 
 	ldd	#4
 	sta	>DBLFLG
 	stb	>VALTYP
 	endc
-	
+
 	bsr	startCLK
-	
+
 	ldu	#_main	; jmp to main
 	pulu	pc
 	fdb	__exit
@@ -1111,7 +1143,7 @@ stopCLK orcc	#$50
 	ldx	#STATUS
 	ldb	,x
 	andb	#%11011111
-stopCL1 orb	#0	  
+stopCL1 orb	#0
 	stb	,x
 stopCL2 ldd	#0
 	std	TIMEPT-STATUS,x
@@ -1123,13 +1155,13 @@ stopCL3 orb	#0
 
 startCLK
 	ldx	#STATUS
-	
+
 	ldd	TIMEPT-STATUS,x
 	std	stopCL2+1
 
 	ldd	#interCLK
 	std	TIMEPT-STATUS,x
-	
+
 	tfr	cc,b
 	andb	#$50
 	stb	stopCL3+1
@@ -1138,10 +1170,10 @@ startCLK
 	ldb	,x
 	andb	#$20
 	stb	stopCL1+1
-	ldb	,x 
+	ldb	,x
 	orb	#$20
-	stb	,x	
-	
+	stb	,x
+
 	andcc	#$AF
 	rts
 
@@ -1161,15 +1193,15 @@ opLDCLK pshs	cc
 	ldd	CLK
 	ldx	CLK+2
 	puls	cc
-	std	<R0
-	stx	<R0+2
+	std	<R0hi
+	stx	<R0lo
 	pulu	pc
 
 	ifne	FPU
 * floating point
 FACEXP	equ	$614E
 FACHO	equ	FACEXP+1
-FACSGN	equ	$6156	     
+FACSGN	equ	$6156
 
 ARGEXP	equ	$6159
 ARGHO	equ	ARGEXP+1
@@ -1190,17 +1222,17 @@ opLDGi	leay	,u
 	leau	4,u
 	bra	opLDGa
 opLDG	pulu	d
-	leay	b,s	   
+	leay	b,s
 opLDGa	ldx	#ARGEXP
 	bra	opLDFb
 
 opLDF4m pulu	y
-	bra	opLDFa	
+	bra	opLDFa
 opLDFi	leay	,u
 	leau	4,u
 	bra	opLDFa
 opLDF4	pulu	d
-	leay	b,s			
+	leay	b,s
 opLDFa	ldx	#FACEXP
 
 opLDFb	ldd	,y
@@ -1254,18 +1286,18 @@ opSTFz	clrb
 	std	,y
 	std	2,y
 	pulu	pc
-	
+
 opLDG8m pulu	y
 	bra	opLDG8a
 opLDG8	pulu	d
-	leay	b,s	   
+	leay	b,s
 opLDG8a ldx	#ARGEXP
 	bra	opLDF8c
 
 opLDF8m pulu	y
 	bra	opLDF8b
 opLDF8	pulu	d
-	leay	b,s	   
+	leay	b,s
 opLDF8b ldx	#FACEXP
 
 opLDF8c ldd	,y
@@ -1292,7 +1324,7 @@ opLDF8c ldd	,y
 	std	2+FACHO-FACEXP,x
 	ldd	1,y
 	anda	#%00001111
-	ora	#%00010000		
+	ora	#%00010000
 opLDF8d lsl	3+FACHO-FACEXP,x
 	rol	2+FACHO-FACEXP,x
 	rolb
@@ -1317,7 +1349,7 @@ opSTF8e ldx	#FACEXP
 opSTF8f clrb
 	std	6,y
 	std	4,y
-	
+
 	ldb	FACEXP-FACEXP,x
 	addd	#1023-128	; D = ieee_biased_exp (11 bits, max 1149, safe)
 	lslb			; A=exp[10:4], B=exp[3:0]000
@@ -1333,7 +1365,7 @@ opSTF8f clrb
 	anda	FACSGN-FACEXP,x ; isolate sign
 	ora	,y		; inject
 	sta	,y		; store
-	
+
 	lda	2+FACHO-FACEXP,x
 	sta	3,y
 	ldd	FACHO-FACEXP,x
@@ -1347,11 +1379,11 @@ opSTF8g lsra
 	ora	1,y
 	std	1,y
 	pulu	pc
-	
+
 	endc
 
 	echo	CRT0  size = &(*-crt0) bytes
-	
+
 *************************************************************************
 * macros
 *************************************************************************
@@ -1389,13 +1421,13 @@ LD4	macro
 	endm
 LD1r	macro
 	fdb	opLD1r
-	endm	    
+	endm
 LD2r	macro
 	fdb	opLD2r
-	endm	    
+	endm
 LD4r	macro
 	fdb	opLD4r
-	endm	    
+	endm
 LD1m	macro
 	fdb	opLD1m,\1
 	endm
@@ -1414,10 +1446,10 @@ LDu2	macro
 	endm
 LDu1r	macro
 	fdb	opLDu1r
-	endm	    
+	endm
 LDu2r	macro
 	fdb	opLDu2r
-	endm	    
+	endm
 LDu1m	macro
 	fdb	opLDu1m,\1
 	endm
@@ -1451,7 +1483,7 @@ ST4m	macro
 * stack
 ADJ	macro
 	fdb	opADJ,\0
-	endm	    
+	endm
 PUSH	macro
 	fdb	opPUSH,\0
 	endm
@@ -1465,14 +1497,14 @@ PUSHr	macro
 * subroutine
 RET	macro
 	fdb	opRET
-	endm	    
-CALL_	macro	     
+	endm
+CALL_	macro
 	fdb	opCALL,\0
 	endm
-CALLm	macro	     
+CALLm	macro
 	fdb	opCALLm,\1
 	endm
-CALLr	macro	     
+CALLr	macro
 	fdb	opCALLr
 	endm
 
@@ -1520,7 +1552,7 @@ JLE	macro
 	endm
 
 
-* operations	    
+* operations
 ADD	macro
 	fdb	opADD,\0
 	endm
@@ -1624,16 +1656,16 @@ MUL2	macro
 	endm
 DIV2	macro
 	fdb	opDIV2,256*\0+\1
-	endm	    
+	endm
 MOD2	macro
 	fdb	opMOD2,256*\0+\1
-	endm	    
+	endm
 UDIV2	macro
 	fdb	opUDIV2,256*\0+\1
-	endm	    
+	endm
 UMOD2	macro
 	fdb	opUMOD2,256*\0+\1
-	endm	    
+	endm
 AND2	macro
 	fdb	opAND2,256*\0+\1
 	endm
@@ -1656,13 +1688,13 @@ EXT1	macro
 	endm
 EXT2	macro
 	fdb	opEXT2
-	endm	    
+	endm
 EXTu1	macro
 	fdb	opEXTu1
 	endm
 EXTu2	macro
 	fdb	opEXTu2
-	endm	       
+	endm
 
 	ifne	FPU
 * floating point
@@ -1674,7 +1706,7 @@ VM_OFF	macro
 	endm
 VM_ON	macro
 	jsr	<go_vm
-	endm  
+	endm
 LDCLK	macro
 	fdb	opLDCLK
 	endm
