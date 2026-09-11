@@ -17,6 +17,7 @@
 
 FPU     set     1
 FATMUL  set     1
+FATSHFT	set		1
 
         setdp   R0hi/256
 
@@ -880,7 +881,8 @@ opUMODa jsr     <UDIV_Y
 * Shift itself: binary decomposition - lsr <R1 emits amount bits
 * LSB-first into C, each set bit applies the pre-unrolled partial
 * shift. Shortcut when one 16-bit half of R0 is zero.
-*
+
+		ifeq	FATSHFT
 lslR0   macro
         lslb
         rola
@@ -971,9 +973,178 @@ lsrR0   macro
         endm
 opSHR   pulu    b,y
         addb    #3
-        ldb     b,s
+        lda     b,s
         SKIP2X
-opSHRi  pulu    b,y
+opSHRi  pulu    a,y
+		sta		<opSHR_111+1
+		anda	#%11000
+		beq		opSHR_111
+		suba	#%10000
+		beq		opSHR_16
+		bmi		opSHR_8
+		clra
+		ldb		<R0hi
+		bra		opSHR_16a
+opSHR_8	lda		<R0hi+1
+		ldb		<R0lo
+		std		<R0lo
+		lsb		<R0hi
+		clra
+		std		<R0hi
+		bra		opSHR_111
+opSHR_16
+		ldd		<R0hi
+opSHR_16a
+		std		<R0lo
+		ldd		#0
+		std		<R0hi
+opSHR_111
+		ldb		#0			; 2
+		andb	#7			; 2
+		lslb				; 2
+		ldx		#opSHR_tab	; 3
+		abx					; 3
+		ldd		<R0lo		; 5
+		jmp		[,x]		; 6 == 23
+		
+opSHR_tab
+		fdb		opSHR_0
+		fdb		opSHR_1
+		fdb		opSHR_2
+		fdb		opSHR_3
+		fdb		opSHR_4
+		fdb		opSHR_5
+		fdb		opSHR_6
+		fdb		opSHR_7
+
+opSHR_7	lslb			; = 33
+		rola
+		sta		<R0lo+1
+		lda		<R0hi+1
+		rola
+		sta		<R0lo
+		lda		#0
+		ldb		<R0hi
+		rolb
+		rola
+		std		<R0h
+		jmp		,y
+
+opSHR_6	lslb			; = 50
+		rola
+		rolb			; carry in b0
+		rola
+		rorb			; push in carry in b7, old carry out
+		sta		<R0lo+1
+		lda		<R0hi+1
+		rola
+		rolb			; carry in b0
+		rola
+		rorb			; push in carry in b7, old carry out
+		sta		<R0lo
+		lda		<R0hi
+		rola
+		rolb			; carry in b0
+		rola
+		sta		<R0hi+1
+		andb	#1
+		stb		<R0hi
+		jmp		,y
+
+opSHR_5	lsra			; = 73
+		rorb
+		lsra
+		rorb		
+		lsra
+		rorb		
+		lsra
+		rorb		
+		lsra
+		rorb		
+		std		<R0lo 	; 25
+		lda		<R0hi+1
+		lsla
+		lsla
+		lsla
+		ora		<R0lo
+		sta		<R0lo	; 18
+		ldd		<R0hi
+		lsra
+		rorb
+		lsra
+		rorb		
+		lsra
+		rorb		
+		lsra
+		rorb		
+		lsra
+		rorb		
+		std		<R0hi 	; 30
+		jmp		,y
+
+opSHR_4	lsra				; = 67
+		rorb		
+		lsra
+		rorb		
+		lsra
+		rorb		
+		lsra
+		rorb		
+		std		<R0lo
+		lda		<R0hi+1		
+		lsla
+		lsla
+		lsla
+		lsla
+		ora		<R0lo
+		sta		<R0lo
+		ldd		<R0hi
+		lsra
+		rorb
+		lsra
+		rorb		
+		lsra
+		rorb		
+		lsra
+		rorb		
+		lsra
+		rorb		
+		std		<R0hi
+		jmp		,y
+opSHR_3	lsr		<R0hi		; = 53
+		ror		<R0hi+1
+		rora
+		rorb	
+opSHR_2	lsr		<R0hi		; = 37
+		ror		<R0hi+1
+		rora
+		rorb	
+opSHR_1	lsr		<R0hi		; = 21
+		ror		<R0hi+1
+		rora
+		rorb	
+		std		<R0lo		
+opSHR_0	jmp		,y
+
+
+
+		
+		ld
+		cmpa	#%01000
+		bne		opSHR_8
+		cmpa	#%10000
+		bne		opSHR_16
+		ls
+		
+		ldx		<R0hi
+		stx		<R0lo
+		ldx		#0
+		stx		<R0hi
+opSHR_8	bita	#8
+		beq		opSHR_7
+		ldx		<
+
+
         stb     <R1
         ldd     <R0hi
         beq     opSHR_half
