@@ -882,6 +882,8 @@ opUMODa jsr     <UDIV_Y
 * LSB-first into C, each set bit applies the pre-unrolled partial
 * shift. Shortcut when one 16-bit half of R0 is zero.
 
+        ifeq	FATSHFT
+
 lslR0   macro
         lslb
         rola
@@ -1093,6 +1095,8 @@ opSAR_32
         jmp     ,y
         
         else
+		
+* faster, but fatteer version
 
 opSHR   pulu    b,y
         addb    #3
@@ -1108,7 +1112,8 @@ opSHRi  pulu    b,y
 	clra
 	ldb	<R0hi
 	bra	opSHR_16a
-opSHR_8	lda	<R0hi+1
+opSHR_8	
+	lda	<R0hi+1
 	ldb	<R0lo
 	std	<R0lo
 	ldb	<R0hi
@@ -1174,34 +1179,37 @@ opSHR_6	lslb		; = 50
 	stb	<R0hi
 	jmp	,y
 
-opSHR_5 lslb            ; = 71
-        rola
-        rolb
-        rola
-        rolb
-        rola
-        rolb
-        andb    #7      ; 16
-        stb     <R0lo
-        sta     <R0lo+1
-        ldb     <R0hi
-        lda     <R0lo+1 ; 16
-        lsla    
-        rolb
-        lsla
-        rolb
-        lsla
-        rolb           
-        ora     <R0lo   ; 16
-        sta     <R0lo
-        lda     <R0hi
-        lsra
-        lsra
-        lsra
-        lsra
-        lsra
-        std     <R0hi  ; 22
-        jmp     ,y
+opSHR_5 lslb            ; = 69
+    rola
+    rolb
+    rola
+    rolb
+    rola
+    sta     <R0lo+1	; 16
+       
+	lda		<R0hi+1
+	ldb		<R0lo
+	lslb            
+    rola
+    rolb
+    rola
+    rolb
+    rola
+    sta     <R0lo	; 24
+       
+	ldb		<R0hi
+	lda		<R0hi+1
+	lsla
+	rolb
+	rola
+	rolb
+	rola
+	rolb
+	rola
+	anda	#7
+	std		<R0hi ; 29
+    
+	jmp     ,y
 
 opSHR_4	lsra		; = 67
 	rorb		
@@ -1310,7 +1318,7 @@ opASR_7	lslb		; = 33
 	std	<R0hi
 	jmp	,y
 
-opASR_6	lslb		; = 50
+opASR_6	lslb		; = 55
 	rola
 	rolb		; carry in b0
 	rola
@@ -1321,16 +1329,18 @@ opASR_6	lslb		; = 50
 	rolb		; carry in b0
 	rola
 	rorb		; push in carry in b7, old carry out
-	sta	<R0lo
+	sta	<R0lo ; 30
 	lda	<R0hi
 	rola
 	rolb	        ; carry in b0
 	rola
-	sta	<R0hi+1
-        bitb    #2
+	sta	<R0hi+1	; 44
+	
+    bitb    #2
         beq     opASR_6a
         orb     #-4
-        SKIP2_X
+	stb	<R0hi
+	jmp	,y		; 11
 opASR6a	andb	#3
 	stb	<R0hi
 	jmp	,y
@@ -1341,30 +1351,30 @@ opASR_5 lslb            ; = 70
         rola
         rolb
         rola
-        sta     <R0lo+1 ; 00
+        sta     <R0lo+1
         rolb
         andb    #7
-        stb     <R0lo
+        stb     opASR_5a+1	; 25
         
-        
-        
-        ldd     <R0hi ; 0110
+        ldd     <R0hi
         lslb    
         rola ;0220
         lslb
         rola ;  0440
         lslb
         rola ; 0880           
-        orb     <R0lo 
+opASR_5a		
+        orb     #0
         stb     <R0lo
-        sta     <R0hi+1 ; 0880
+        sta     <R0hi+1 ; 27
+		
         lda     <R0hi
         asra
-        lsra
-        lsra
-        lsra
-        lsra
-        sta     <R0hi  ; 00 [0880] 00
+        asra
+        asra
+        asra
+        asra
+        sta     <R0hi  ; 18
         jmp     ,y
 
 opASR_4	lsra		; = 67
@@ -1410,6 +1420,155 @@ opASR_1	asr	<R0hi	; = 21
 	std	<R0lo		
 opASR_0	jmp	,y
         
+opLSL   pulu    b,y
+        addb    #3
+        ldb     b,s
+        SKIP2X
+opLSLi  pulu    b,y
+	stb	<opLSL_111+1
+	andb	#%11000
+	beq	opLSL_111
+	subb	#%10000
+	beq	opLSL_16
+	lda	<R0hi+1
+	ldb	<R0lo
+	std	<R0hi
+	lda	<R0lo+1
+	bra	opLSL_16a
+opLSL_16
+	ldd	<R0lo
+	std	<R0hi
+	clra
+opLSL_16a
+	clrb
+	std	<R0lo
+opLSL_111
+	ldb	#0		; 2
+	andb	#7		; 2
+	lslb			; 2
+	ldx	#opLSL_tab	; 3
+	abx			; 3
+	ldd	<R0hi		; 5
+	jmp	[,x]		; 6 == 23
+		
+opLSL_tab
+	fdb	opLSL_0
+	fdb	opLSL_1
+	fdb	opLSL_2
+	fdb	opLSL_3
+	fdb	opLSL_4
+	fdb	opLSL_5
+	fdb	opLSL_6
+	fdb	opLSL_7
+        
+opLSL_7	lsra	; = 33
+	rorb
+	stb	<R0hi
+	ldd <R0lo
+	rora
+	rorb
+	sta	<R0h+1
+	stb	<R0lo
+	ldb	#0
+	rorb
+	stb	<R0lo+1
+	jmp	,y
+
+opLSL_6	lsra		; = 52
+	rorb
+	rora		; carry in a7
+	rorb
+	rola		; push in carry in a0, old carry out
+	stb	<R0hi
+	ldb	<R0lo
+	rorb
+	rora		; carry in a7
+	rorb
+	rola		; push in carry in a0, old carry out
+	stb	<R0hi+1
+	ldb	<R0lo+1
+	rorb
+	rora	        ; carry in a0 out
+	rorb
+	rora
+	anda	#%11000000
+	stb	<R0lo
+	sta	<R0lo+1
+	jmp	,y
+
+opLSL_5 lsra		; = 69
+		rorb
+		lsra
+		rorb
+		lsra
+		rorb
+		stb	<R0hi	; 16
+		
+		lda	<R0hi+1
+		ldb <R0lo
+        lsra
+		rorb
+		lsra
+		rorb
+		lsra
+		rorb
+		stb	<R0hi+1	; 24
+		
+		ldd	<R0lo
+		lsra
+		rorb
+		rora
+		rorb
+		rora
+		rorb
+		rora
+		stb	<R0lo
+		anda #%11100000
+		sta	<R0lo+1	; 29
+		jmp     ,y
+
+oplsl_4	lslb	; = 67
+	rola
+	lslb
+	rola
+	lslb
+	rola
+	lslb
+	rola
+	std	<R0hi
+	lda	<R0lo
+	lsra
+	lsra
+	lsra
+	lsra
+	ora	<R0hi+1
+	sta	<R0hi+1
+	ldd	<R0lo
+	lslb
+	rola
+	lslb
+	rola
+	lslb
+	rola
+	lslb
+	rola
+	std	<R0lo
+	jmp	,y
+        
+opLSL_3	lsl	<R0lo+1	; = 53
+	rol	<R0lo
+	rolb
+	rola	
+opLSL_2	lsl	<R0lo+1	; = 37
+	rol	<R0lo
+	rolb
+	rola	
+opLSL_1	lsl	<R0lo+1	; = 21
+	rol	<R0lo
+	rolb
+	rola	
+	std	<R0hi
+opLSL_0	jmp	,y
         
         endc
 
