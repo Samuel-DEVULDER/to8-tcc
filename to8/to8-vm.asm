@@ -1174,33 +1174,33 @@ opSHR_6	lslb		; = 50
 	stb	<R0hi
 	jmp	,y
 
-opSHR_5 lslb            ; = 70
+opSHR_5 lslb            ; = 71
         rola
         rolb
         rola
         rolb
         rola
         rolb
-        andb    #7
+        andb    #7      ; 16
         stb     <R0lo
-        sta     <R0lo+1 ; 00
-        ldd     <R0hi ; 0110
-        lslb    
-        rola ;0220
-        lslb
-        rola ;  0440
-        lslb
-        rola ; 0880           
-        orb     <R0lo 
-        stb     <R0lo
-        sta     <R0hi+1 ; 0880
+        sta     <R0lo+1
+        ldb     <R0hi
+        lda     <R0lo+1 ; 16
+        lsla    
+        rolb
+        lsla
+        rolb
+        lsla
+        rolb           
+        ora     <R0lo   ; 16
+        sta     <R0lo
         lda     <R0hi
         lsra
         lsra
         lsra
         lsra
         lsra
-        sta     <R0hi  ; 00 [0880] 00
+        std     <R0hi  ; 22
         jmp     ,y
 
 opSHR_4	lsra		; = 67
@@ -1211,14 +1211,14 @@ opSHR_4	lsra		; = 67
 	rorb		
 	lsra
 	rorb		
-	std	<R0lo
+	std	<R0lo   ; 21
 	lda	<R0hi+1		
 	lsla
 	lsla
 	lsla
 	lsla
 	ora	<R0lo
-	sta	<R0lo
+	sta	<R0lo   ; 20
 	ldd	<R0hi
 	lsra
 	rorb
@@ -1228,7 +1228,7 @@ opSHR_4	lsra		; = 67
 	rorb		
 	lsra
 	rorb		
-	std	<R0hi
+	std	<R0hi   ; 26
 	jmp	,y
         
 opSHR_3	lsr	<R0hi	; = 53
@@ -1341,10 +1341,13 @@ opASR_5 lslb            ; = 70
         rola
         rolb
         rola
+        sta     <R0lo+1 ; 00
         rolb
         andb    #7
         stb     <R0lo
-        sta     <R0lo+1 ; 00
+        
+        
+        
         ldd     <R0hi ; 0110
         lslb    
         rola ;0220
