@@ -181,26 +181,31 @@ void putu(unsigned t)  {
 #define MAX_ITER 32
 
 // ==================== MANDELBROT ====================
+
+int iterate(int cr, int ci) {
+    unsigned zr2 = 0, zi2 = 0;
+    int zr = 0, zi = 0, one = 1;
+    int iter = MAX_ITER;
+           
+    do {
+	zi = ci + ((zr * zi) >> FIX_2MUL_SHIFT);
+	zr = cr + (zr2 - zi2);
+	    
+               zi2 = ((unsigned)(zi * zi)) >> FIX_MUL_SHIFT;
+               zr2 = ((unsigned)(zr * zr)) >> FIX_MUL_SHIFT;
+	
+	iter -= one;
+    } while(iter && (zr2 + zi2) < (FIX_FOUR+1));
+    return iter;
+}
+
 void mandelbrot(void) {
     int x, y, ci, cr, sr = -STEP_X, si = STEP_Y, one = 1;
     
     for(ci = CI_BASE, y = HEIGHT-1; y>=0; ci += si, y -= one) {
         for(cr = CR_BASE, x = WIDTH-1; x>=0; cr += sr, x -= one) {
-	    unsigned zr2 = 0, zi2 = 0;
-            int zr = 0, zi = 0;
-            int iter = MAX_ITER;
-            
-	    do {
-		zi = ci + ((zr * zi) >> FIX_2MUL_SHIFT);
-		zr = cr + (zr2 - zi2);
-		    
-                zi2 = ((unsigned)(zi * zi)) >> FIX_MUL_SHIFT;
-                zr2 = ((unsigned)(zr * zr)) >> FIX_MUL_SHIFT;
-		
-		iter -= one;
-            } while(iter && (zr2 + zi2) < (FIX_FOUR+1));
-           
-	    plot(x,y, iter ? (MAX_ITER - iter + ((x^y)&1))>>1 : 0);
+            int iter =  iterate(cr, ci);
+	    plot(x,y, iter ? (MAX_ITER - (iter>>0) + ((x^y)&1))>>1 : 0);
         }
     }
 }
