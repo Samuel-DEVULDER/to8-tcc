@@ -188,11 +188,11 @@ int iterate(int cr, int ci) {
     int iter = MAX_ITER;
            
     do {
-	zi = ci + ((zr * zi) >> FIX_2MUL_SHIFT);
+	zi = ci + ((zr * zi)>>FIX_2MUL_SHIFT);
 	zr = cr + (zr2 - zi2);
 	    
-               zi2 = ((unsigned)(zi * zi)) >> FIX_MUL_SHIFT;
-               zr2 = ((unsigned)(zr * zr)) >> FIX_MUL_SHIFT;
+        zi2 = ((unsigned)(zi * zi))>>FIX_MUL_SHIFT;
+        zr2 = ((unsigned)(zr * zr))>>FIX_MUL_SHIFT;
 	
 	iter -= one;
     } while(iter && (zr2 + zi2) < (FIX_FOUR+1));

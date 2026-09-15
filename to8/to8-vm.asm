@@ -1110,23 +1110,23 @@ opSHRi  pulu    b,y
         andb    #%11000
         beq     opSHR_111
         subb    #%10000
-        beq     opSHR_16a
         bmi     opSHR_8
+        beq     opSHR_16a
         clra
         ldb     <R0hi
         bra     opSHR_16b
-opSHR_8 lda     <R0hi+1
-        ldb     <R0lo
-        std     <R0lo
-        ldb     <R0hi
-        clra
-        std     <R0hi
-        bra     opSHR_111
 opSHR_16a
         ldd     <R0hi
 opSHR_16b
         std     <R0lo
         ldd     #0
+        std     <R0hi
+        bra     opSHR_111
+opSHR_8 lda     <R0hi+1
+        ldb     <R0lo
+        std     <R0lo
+        ldb     <R0hi
+        clra
         std     <R0hi
 opSHR_111
         ldb     #0              ; 2
@@ -1265,28 +1265,28 @@ opSARi  pulu    b,y
         andb    #%11000
         beq     opSAR_111
         subb    #%10000
-        beq     opSAR_16a
         bmi     opSAR_8
+        beq     opSAR_16a
         ldb     <R0hi
         sex
         bra     opSAR_16b
-opSAR_8 lda     <R0hi+1
-        ldb     <R0lo
-        std     <R0lo
-        ldb     <R0hi
-        sex
-        std     <R0hi
-        bra     opSAR_111
 opSAR_16a
         ldd     <R0hi
 opSAR_16b
         std     <R0lo
         bpl     opSAR_16c
-        ldd     #-1
-        SKIP2_X
+        ldb     #-1
+        SKIP1
 opSAR_16c
-        clra
         clrb
+        sex
+        std     <R0hi
+        bra     opSAR_111
+opSAR_8 lda     <R0hi+1
+        ldb     <R0lo
+        std     <R0lo
+        ldb     <R0hi
+        sex
         std     <R0hi
 opSAR_111
         ldb     #0              ; 2
@@ -1422,48 +1422,48 @@ opSAR_1 asr     <R0hi   ; = 21
         std     <R0lo
 opSAR_0 jmp     ,y
 
-opLSL   pulu    b,y
+opSHL   pulu    b,y
         addb    #3
         ldb     b,s
         SKIP2_X
-opLSLi  pulu    b,y
-        stb     >opLSL_111+1
+opSHLi  pulu    b,y
+        stb     >opSHL_111+1
         andb    #%11000
-        beq     opLSL_111
+        beq     opSHL_111
         subb    #%10000
-        beq     opLSL_16
+        bne     opSHL_16b
+        ldd     <R0lo
+        std     <R0hi
+        clra
+        bra     opSHL_16a
+opSHL_16b
         lda     <R0hi+1
         ldb     <R0lo
         std     <R0hi
         lda     <R0lo+1
-        bra     opLSL_16a
-opLSL_16
-        ldd     <R0lo
-        std     <R0hi
-        clra
-opLSL_16a
+opSHL_16a
         clrb
         std     <R0lo
-opLSL_111
+opSHL_111
         ldb     #0              ; 2
         andb    #7              ; 2
         lslb                    ; 2
-        ldx     #opLSL_tab      ; 3
+        ldx     #opSHL_tab      ; 3
         abx                     ; 3
         ldd     <R0hi           ; 5
         jmp     [,x]            ; 6 == 23
 
-opLSL_tab
-        fdb     opLSL_0
-        fdb     opLSL_1
-        fdb     opLSL_2
-        fdb     opLSL_3
-        fdb     opLSL_4
-        fdb     opLSL_5
-        fdb     opLSL_6
-        fdb     opLSL_7
+opSHL_tab
+        fdb     opSHL_0
+        fdb     opSHL_1
+        fdb     opSHL_2
+        fdb     opSHL_3
+        fdb     opSHL_4
+        fdb     opSHL_5
+        fdb     opSHL_6
+        fdb     opSHL_7
 
-opLSL_7 lsra    ; = 33
+opSHL_7 lsra    ; = 33
         rorb
         stb     <R0hi
         ldd <R0lo
@@ -1476,7 +1476,7 @@ opLSL_7 lsra    ; = 33
         stb     <R0lo+1
         jmp     ,y
 
-opLSL_6 lsra            ; = 52
+opSHL_6 lsra            ; = 52
         rorb
         rora            ; carry in a7
         rorb
@@ -1498,7 +1498,7 @@ opLSL_6 lsra            ; = 52
         sta     <R0lo+1
         jmp     ,y
 
-opLSL_5 lsra            ; = 69
+opSHL_5 lsra            ; = 69
         rorb
         lsra
         rorb
@@ -1529,7 +1529,7 @@ opLSL_5 lsra            ; = 69
         sta     <R0lo+1 ; 29
         jmp     ,y
 
-opLSL_4 lslb    ; = 67
+opSHL_4 lslb    ; = 67
         rola
         lslb
         rola
@@ -1557,20 +1557,20 @@ opLSL_4 lslb    ; = 67
         std     <R0lo
         jmp     ,y
 
-opLSL_3 lsl     <R0lo+1 ; = 53
+opSHL_3 lsl     <R0lo+1 ; = 53
         rol     <R0lo
         rolb
         rola
-opLSL_2 lsl     <R0lo+1 ; = 37
+opSHL_2 lsl     <R0lo+1 ; = 37
         rol     <R0lo
         rolb
         rola
-opLSL_1 lsl     <R0lo+1 ; = 21
+opSHL_1 lsl     <R0lo+1 ; = 21
         rol     <R0lo
         rolb
         rola
         std     <R0hi
-opLSL_0 jmp     ,y
+opSHL_0 jmp     ,y
 
         endc
 
