@@ -1,8 +1,55 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.26.0 (new peephole to8_peephole_thread_jumps())
+ * Version: 8.26.2 (fix R0|VT_LVAL left operand: address treated as value)
  *
  * Changelog:
+ * - v8.26.2 CORRECTNESS FIX in gen_opi(), completing v8.26.1: a THIRD
+ *   left-operand state escaped both the original code and the v8.26.1
+ *   normalization -- vtop[-1].r == TREG_R0|VT_LVAL, an lvalue whose
+ *   ADDRESS sits in R0 (the working copy of a duplicated lvalue, e.g.
+ *   "col[iter] += one" where tccgen duplicates the lvalue and leaves
+ *   one copy address-in-R0; also any "*p op x" / "p[i] op x" with the
+ *   address computed in R0). The v1 == TREG_R0 pre-spill treated the
+ *   R0 content (the ADDRESS) as the operand VALUE: it stored the
+ *   address into a temp slot that was then added to the right operand
+ *   ("ADD2 24,16" = pointer + one), while the store half of the
+ *   compound assign correctly went through VT_LLOCAL/ST4 -- two halves
+ *   of one statement disagreeing about what slot 24 holds. Existed
+ *   with and without -O (-O only fused the wrong LD into a plausible
+ *   ADD2). Fix: new normalization block (a) at the very top of
+ *   gen_opi, before the v8.26.1 VT_LLOCAL blocks: if the left operand
+ *   is TREG_R0|VT_LVAL, save_reg_upstack(TREG_R0,0) spills and
+ *   VT_LLOCAL-marks ALL R0 claimants (the store copy included, whose
+ *   ST4 semantics were already correct), then the existing v8.26.1
+ *   block materializes the pointed-to value (to8_byte_suffix_ld with
+ *   the real pointed-to type) into a fresh slot. Order matters:
+ *   block (a) may spill vtop itself, so the right-operand VT_LLOCAL
+ *   block runs after it. Result for the repro: ST addr; LD4 value;
+ *   ADD one; ST result; ST4 -- the dereference that was missing.
+ *   Same family, wider reach than v8.26.1: every binary op whose LEFT
+ *   operand is a dereference computed in R0. VT_LOCAL-only paths
+ *   unchanged (one flag test, zero instructions).
+ *
+ * - v8.26.1 CORRECTNESS FIX in gen_opi(): VT_LLOCAL left/right operands
+ *   were read as plain value slots. VT_LLOCAL means the slot holds a
+ *   POINTER to the operand (save_reg_upstack spill of an lvalue address,
+ *   e.g. "col[iter] += one" where both address copies become VT_LLOCAL
+ *   slots); the v8.10.0 fast path accepted it but emitted an
+ *   unconditional OP_LD (loading the pointer), and the generic branches
+ *   (to8_spill_and_reload(c1), ADD c1, compare section, gen_opi_shift)
+ *   read c1 the same wrong way - so the bug exists with and without -O;
+ *   -O merely made it visible by fusing the wrong LD into a plausible-
+ *   looking ADD2. Fix: one normalization at the top of gen_opi, before
+ *   every dispatch - each LLOCAL operand's pointed-to value is loaded
+ *   (to8_byte_suffix_ld with the REAL pointed-to type, not hardcoded
+ *   LD4) into a fresh temp slot and the SValue rewritten as plain
+ *   VT_LOCAL, so every existing branch sees what it was written for.
+ *   The left-in-R0 pre-spill is hoisted above the normalizations (they
+ *   use R0 as scratch); the right operand is normalized first (it owns
+ *   R0), with a save_reg(TREG_R0) guard before the left one. VT_LOCAL-
+ *   only code paths (div_simple, mul_complex2, all v8.10.0 repros) are
+ *   unchanged: two register-flag tests, zero instructions added.
+ *
  * - v8.26.0 new peephole to8_peephole_thread_jumps(): a jump (JCC or JRA)
  *   whose target is an unconditional JRA is retargeted to the JRA's own
  *   landing point, chains resolved through consecutive JRAs in one pass.
@@ -1206,7 +1253,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.26.0"
+#define TO8_GEN_VERSION "8.26.2"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -2953,6 +3000,54 @@ static void gen_opi_shift(int op)
 void gen_opi(int op)
 {
     int v1, c1;
+    
+    /* v8.26.2: LEFT operand is an LVALUE whose ADDRESS is in R0
+     * (r == TREG_R0|VT_LVAL) -- e.g. the working copy of a duplicated
+     * lvalue ("col[iter] += one") or "*p + x". R0 holds the ADDRESS,
+     * but the v1 == TREG_R0 pre-spill below treats the R0 content as
+     * the operand VALUE: it stored the address into a slot that was
+     * then added to `one` (ADD2 24,16 = address+one). Route through
+     * the standard save_reg_upstack so ALL R0 claimants (including the
+     * store copy of the duplicated lvalue) get spilled and VT_LLOCAL-
+     * marked; the existing VT_LLOCAL materialization block below then
+     * loads the pointed-to VALUE into a fresh slot. The RIGHT operand
+     * needs no equivalent: gv()->load() already dereferences an
+     * R0|VT_LVAL right operand via LDxr. */
+    if ((vtop[-1].r & (VT_VALMASK | VT_LVAL)) == (TREG_R0 | VT_LVAL)) {
+        save_reg_upstack(TREG_R0, 0);
+        /* vtop[-1] is now VT_LLOCAL|VT_LVAL @ its spill slot:
+         * falls through into the existing left-LLOCAL block below */
+    }
+
+    /* v8.26.1: materialize VT_LLOCAL operands BEFORE anything below
+     * reads vtop[-1].c.i / vtop->c.i as a VALUE slot. VT_LLOCAL means
+     * the slot holds a POINTER (save_reg_upstack spill of an lvalue
+     * address, e.g. "col[iter] += one"): LD/LD4 the pointed-to value
+     * into a fresh temp slot, rewrite the SValue as plain VT_LOCAL.
+     * RIGHT first (it owns R0), then LEFT (save_reg(TREG_R0) guards
+     * the case where the right operand is a raw value still in R0).
+     * Left-in-R0 and VT_LLOCAL are mutually exclusive (distinct
+     * VT_VALMASK values), so no other interaction is possible. */
+    if ((vtop->r & VT_VALMASK) == VT_LLOCAL && !(vtop->r & VT_SYM)) {
+        int vs = to8_temp_alloc(4, 4);
+        e_op_slot(to8_byte_suffix_ld(vtop->type.t & VT_BTYPE,
+                                     (vtop->type.t & VT_UNSIGNED) != 0),
+                  vtop->c.i);
+        e_op_slot(OP_ST, vs);
+        vtop->r = VT_LOCAL | VT_LVAL;
+        vtop->c.i = vs;
+    }
+    if ((vtop[-1].r & VT_VALMASK) == VT_LLOCAL && !(vtop[-1].r & VT_SYM)) {
+        int vs = to8_temp_alloc(4, 4);
+        if ((vtop->r & VT_VALMASK) == TREG_R0)
+            save_reg(TREG_R0);
+        e_op_slot(to8_byte_suffix_ld(vtop[-1].type.t & VT_BTYPE,
+                                     (vtop[-1].type.t & VT_UNSIGNED) != 0),
+                  vtop[-1].c.i);
+        e_op_slot(OP_ST, vs);
+        vtop[-1].r = VT_LOCAL | VT_LVAL;
+        vtop[-1].c.i = vs;
+    }
 
     if (op == TOK_SHL || op == TOK_SAR || op == TOK_SHR) {
         gen_opi_shift(op);
@@ -3033,7 +3128,18 @@ void gen_opi(int op)
             to8_opcode slot_op, imm_op;
             if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) { vtop--; return; }
             int rslot = vtop->c.i;
+	    
+	                /* TEMPORARY v8.26.1 verification: the fast path must NEVER
+             * see a (sym-free) VT_LLOCAL anymore - the normalization at
+             * the top of gen_opi rewrites it to VT_LOCAL first. If this
+             * fires, some path bypasses it; the raw r values tell why. */
+            if ((v1 == VT_LLOCAL && !(vtop[-1].r & VT_SYM)) ||
+                (rv == VT_LLOCAL && !(vtop->r & VT_SYM)))
+                tcc_error("v8.26.1 verify: fast path saw VT_LLOCAL "
+                          "(left r=%#x right r=%#x)", vtop[-1].r, vtop->r);
+	    
             int lslot = c1;
+	    
 	    save_reg(TREG_R0);
             e_op_slot(OP_LD, lslot);
             e_op_slot(slot_op, rslot);

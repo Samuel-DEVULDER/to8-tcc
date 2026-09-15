@@ -199,12 +199,15 @@ int iterate(int cr, int ci) {
     return iter;
 }
 
+static unsigned int color[MAX_ITER+1];
+
 void mandelbrot(void) {
-    int x, y, ci, cr, sr = -STEP_X, si = STEP_Y, one = 1;
+    int x, y, ci, cr, sr = -STEP_X, si = STEP_Y, one = 1, *col = color;
     
     for(ci = CI_BASE, y = HEIGHT-1; y>=0; ci += si, y -= one) {
         for(cr = CR_BASE, x = WIDTH-1; x>=0; cr += sr, x -= one) {
             int iter =  iterate(cr, ci);
+	    col[iter] += one;
 	    plot(x,y, iter ? (MAX_ITER - (iter>>0) + ((x^y)&1))>>1 : 0);
         }
     }

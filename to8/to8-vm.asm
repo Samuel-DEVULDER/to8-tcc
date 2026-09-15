@@ -356,7 +356,7 @@ opLD4r  pulu    y
 
 opLD4m  pulu    x,y
         bra     opLD4a
-pLD4    pulu    b,y
+opLD4    pulu    b,y
         leax    b,s
 opLD4a  ldx     2,x    ; TODO banking
         ldd     ,x
