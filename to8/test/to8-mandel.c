@@ -143,16 +143,17 @@ void putu(unsigned t)  {
 }
 
 // ==================== CONFIG ====================
+#define MAX_ITER 32
 #define FIX_FRAC 13 /* 8  = fast  13 = accurate */
-#define FIX_ONE (1 << FIX_FRAC)
-
-// Conversion float → fixed-point à la compilation
-#define F2FIX(f) ((int)((f) * FIX_ONE + 0.5))
 
 // --- 3 CONSTANTES UTILISATEUR (en float) ---
 #define CH      2.20f   // Hauteur de la fenêtre (CI_MAX - CI_MIN)
 #define CR_MIN -2.50f    // Gauche (réel minimum)
 #define CI_MIN -1.10f    // Bas (imaginaire minimum)
+
+// Conversion float → fixed-point à la compilation
+#define FIX_ONE (1 << FIX_FRAC)
+#define F2FIX(f) ((int)((f) * FIX_ONE + 0.5))
 
 // --- Dimensions écran ---
 #define WIDTH  160
@@ -178,8 +179,6 @@ void putu(unsigned t)  {
 #define FIX_MUL_SHIFT (FIX_FRAC)
 #define FIX_2MUL_SHIFT (FIX_FRAC - 1)
 
-#define MAX_ITER 32
-
 // ==================== MANDELBROT ====================
 
 int iterate(int cr, int ci) {
@@ -199,7 +198,8 @@ int iterate(int cr, int ci) {
     return iter;
 }
 
-static unsigned int color[MAX_ITER+1];
+static unsigned int color[MAX_ITER];
+
 
 void mandelbrot(void) {
     int x, y, ci, cr, sr = -STEP_X, si = STEP_Y, one = 1, *col = color;
@@ -207,10 +207,20 @@ void mandelbrot(void) {
     for(ci = CI_BASE, y = HEIGHT-1; y>=0; ci += si, y -= one) {
         for(cr = CR_BASE, x = WIDTH-1; x>=0; cr += sr, x -= one) {
             int iter =  iterate(cr, ci);
-	    col[iter] += one;
-	    plot(x,y, iter ? (MAX_ITER - (iter>>0) + ((x^y)&1))>>1 : 0);
+	    //col[iter] += one;
+	    plot(x,y, iter ? (MAX_ITER - (iter>>1) + ((x^y)&1))>>1 : 0);
         }
     }
+    /*
+    int i, total  = 0;
+    for(i=MAX_ITER-1;i;--i) {
+	  col[i] = (total += col[i]);
+    }
+    col[0] = 0;
+    for(i=1; i<MAX_ITER; ++i) {
+	    col[i] = 1+(col[i]*30+total/2)/total;
+    }
+    */
 }
 
 void print_time(unsigned t) {

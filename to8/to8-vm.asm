@@ -48,7 +48,7 @@ R0lo    set     *-2
         stx     b,s
         jmp     ,y
 
-R1      FDB     0,0     ;
+R1      FDB     0,0
 
 go_vm   puls    u
         pulu    pc
@@ -1100,42 +1100,14 @@ opSAR_32
         else
 
 * faster, but fateer version
-
-opSHR   pulu    b,y
+opSHR   LDB     ,u+
         addb    #3
         ldb     b,s
-        SKIP2_X
-opSHRi  pulu    b,y
-        stb     >opSHR_111+1
-        andb    #%11000
-        beq     opSHR_111
-        subb    #%10000
-        bmi     opSHR_8
-        beq     opSHR_16a
-        clra
-        ldb     <R0hi
-        bra     opSHR_16b
-opSHR_16a
-        ldd     <R0hi
-opSHR_16b
-        std     <R0lo
-        ldd     #0
-        std     <R0hi
-        bra     opSHR_111
-opSHR_8 lda     <R0hi+1
-        ldb     <R0lo
-        std     <R0lo
-        ldb     <R0hi
-        clra
-        std     <R0hi
-opSHR_111
-        ldb     #0              ; 2
-        andb    #7              ; 2
-        lslb                    ; 2
-        ldx     #opSHR_tab      ; 3
-        abx                     ; 3
-        ldd     <R0lo           ; 5
-        jmp     [,x]            ; 6 == 23
+        
+        andb    #31
+        lslb
+        ldx     #opSHR_tab
+        jmp     [b,x]
 
 opSHR_tab
         fdb     opSHR_0
@@ -1146,21 +1118,93 @@ opSHR_tab
         fdb     opSHR_5
         fdb     opSHR_6
         fdb     opSHR_7
+        fdb     opSHR_8
+        fdb     opSHR_9
+        fdb     opSHR_10
+        fdb     opSHR_11
+        fdb     opSHR_12
+        fdb     opSHR_13
+        fdb     opSHR_14
+        fdb     opSHR_15
+        fdb     opSHR_16
+        fdb     opSHR_17
+        fdb     opSHR_18
+        fdb     opSHR_19
+        fdb     opSHR_20
+        fdb     opSHR_21
+        fdb     opSHR_22
+        fdb     opSHR_23
+        fdb     opSHR_24
+        fdb     opSHR_25
+        fdb     opSHR_26
+        fdb     opSHR_27
+        fdb     opSHR_28
+        fdb     opSHR_29
+        fdb     opSHR_30
+        fdb     opSHR_31
 
-opSHR_7 lslb            ; = 33
-        rola
-        sta     <R0lo+1
-        lda     <R0hi+1
-        rola
-        sta     <R0lo
-        ldb     <R0hi
-        lda     #0
+opSHR_31
+        lsl     <R0hi
+        ldd     #0
+        std     <R0hi
+        lslb        
+        std     <R0lo
+        pulu    pc
+
+opSHR_23 
+        clra
+        LDB     <R0hi
+        lsl     <R0hi+1
+        lslb
+        lsla
+        std     <R0lo
+        ldd     #0
+        std     <R0lo
+        pulu    pc
+        
+opSHR_15
+        lsl     <R0lo
+        ldd     <R0hi
         rolb
         rola
+        std     <R0lo
+        ldd     #0
+        rolb    
         std     <R0hi
-        jmp     ,y
+        pulu    pc
+        
+opSHR_7 lsl     <R0lo+1 ; =38
+        lda     <R0hi+1
+        ldb     <R0lo
+        rolb
+        rola
+        std     <R0lo
+        ldb     <R0hi
+        rolb
+        rola
+        anda    #1
+        std     <R0hi
+        pulu    pc
 
-opSHR_6 lslb            ; = 50
+opSHR_22
+        comb
+        SKIP1
+opSHR_30
+        clrb
+        ldd     <R0hi
+        std     <R0lo
+        ldd     #0
+        std     <R0hi
+        bcs     opSHR_6
+opSHR_14
+        lda     <R0hi+1
+        LDB     <R0lo
+        std     <R0lo
+        clra
+        LDB     <R0hi
+        std     <R0hi
+opSHR_6 ldd     <R0lo   ; = 57
+        lslb
         rola
         rolb            ; carry in b0
         rola
@@ -1176,59 +1220,92 @@ opSHR_6 lslb            ; = 50
         rola
         rolb            ; carry in b0
         rola
+        rolb
         sta     <R0hi+1
         andb    #3
         stb     <R0hi
-        jmp     ,y
+        pulu    pc
 
-opSHR_5 lslb            ; = 69
-        rola
-        rolb
-        rola
-        rolb
-        rola
-        sta     <R0lo+1 ; 16
-
+opSHR_21
+        comb
+        SKIP1
+opSHR_29
+        clrb
+        ldd     <R0hi
+        std     <R0lo
+        ldd     #0
+        bcs     opSHR_5+2
+opSHR_13
         lda     <R0hi+1
-        ldb     <R0lo
+        LDB     <R0lo
+        std     <R0lo
+        clra
+        LDB     <R0hi
+        SKIP2_X
+opSHR_5 ldd     <R0hi           ; = 73
         lslb
         rola
         rolb
         rola
         rolb
         rola
-        sta     <R0lo   ; 24
+        sta     <R0hi+1         ; 21
+        tfr     b,a
+        rolb
+        andb    #7
+        stb     <R0hi
+        anda    #255-7
+        sta     opSHR_5a+1      ; 21
+        LDd     <R0lo
+        lslb
+        rola
+        rolb
+        rola
+        rolb
+        rola
+        sta     <R0lo+1         ; 21
+        rolb
+        andb    #7
+opSHR_5a 
+        orb     #0
+        stb     <R0lo           ; 10
+        pulu    pc
 
-        ldb     <R0hi
+opSHR_20
+        comb
+        SKIP1
+opSHR_28
+        clrb
+        ldd     <R0hi
+        std     <R0lo
+        ldd     #0
+        std     <R0hi
+        bcs     opSHR_4
+opSHR_12
+        lda     <R0hi+1
+        LDB     <R0lo
+        std     <R0lo
+        clra
+        LDB     <R0hi
+        std     <R0hi
+opSHR_4 ldd     <R0lo   ; = 70
+        lsra            
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
+        lsra
+        rorb
+        sta     opSHR_4a+1
         lda     <R0hi+1
         lsla
-        rolb
-        rola
-        rolb
-        rola
-        rolb
-        rola
-        anda    #7
-        std     <R0hi ; 29
-
-        jmp     ,y
-
-opSHR_4 lsra            ; = 67
-        rorb
-        lsra
-        rorb
-        lsra
-        rorb
-        lsra
-        rorb
-        std     <R0lo   ; 21
-        lda     <R0hi+1
         lsla
         lsla
         lsla
-        lsla
-        ora     <R0lo
-        sta     <R0lo   ; 20
+opSHR_4a
+        ora     #0
+        std     <R0lo   ; 44
         ldd     <R0hi
         lsra
         rorb
@@ -1239,22 +1316,118 @@ opSHR_4 lsra            ; = 67
         lsra
         rorb
         std     <R0hi   ; 26
-        jmp     ,y
+        pulu    pc
 
-opSHR_3 lsr     <R0hi   ; = 53
-        ror     <R0hi+1
-        rora
-        rorb
-opSHR_2 lsr     <R0hi   ; = 37
-        ror     <R0hi+1
-        rora
-        rorb
-opSHR_1 lsr     <R0hi   ; = 21
-        ror     <R0hi+1
-        rora
-        rorb
+
+opSHR_19
+        comb
+        SKIP1
+opSHR_27
+        clrb
+        ldd     <R0hi
         std     <R0lo
-opSHR_0 jmp     ,y
+        ldd     #0
+        bcs     opSHR_3+2
+        std     <R0hi
+opSHR_11
+        lda     <R0hi+1
+        LDB     <R0lo
+        std     <R0lo
+        clra
+        LDB     <R0hi
+        SKIP2_X
+opSHR_3 ldd     <R0hi   ; = 58
+        lsra
+        rorb
+        lsr     <R0lo
+        ror     <R0lo+1
+        lsra
+        rorb
+        lsr     <R0lo
+        ror     <R0lo+1
+        lsra
+        rorb
+        lsr     <R0lo
+        ror     <R0lo+1
+        std     <R0hi
+        pulu    pc
+        
+opSHR_18
+        comb
+        SKIP1
+opSHR_26
+        clrb
+        ldd     <R0hi
+        std     <R0lo
+        ldd     #0
+        std     <R0hi
+        bcs     opSHR_2+2
+opSHR_10
+        lda     <R0hi+1
+        LDB     <R0lo
+        std     <R0lo
+        clra
+        LDB     <R0hi
+        SKIP2_X
+opSHR_2 ldd     <R0hi   ; = 42
+        lsra
+        rorb
+        lsr     <R0lo
+        ror     <R0lo+1
+        lsra
+        rorb
+        lsr     <R0lo
+        ror     <R0lo+1
+        std     <R0hi
+        pulu    pc
+
+opSHR_17
+        comb
+        SKIP1
+opSHR_25
+        clrb
+        ldd     <R0hi
+        std     <R0lo
+        ldd     #0
+        std     <R0hi
+        bcs     opSHR_1
+opSHR_9
+        lda     <R0hi+1
+        LDB     <R0lo
+        std     <R0lo
+        clra
+        LDB     <R0hi
+        std     <R0hi
+opSHR_1 lsr     <R0hi   ; = 24
+        ror     <R0hi+1
+        ror     <R0lo
+        ror     <R0lo+1
+        pulu    pc
+        
+opSHR_16
+        ldd     <R0hi
+        std     <R0lo
+        ldd     #0
+        std     <R0hi
+        pulu    pc        
+opSHR_24
+        clra
+        LDB     <R0hi
+        std     <R0lo
+        clrb
+        std     <R0hi
+        pulu    pc
+opSHR_8
+        lda     <R0hi+1
+        LDB     <R0lo
+        std     <R0lo
+        clra
+        LDB     <R0hi
+        std     <R0hi
+opSHR_0 pulu    pc
+
+
+
 
 opSAR   pulu    b,y
         addb    #3
