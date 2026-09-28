@@ -981,9 +981,9 @@ opSHL_half32
 
 opSHR   pulu    b,y
         addb    #3
-        lda     b,s
+        ldb     b,s
         SKIP2_X
-opSHRi  pulu    a,y
+opSHRi  pulu    b,y
         stb     <R1
         ldd     <R0hi
         beq     opSHR_half

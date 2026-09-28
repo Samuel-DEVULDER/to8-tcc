@@ -208,7 +208,7 @@ void mandelbrot(void) {
         for(cr = CR_BASE, x = WIDTH-1; x>=0; cr += sr, x -= one) {
             int iter =  iterate(cr, ci);
 	    //col[iter] += one;
-	    plot(x,y, iter ? (MAX_ITER - (iter>>1) + ((x^y)&1))>>1 : 0);
+	    plot(x,y, iter ? (MAX_ITER - iter + ((x^y)&1))>>1 : 0);
         }
     }
     /*
