@@ -1,8 +1,25 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.28.0 (fixed UDIVi/UMODi being output as DIVi/MODi).
+ * Version : 8.29.0 (fix ARG_SYM: sym_addend dropped — global[const] addressed the base)
  *
  * Changelog:
+ * - v8.29.0 CORRECTNESS FIX: ARG_SYM rendering dropped sym_addend. The
+ *   "0,_name" rendering established by v8.15/v8.16 never printed the
+ *   symbol's constant offset, so any global access with a NON-ZERO
+ *   constant index silently addressed the base: "left8[BLK_H-1]"
+ *   (addend 28) compiled to opLD4m,_left8 -- loading left8[0]. Found on
+ *   to8-mblk: prev[bx]/prev[bx+BLK_W-1] received the block's BOTTOM
+ *   corner values instead of its TOP line, so the next block row's
+ *   vertical-continuity test failed on 64 blocks whose columns have a
+ *   contour crossing between corner and top (calc 25399 vs PC 24503,
+ *   fill 6601 vs 7497 -- delta exactly 64x14). Image unaffected (prev[]
+ *   is never plotted); masked forever because every prior global access
+ *   had addend 0 (scalars, strings, array bases). Fix: render
+ *   "_name+addend" when addend != 0 -- the rendered symbol expression IS
+ *   the link-time address, the assembler resolves it, no VM change (the
+ *   m-form handlers receive the complete address in X). Covers every
+ *   e_op_addr consumer: LD1m..ST4m, LDi sym+off, PUSHi sym+off.
+ *
  * - v8.28.0 CORRECTNESS FIX: to8_opcode_name() rendered OP_UDIVi/OP_UMODi
  *   as "DIVi"/"MODi" -- an alias introduced by the v8.11.0 routing fix
  *   itself. The opcode SELECTION chain was verified correct end to end
@@ -1286,7 +1303,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.28.0"
+#define TO8_GEN_VERSION "8.29.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -4718,6 +4735,11 @@ static void to8_render_line(to8_line *ln)
             const char *name = ln->sym_name;		
             out_str("0,_");
             {char  *s=name; while(*s) {out_char(*s=='.' ? '_' : *s);++s;}}
+	    if (ln->sym_addend) {        /* l'offset fait partie de l'adresse:
+                                            sans lui, global[const] accede a la base */
+                out_char('+');
+                out_int(ln->sym_addend);
+            }
         } else {
             out_int(ln->sym_addend);
         }
