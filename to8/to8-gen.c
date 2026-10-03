@@ -1,8 +1,25 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.27.0 (fix call args: global lvalue passed as &sym; putu(n_iter) printed the address).
+ * Version : 8.28.0 (fixed UDIVi/UMODi being output as DIVi/MODi).
  *
  * Changelog:
+ * - v8.28.0 CORRECTNESS FIX: to8_opcode_name() rendered OP_UDIVi/OP_UMODi
+ *   as "DIVi"/"MODi" -- an alias introduced by the v8.11.0 routing fix
+ *   itself. The opcode SELECTION chain was verified correct end to end
+ *   (diag: TOK_UDIV reaches gen_opi; to8_get_arith_ops maps it to
+ *   OP_UDIVi; the v7.39.0 constant-right fast path emits e_op_imm
+ *   (OP_UDIVi, c0); slot-form names and asm macros correct) -- the only
+ *   transformation between e_op_imm and the .asm text is
+ *   to8_opcode_name(), so the rendered "opDIVi" in the fresh listing
+ *   proved the alias by logical necessity. The rendered name IS the
+ *   link-time selection of the runtime routine: an alias between
+ *   distinct opcodes is a real miscompile (same family as v8.18.0-2's
+ *   MUL_/MUL_ rename). putu(t/10u) divided -9010 as signed, printing
+ *   garbage digits; masked until now because every putu argument stayed
+ *   below 2^31, where DIV and UDIV agree. Companion fix in to8-vm.asm:
+ *   the UMODi macro emitted opUDIVi (copy-paste) -- would have broken
+ *   print_time()'s % the moment the name alias was fixed.
+ *
  * - v8.27.0 CORRECTNESS FIX in gfunc_call(): the VT_SYM argument branch
  *   (v7.37.0) pushed the symbol ADDRESS for ANY symbol-bearing argument,
  *   including global-variable lvalues (VT_CONST|VT_LVAL|VT_SYM) which must
@@ -1269,7 +1286,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.27.0"
+#define TO8_GEN_VERSION "8.28.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -1608,8 +1625,8 @@ static const char *to8_opcode_name(to8_opcode op)
     case OP_MULi:  return "MULi";
     case OP_DIVi:  return "DIVi"; 
     case OP_MODi:  return "MODi";
-    case OP_UDIVi: return "DIVi"; 
-    case OP_UMODi: return "MODi";
+    case OP_UDIVi: return "UDIVi"; 
+    case OP_UMODi: return "UMODi";
     case OP_SHLi:  return "SHLi"; 
     case OP_SHRi:  return "SHRi"; 
     case OP_SARi:  return "SARi";
@@ -3016,7 +3033,7 @@ static void gen_opi_shift(int op)
 void gen_opi(int op)
 {
     int v1, c1;
-    
+
     /* v8.26.2: LEFT operand is an LVALUE whose ADDRESS is in R0
      * (r == TREG_R0|VT_LVAL) -- e.g. the working copy of a duplicated
      * lvalue ("col[iter] += one") or "*p + x". R0 holds the ADDRESS,
@@ -3144,15 +3161,6 @@ void gen_opi(int op)
             to8_opcode slot_op, imm_op;
             if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) { vtop--; return; }
             int rslot = vtop->c.i;
-	    
-	                /* TEMPORARY v8.26.1 verification: the fast path must NEVER
-             * see a (sym-free) VT_LLOCAL anymore - the normalization at
-             * the top of gen_opi rewrites it to VT_LOCAL first. If this
-             * fires, some path bypasses it; the raw r values tell why. */
-            if ((v1 == VT_LLOCAL && !(vtop[-1].r & VT_SYM)) ||
-                (rv == VT_LLOCAL && !(vtop->r & VT_SYM)))
-                tcc_error("v8.26.1 verify: fast path saw VT_LLOCAL "
-                          "(left r=%#x right r=%#x)", vtop[-1].r, vtop->r);
 	    
             int lslot = c1;
 	    
