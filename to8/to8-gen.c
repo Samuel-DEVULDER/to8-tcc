@@ -1,8 +1,24 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version: 8.26.2 (fix R0|VT_LVAL left operand: address treated as value)
+ * Version : 8.27.0 (fix call args: global lvalue passed as &sym; putu(n_iter) printed the address).
  *
  * Changelog:
+ * - v8.27.0 CORRECTNESS FIX in gfunc_call(): the VT_SYM argument branch
+ *   (v7.37.0) pushed the symbol ADDRESS for ANY symbol-bearing argument,
+ *   including global-variable lvalues (VT_CONST|VT_LVAL|VT_SYM) which must
+ *   be passed BY VALUE. "putu(n_iter)" received &_n_iter and printed the
+ *   BSS address ($A46A=42090) while the same n_iter read a few lines later
+ *   printed the true count -- the two prints of one variable disagreeing
+ *   (calc+fill != 32000) was the tell. Latent since the beginning: strings
+ *   (&L.n, no VT_LVAL), locals (VT_LOCAL) and computed args (no VT_SYM)
+ *   all masked it; mblk's putu(n_iter) is the first by-value global arg of
+ *   the test suite (dhry's Ptr_Glob-by-value likely affected too -- results
+ *   unvalidated until now). Fix: address-pushing now requires
+ *   !(r & VT_LVAL); e_push_imm likewise guarded against VT_CONST|VT_LVAL
+ *   (deref-of-immediate); every remaining lvalue form (global -> LD4m,
+ *   *pp with pointer in R0 -> LDxr, spilled VT_LLOCAL -> LD4) routes
+ *   through load(TREG_R0, sv) + e_push_r0().
+ *
  * - v8.26.2 CORRECTNESS FIX in gen_opi(), completing v8.26.1: a THIRD
  *   left-operand state escaped both the original code and the v8.26.1
  *   normalization -- vtop[-1].r == TREG_R0|VT_LVAL, an lvalue whose
@@ -1253,7 +1269,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.26.2"
+#define TO8_GEN_VERSION "8.27.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3461,18 +3477,21 @@ void gfunc_call(int nb_args)
     for (i = 0; i < nb_args; i++) {
         SValue *sv = &vtop[-i];
         int v = sv->r & VT_VALMASK;
-        if (v == VT_CONST && !(sv->r & VT_SYM)) {
-            e_push_imm(sv->c.i);
-        } else if (v == VT_LOCAL || v == VT_LLOCAL) {
-            e_push_slot(sv->c.i);
-        } else if (sv->r & VT_SYM) {
-            e_push_addr(sv->sym, sv->c.i);
+        if (v == VT_CONST && !(sv->r & VT_SYM) && !(sv->r & VT_LVAL)) {
+            e_push_imm(sv->c.i);                /* immediate rvalue */
+        } else if ((sv->r & VT_SYM) && !(sv->r & VT_LVAL)) {
+            e_push_addr(sv->sym, sv->c.i);      /* TRUE address arg: &x, array
+                                                   decay, function name */
+        } else if (v == VT_LOCAL) {
+            e_push_slot(sv->c.i);               /* local: slot holds the value */
         } else {
-            load(TREG_R0, sv);
+            load(TREG_R0, sv);                  /* everything else: global lvalue
+                                                   (-> LD4m), *pp (-> LDxr),
+                                                   spilled VT_LLOCAL (-> LD4) */
             e_push_r0();
         }
     }
-
+    
     save_regs(0);
 
     if ((func->r & VT_VALMASK) == VT_CONST && (func->r & VT_SYM)) {

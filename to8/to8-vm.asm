@@ -287,14 +287,16 @@ opMOV   pulu    d,y
 opLD1m  pulu    x,y
         bra     opLD1a
 opLD1r  pulu    y
-        ldx     #R0lo-2
+        ldx     <R0lo
         bra     opLD1a
 opLD1   pulu    b,y
-        leax    b,s
-opLD1a  ldb     [2,x]   ; TODO banking
-        SKIP2_X
-opEXT1  ldb     <R0lo+1
-        sex
+        addb    #2
+        ldx     b,s
+opLD1a  ldb     ,x   ; TODO banking
+        bra     opLD1b
+opEXT1  pulu    y
+        ldb     <R0lo+1
+opLD1b  sex
         std     <R0lo
         sta     <R0hi+1
         sta     <R0hi
@@ -303,14 +305,16 @@ opEXT1  ldb     <R0lo+1
 opLDu1m pulu    x,y
         bra     opLDu1a
 opLDu1r pulu    y
-        ldx     #R0lo-2
+        ldx     <R0lo
         bra     opLDu1a
 opLDu1  pulu    b,y
-        leax    b,s
-opLDu1a ldb     [2,x]   ; TODO banking
-        SKIP2_X
-opEXTu1 ldb     <R0lo+1
-        clra
+        addb    #2
+        ldx     b,s
+opLDu1a ldb     ,x   ; TODO banking
+        bra     opLDu1b
+opEXTu1 pulu    y
+        ldb     <R0lo+1
+opLDu1b clra
         std     <R0lo
         clrb
         std     <R0hi
@@ -319,48 +323,47 @@ opEXTu1 ldb     <R0lo+1
 opLD2m  pulu    x,y
         bra     opLD2a
 opLD2r  pulu    y
-        ldx     #R0lo-2
+        ldx     <R0lo   ; TODO banking
         bra     opLD2a
 opLD2   pulu    b,y
-        leax    b,s
-opLD2a  ldd     [2,x]   ; TODO banking
+        addb    #2
+        ldx     b,s
+opLD2a  ldd     ,x
         std     <R0lo
-        SKIP2_X
-opEXT2  ldb     <R0lo
-        bpl     opLD2c
-        ldb     #-1
-        SKIP1
-opLD2c  clrb
-        sex
+        bpl     opEXTu2
+        bra     opLD2c
+opEXT2  pulu    y
+        ldb     <R0lo
+        bpl     opEXTu2        
+opLD2c  ldd     #-1
         std     <R0hi
         jmp     ,y
 
 opLDu2m pulu    x,y
         bra     opLDu2a
 opLDu2r pulu    y
-        ldx     #R0lo-1
+        ldx     <R0lo   ; TODO banking
         bra     opLDu2a
 opLDu2  pulu    b,y
-        leax    b,s
-opLDu2a ldd     [2,x]   ; TODO banking
+        addb    #2
+        ldx     b,s
+opLDu2a ldd     ,x      ; TODO banking
         std     <R0lo
 opEXTu2 ldd     #0
         std     <R0hi
-        jmp,y
-
-opLD4r  pulu    y
-        ldd     <R0hi
-        LDX     <R0lo
-        bra     opLD4b
+        jmp     ,y
 
 opLD4m  pulu    x,y
         bra     opLD4a
-opLD4    pulu    b,y
-        leax    b,s
-opLD4a  ldx     2,x    ; TODO banking
-        ldd     ,x
+opLD4r  pulu    y
+        ldx     <R0lo   ; TODO banking
+        bra     opLD4a
+opLD4   pulu    b,y
+        addb    #2
+        ldx     b,s
+opLD4a  ldd     ,x
         ldx     2,x
-opLD4b  std     <R0hi
+        std     <R0hi
         stx     <R0lo
         jmp     ,y
 
@@ -368,17 +371,19 @@ opLD4b  std     <R0hi
 opST1m  pulu    x,y
         bra     opST1a
 opST1   pulu    b,y
-        leax    b,s
+        addb    #2
+        ldx     b,s
 opST1a  lda     <R0lo+1
-        sta     [2,x]   ; TODO banking
+        sta     ,x     ; TODO banking
         jmp     ,y
 
 opST2m  pulu    x,y
         bra     opST2a
 opST2   pulu    b,y
-        leax    b,s
+        addb    #2
+        ldx     b,s
 opST2a  ldd     <R0lo
-        std     [2,x]   ; TODO banking
+        std     ,x     ; TODO banking
         jmp     ,y
 
 opST4m  pulu    x,y
