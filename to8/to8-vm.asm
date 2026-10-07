@@ -1287,52 +1287,34 @@ opSTF8g lsra
         pulu    pc
 
 * FPU arithmetic. EXTRAMON routines, called through EXTRA ($EC0C).
-* Conventions CONFIRMED against BASIC 512 ROM (TOJE trace of
-* "PRINT 1.1*0.0" + disassembly):
+* Conventions CONFIRMED against BASIC 512 ROM + EXTRAMON manual:
 *   - ZERO  = FACEXP==0. The ROM SGN routine ($12A1) does
 *             "LDB FACEXP; BEQ -> 0" and never reads FACSGN in that
 *             case. MULTGO's dispatch target ($0FDC) BEQs on the same
 *             exponent load and RTSes immediately when FAC is zero.
 *   - SIGN  = FACSGN bit7, only meaningful when FACEXP!=0.
-*   - MULTGO prologue ($1C30): result sign = ARGSGN EOR FACSGN
-*             stored at $6162, then ARGEXP->A, FACEXP->B.
-* NOTE: opLDFz below must CLEAR FACEXP on zero loads (not just FACHO)
-* or the ROM treats the stale exponent as a nonzero value.
+*   - ARG is the LEFT operand (manual: SUBGO FAC = ARG - FAC, DIVGO
+*             FAC = ARG / FAC; trace-verified: BASIC's MOVAF pushes
+*             the FIRST operand into ARG and keeps the second in FAC).
+*             This matches the to8-gen.c ISA "F = G op F" DIRECTLY -
+*             no operand swap needed for any of the four operations.
 *
 * ISA (to8-gen.c): FADD F=G+F, FSUB F=G-F, FMUL F=G*F, FDIV F=G/F,
-* result always in F (=FAC). ADDGO/MULTGO compute FAC+ARG/FAC*ARG =
-* F+G/F*G - commutative, direct. SUBGO/DIVGO compute FAC-ARG/FAC/ARG
-* = F-G/F/G - WRONG ORDER, so swap FAC<->ARG first (opFSWAP).
+* result always in F (=FAC).
 
-opFADD  ldb     #54             ; EXTRA ADDGO: FAC = FAC + ARG
+opFADD  ldb     #54             ; EXTRA ADDGO: FAC = FAC + ARG (commut.)
         jsr     >EXTRA
         pulu    pc
 
-opFMUL  ldb     #56             ; EXTRA MULTGO: FAC = FAC * ARG
+opFSUB  ldb     #55             ; EXTRA SUBGO: FAC = ARG - FAC = G - F
         jsr     >EXTRA
         pulu    pc
 
-* swap FAC <-> ARG (9 bytes each: exp, 7 mantissa, sign)
-opFSWAP ldx     #FACEXP
-        ldy     #ARGEXP
-        ldb     #9
-opFSWl  lda     ,x
-        pshs    a
-        lda     ,y
-        sta     ,x+
-        puls    a
-        sta     ,y+
-        decb
-        bne     opFSWl
-        rts
-
-opFSUB  jsr     opFSWAP         ; FAC=G, ARG=F
-        ldb     #55             ; EXTRA SUBGO: FAC = G - F
+opFMUL  ldb     #56             ; EXTRA MULTGO: FAC = ARG * FAC = G * F
         jsr     >EXTRA
         pulu    pc
 
-opFDIV  jsr     opFSWAP         ; FAC=G, ARG=F
-        ldb     #57             ; EXTRA DIVGO: FAC = G / F
+opFDIV  ldb     #57             ; EXTRA DIVGO: FAC = ARG / FAC = G / F
         jsr     >EXTRA
         pulu    pc
 
@@ -1363,40 +1345,52 @@ opFSCmax
         sta     FACEXP
         jmp     ,y
 
-* FCMP: R0 = sign(G - F); F and G BOTH survive (ISA note). SUBGO
-* destroys FAC, so save F to FTEMP first; SUBGO then gives FAC = F - G,
-* whose class is the NEGATED answer; restore F, and let the shared
-* opLDi_* tails set R0 and dispatch (same reuse as integer CMP).
-FTEMP   FCB     0,0,0,0,0,0,0,0,0
-opFCMP  ldx     #FACEXP
-        ldy     #FTEMP
-        ldb     #9
-opFCMc  lda     ,x+
-        sta     ,y+
-        decb
-        bne     opFCMc
-        ldb     #55             ; SUBGO: FAC = F - G
-        jsr     >EXTRA
-        clra                    ; 0 = equal
-        tst     FACEXP          ; zero = FACEXP==0 (ROM convention)
-        beq     opFCMr
-        lda     #$FF            ; F > G -> sign(G-F) = -1
-        tst     FACSGN
-        bpl     opFCMr
-        lda     #1              ; F < G -> +1
-opFCMr  pshs    a               ; restore F while class waits on stack
-        ldx     #FTEMP
-        ldy     #FACEXP
-        ldb     #9
-opFCMs  lda     ,x+
-        sta     ,y+
-        decb
-        bne     opFCMs
-        puls    a
+* FCMP: R0 = sign(G - F); F and G both survive, NOTHING is written.
+* Direct lexicographic compare, modeled on BASIC 512's own FCOMP
+* ($12DF, traced via "PRINT 1.1>2.2"): no arithmetic - zero test,
+* signs, exponent, then mantissa bytes. ~25 cycles on the hot path
+* vs ~8800 for a SUBGO round-trip. Zero = exponent 0 (a zero F loses
+* any exponent compare, so only the zero-vs-zero case needs care).
+opFCMP  tst     FACEXP          ; F == 0?
+        bne     opFCMP1
+        tst     ARGEXP          ; G == 0 too -> equal
         beq     opLDi_0
-        cmpa    #1
-        beq     opLDi_1
+        tst     ARGSGN          ; G<0 -> G-F<0 -> -1 ; G>0 -> +1
+        bmi     opLDi_m1
+        bra     opLDi_1
+opFCMP1 tst     ARGEXP          ; G == 0 (F!=0): G-F = -F
+        bne     opFCMP2
+        tst     FACSGN
+        bmi     opLDi_1
         bra     opLDi_m1
+opFCMP2 lda     FACSGN
+        eora    ARGSGN          ; bit7 = signs differ?
+        bmi     opFCMP3
+        lda     FACEXP          ; same sign: magnitude order decides
+        cmpa    ARGEXP
+        bhi     opFCMPg
+        blo     opFCMPl
+        lda     FACHO           ; equal exponents: mantissa, MSB first
+        cmpa    ARGHO
+        bne     opFCMPc
+        lda     FACHO+1
+        cmpa    ARGHO+1
+        bne     opFCMPc
+        lda     FACHO+2
+        cmpa    ARGHO+2
+        bne     opFCMPc
+        bra     opLDi_0         ; identical magnitudes -> equal
+opFCMPc bhi     opFCMPg
+        bra     opFCMPl
+opFCMPg tst     FACSGN          ; |F| > |G|: F>0 -> F>G -> -1 ; F<0 -> +1
+        bmi     opLDi_1
+        bra     opLDi_m1
+opFCMPl tst     FACSGN          ; |F| < |G|: F>0 -> F<G -> +1 ; F<0 -> -1
+        bmi     opLDi_m1
+        bra     opLDi_1
+opFCMP3 tst     FACSGN          ; opposite signs: F's sign decides
+        bmi     opLDi_1         ; F<0 -> F<G -> +1
+        bra     opLDi_m1        ; F>0 -> F>G -> -1
 
 * FTOI: R0 = (int32)FAC, C99 truncation toward zero. Pure 6809: the
 * EXTRAMON FIXER only knows 16-bit BASIC ints, not our 32-bit R0.
