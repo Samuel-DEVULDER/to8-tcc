@@ -1331,7 +1331,8 @@ opFSCALEi
         bcs     opFSCz
         sta     FACEXP
         jmp     ,y
-opFSCp  aba                     ; A = FACEXP + n
+opFSCp  pshs    b               ; c6809 lacks ABA: A = A + B
+        adda    ,s+
         bcs     opFSCmax
         sta     FACEXP
         jmp     ,y
@@ -1351,18 +1352,18 @@ opFSCmax
 * signs, exponent, then mantissa bytes. ~25 cycles on the hot path
 * vs ~8800 for a SUBGO round-trip. Zero = exponent 0 (a zero F loses
 * any exponent compare, so only the zero-vs-zero case needs care).
-opFCMP  tst     FACEXP          ; F == 0?
-        bne     opFCMP1
-        tst     ARGEXP          ; G == 0 too -> equal
-        beq     opLDi_0
-        tst     ARGSGN          ; G<0 -> G-F<0 -> -1 ; G>0 -> +1
-        bmi     opLDi_m1
-        bra     opLDi_1
-opFCMP1 tst     ARGEXP          ; G == 0 (F!=0): G-F = -F
+opFCMP  lda     FACEXP          ; F == 0? (lda, not tst: RMW = +2 cycles,
+        bne     opFCMP1         ;  same N/Z flags, A dead here anyway)
+        ldb     ARGEXP          ; G == 0 too -> equal
+        beq     jpLDi0
+        ldb     ARGSGN          ; G<0 -> G-F<0 -> -1 ; G>0 -> +1
+        bmi     jpLDim1
+        bra     jpLDi1
+opFCMP1 ldb     ARGEXP          ; G == 0 (F!=0): G-F = -F
         bne     opFCMP2
-        tst     FACSGN
-        bmi     opLDi_1
-        bra     opLDi_m1
+        ldb     FACSGN
+        bmi     jpLDi1
+        bra     jpLDim1
 opFCMP2 lda     FACSGN
         eora    ARGSGN          ; bit7 = signs differ?
         bmi     opFCMP3
@@ -1379,31 +1380,34 @@ opFCMP2 lda     FACSGN
         lda     FACHO+2
         cmpa    ARGHO+2
         bne     opFCMPc
-        bra     opLDi_0         ; identical magnitudes -> equal
+        bra     jpLDi0          ; identical magnitudes -> equal
 opFCMPc bhi     opFCMPg
         bra     opFCMPl
-opFCMPg tst     FACSGN          ; |F| > |G|: F>0 -> F>G -> -1 ; F<0 -> +1
-        bmi     opLDi_1
-        bra     opLDi_m1
-opFCMPl tst     FACSGN          ; |F| < |G|: F>0 -> F<G -> +1 ; F<0 -> -1
-        bmi     opLDi_m1
-        bra     opLDi_1
-opFCMP3 tst     FACSGN          ; opposite signs: F's sign decides
-        bmi     opLDi_1         ; F<0 -> F<G -> +1
-        bra     opLDi_m1        ; F>0 -> F>G -> -1
+* opLDi_1/opLDi_m1 are out of short-branch range from here: branch to
+* these local trampolines, which take the extended jump.
+opFCMPg lda     FACSGN          ; |F| > |G|: F>0 -> F>G -> -1 ; F<0 -> +1
+        bmi     jpLDi1
+        bra     jpLDim1
+opFCMPl lda     FACSGN          ; |F| < |G|: F>0 -> F<G -> +1 ; F<0 -> -1
+        bmi     jpLDim1
+        bra     jpLDi1
+opFCMP3 lda     FACSGN          ; opposite signs: F's sign decides
+        bmi     jpLDi1          ; F<0 -> F<G -> +1
+jpLDim1 jmp     <opLDi_m1       ; F>0 -> F>G -> -1
+jpLDi0  jmp     <opLDi_0
+jpLDi1  jmp     <opLDi_1
 
 * FTOI: R0 = (int32)FAC, C99 truncation toward zero. Pure 6809: the
 * EXTRAMON FIXER only knows 16-bit BASIC ints, not our 32-bit R0.
 * value = mantissa24 * 2^(FACEXP-152) (24-bit explicit-1 mantissa);
 * shift it into place, cap the count, apply the sign at the end.
-opFTOI  tst     FACEXP
+opFTOI  lda     FACEXP
         bne     opFTOI1
-        ldd     #0              ; FACEXP==0 -> 0 (ROM zero marker)
+        clrb                    ; FACEXP==0 -> 0 (ROM zero marker)
         std     <R0lo
         std     <R0hi
         pulu    pc
-opFTOI1 lda     FACHO           ; 24-bit mantissa into R0 = $00mm:mm:m0
-        ldb     FACHO+1
+opFTOI1 ldd     FACHO           ; 24-bit mantissa into R0 = $00mm:mm:m0
         std     <R0hi
         lda     FACHO+2
         clrb
@@ -1432,7 +1436,7 @@ opFTOIlp
         rol     <R0hi
         deca
         bne     opFTOIlp
-opFTOIs tst     FACSGN          ; sign only now (magnitude is unsigned)
+opFTOIs lda     FACSGN          ; sign only now (magnitude is unsigned)
         bpl     opFTOId
         jsr     <NEG_
 opFTOId pulu    pc
@@ -1466,8 +1470,9 @@ opITOFz lda     <R0hi
         rol     <R0hi
         incb
         bra     opITOFz
-opITOFe lda     #160
-        sba                     ; A = 160 - b = FACEXP
+opITOFe pshs    b               ; c6809 lacks SBA: A = 160 - B via stack
+        lda     #160
+        suba    ,s+
         sta     FACEXP
         lda     <R0lo+1         ; dropped byte -> round to nearest
         anda    #$80
