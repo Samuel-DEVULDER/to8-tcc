@@ -1159,8 +1159,10 @@ opLDFw  ldd     #$FFFF          ; maxfloat
         std     2+FACEXP-FACEXP,x
         pulu    pc
 
-        clra                    ; zero
-opLDFz  sta     FACHO-FACEXP,x
+        clra                    ; zero: FACEXP=0 is the ROM zero marker
+opLDFz  sta     FACEXP-FACEXP,x ; (SGN at $12A1 tests FACEXP first; a
+        sta     FACHO-FACEXP,x  ; stale exponent reads as non-zero!)
+        sta     FACSGN-FACEXP,x
         pulu    pc
 
 opSTF4m pulu    y
@@ -1282,6 +1284,230 @@ opSTF8g lsra
         anda    #%00001111
         ora     1,y
         std     1,y
+        pulu    pc
+
+* FPU arithmetic. EXTRAMON routines, called through EXTRA ($EC0C).
+* Conventions CONFIRMED against BASIC 512 ROM (TOJE trace of
+* "PRINT 1.1*0.0" + disassembly):
+*   - ZERO  = FACEXP==0. The ROM SGN routine ($12A1) does
+*             "LDB FACEXP; BEQ -> 0" and never reads FACSGN in that
+*             case. MULTGO's dispatch target ($0FDC) BEQs on the same
+*             exponent load and RTSes immediately when FAC is zero.
+*   - SIGN  = FACSGN bit7, only meaningful when FACEXP!=0.
+*   - MULTGO prologue ($1C30): result sign = ARGSGN EOR FACSGN
+*             stored at $6162, then ARGEXP->A, FACEXP->B.
+* NOTE: opLDFz below must CLEAR FACEXP on zero loads (not just FACHO)
+* or the ROM treats the stale exponent as a nonzero value.
+*
+* ISA (to8-gen.c): FADD F=G+F, FSUB F=G-F, FMUL F=G*F, FDIV F=G/F,
+* result always in F (=FAC). ADDGO/MULTGO compute FAC+ARG/FAC*ARG =
+* F+G/F*G - commutative, direct. SUBGO/DIVGO compute FAC-ARG/FAC/ARG
+* = F-G/F/G - WRONG ORDER, so swap FAC<->ARG first (opFSWAP).
+
+opFADD  ldb     #54             ; EXTRA ADDGO: FAC = FAC + ARG
+        jsr     >EXTRA
+        pulu    pc
+
+opFMUL  ldb     #56             ; EXTRA MULTGO: FAC = FAC * ARG
+        jsr     >EXTRA
+        pulu    pc
+
+* swap FAC <-> ARG (9 bytes each: exp, 7 mantissa, sign)
+opFSWAP ldx     #FACEXP
+        ldy     #ARGEXP
+        ldb     #9
+opFSWl  lda     ,x
+        pshs    a
+        lda     ,y
+        sta     ,x+
+        puls    a
+        sta     ,y+
+        decb
+        bne     opFSWl
+        rts
+
+opFSUB  jsr     opFSWAP         ; FAC=G, ARG=F
+        ldb     #55             ; EXTRA SUBGO: FAC = G - F
+        jsr     >EXTRA
+        pulu    pc
+
+opFDIV  jsr     opFSWAP         ; FAC=G, ARG=F
+        ldb     #57             ; EXTRA DIVGO: FAC = G / F
+        jsr     >EXTRA
+        pulu    pc
+
+* FSCALEi: F = F * 2^n, n = signed immediate byte. Add n to the biased
+* exponent; result <=0 -> underflow (flush to zero), >255 -> saturate.
+opFSCALEi
+        pulu    b,y             ; B = n, Y = return
+        lda     FACEXP
+        tstb
+        bpl     opFSCp          ; n >= 0: plain add, C catches >255
+        negb                    ; n < 0: A = FACEXP - |n|; borrow = underflow
+        pshs    b
+        suba    ,s+
+        bcs     opFSCz
+        sta     FACEXP
+        jmp     ,y
+opFSCp  aba                     ; A = FACEXP + n
+        bcs     opFSCmax
+        sta     FACEXP
+        jmp     ,y
+opFSCz  clra                    ; underflow -> zero (FACEXP=0 = ROM marker)
+        sta     FACEXP
+        sta     FACHO
+        sta     FACSGN
+        jmp     ,y
+opFSCmax
+        lda     #255
+        sta     FACEXP
+        jmp     ,y
+
+* FCMP: R0 = sign(G - F); F and G BOTH survive (ISA note). SUBGO
+* destroys FAC, so save F to FTEMP first; SUBGO then gives FAC = F - G,
+* whose class is the NEGATED answer; restore F, and let the shared
+* opLDi_* tails set R0 and dispatch (same reuse as integer CMP).
+FTEMP   FCB     0,0,0,0,0,0,0,0,0
+opFCMP  ldx     #FACEXP
+        ldy     #FTEMP
+        ldb     #9
+opFCMc  lda     ,x+
+        sta     ,y+
+        decb
+        bne     opFCMc
+        ldb     #55             ; SUBGO: FAC = F - G
+        jsr     >EXTRA
+        clra                    ; 0 = equal
+        tst     FACEXP          ; zero = FACEXP==0 (ROM convention)
+        beq     opFCMr
+        lda     #$FF            ; F > G -> sign(G-F) = -1
+        tst     FACSGN
+        bpl     opFCMr
+        lda     #1              ; F < G -> +1
+opFCMr  pshs    a               ; restore F while class waits on stack
+        ldx     #FTEMP
+        ldy     #FACEXP
+        ldb     #9
+opFCMs  lda     ,x+
+        sta     ,y+
+        decb
+        bne     opFCMs
+        puls    a
+        beq     opLDi_0
+        cmpa    #1
+        beq     opLDi_1
+        bra     opLDi_m1
+
+* FTOI: R0 = (int32)FAC, C99 truncation toward zero. Pure 6809: the
+* EXTRAMON FIXER only knows 16-bit BASIC ints, not our 32-bit R0.
+* value = mantissa24 * 2^(FACEXP-152) (24-bit explicit-1 mantissa);
+* shift it into place, cap the count, apply the sign at the end.
+opFTOI  tst     FACEXP
+        bne     opFTOI1
+        ldd     #0              ; FACEXP==0 -> 0 (ROM zero marker)
+        std     <R0lo
+        std     <R0hi
+        pulu    pc
+opFTOI1 lda     FACHO           ; 24-bit mantissa into R0 = $00mm:mm:m0
+        ldb     FACHO+1
+        std     <R0hi
+        lda     FACHO+2
+        clrb
+        std     <R0lo
+        lda     FACEXP
+        suba    #152            ; A = k (signed)
+        bpl     opFTOIl
+        nega                    ; right shift by -k (1..24; cap at 32)
+        cmpa    #32
+        bls     opFTOIr
+        lda     #32
+opFTOIr lsr     <R0hi           ; LOGICAL right: mantissa is unsigned
+        ror     <R0hi+1
+        ror     <R0lo
+        ror     <R0lo+1
+        deca
+        bne     opFTOIr
+        bra     opFTOIs
+opFTOIl cmpa    #31             ; left shift by k (cap: C UB anyway)
+        bls     opFTOIlp
+        lda     #31
+opFTOIlp
+        asl     <R0lo+1
+        rol     <R0lo
+        rol     <R0hi+1
+        rol     <R0hi
+        deca
+        bne     opFTOIlp
+opFTOIs tst     FACSGN          ; sign only now (magnitude is unsigned)
+        bpl     opFTOId
+        jsr     <NEG_
+opFTOId pulu    pc
+
+* ITOF: F0 = (float)R0 (signed int32 -> FAC), round to nearest.
+* Normalize |R0| until bit31 set (count b), then
+*   FACEXP  = 160 - b           (value = mantissa * 2^(FACEXP-152))
+*   mantissa = top 24 bits, rounded on the dropped byte.
+opITOF  lda     <R0hi
+        bpl     opITOFp
+        anda    #$80            ; sign byte: $80 (opLDFb convention), not $FF
+        sta     FACSGN
+        jsr     <NEG_           ; R0 = |R0|
+        bra     opITOFn
+opITOFp clra
+        sta     FACSGN
+opITOFn ldd     <R0hi
+        bne     opITOFs
+        ldd     <R0lo
+        bne     opITOFs
+        clra                    ; R0==0 -> F0 = 0 (FACEXP=0 ROM marker)
+        sta     FACEXP
+        sta     FACHO
+        pulu    pc
+opITOFs clrb                    ; shift count
+opITOFz lda     <R0hi
+        bmi     opITOFe         ; bit31 set: normalized
+        asl     <R0lo+1
+        rol     <R0lo
+        rol     <R0hi+1
+        rol     <R0hi
+        incb
+        bra     opITOFz
+opITOFe lda     #160
+        sba                     ; A = 160 - b = FACEXP
+        sta     FACEXP
+        lda     <R0lo+1         ; dropped byte -> round to nearest
+        anda    #$80
+        beq     opITOFm
+        inc     <R0lo           ; +1 on the 24-bit mantissa
+        bne     opITOFm
+        inc     <R0hi+1
+        bne     opITOFm
+        inc     <R0hi
+        bne     opITOFm
+        ldd     #$8000          ; mantissa hit $1000000: renormalize
+        std     <R0hi
+        inc     FACEXP
+opITOFm lda     <R0hi           ; FACHO..+2 = top 24 bits
+        sta     FACHO
+        lda     <R0hi+1
+        sta     FACHO+1
+        lda     <R0lo
+        sta     FACHO+2
+        pulu    pc
+
+* operand-less zero loads: F = 0.0 / G = 0.0. FACEXP=0 is the marker;
+* FACHO/FACSGN cleared too for a clean canonical +0.0.
+opLDFi_0
+        clra
+        sta     FACEXP
+        sta     FACHO
+        sta     FACSGN
+        pulu    pc
+opLDGi_0
+        clra
+        sta     ARGEXP
+        sta     ARGHO
+        sta     ARGSGN
         pulu    pc
 
         endc
@@ -1779,7 +2005,53 @@ EXTu2   macro
         endm
 
         ifne    FPU
-* floating point
+* floating point - ops per the to8-gen.c float ISA (v8.0.0+):
+* FMOV, LDFi_0/LDGi_0, LDFi/LDGi, LDF4/LDG4/LDF4m/LDG4m, LDF8/LDG8/
+* LDF8m/LDG8m, STF4/STF8/STF4m/STF8m, FADD/FSUB/FMUL/FDIV (F = G op F),
+* FSCALEi, FCMP (R0 = sign(G-F), F and G survive), FTOI, ITOF.
+* No FSEQ/FSNE/... family: the compiler emits FCMP then the INTEGER
+* SEQ/SNE/SLT/... on R0. No FNEG/FABS/transcendentals: not in the ISA
+* (libm territory).
+
+* FPU arithmetic
+FADD    macro
+        fdb     opFADD
+        endm
+FSUB    macro
+        fdb     opFSUB
+        endm
+FMUL    macro
+        fdb     opFMUL
+        endm
+FDIV    macro
+        fdb     opFDIV
+        endm
+FSCALEi macro
+        fdb     opFSCALEi
+        fcb     \0
+        endm
+
+* FPU comparison
+FCMP    macro
+        fdb     opFCMP
+        endm
+
+* FPU conversions (pure 6809: EXTRAMON FIXER knows only 16-bit ints)
+FTOI    macro
+        fdb     opFTOI
+        endm
+ITOF    macro
+        fdb     opITOF
+        endm
+
+* operand-less zero loads
+LDFi_0  macro
+        fdb     opLDFi_0
+        endm
+LDGi_0  macro
+        fdb     opLDGi_0
+        endm
+
         endc
 
 * misc
