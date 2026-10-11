@@ -352,7 +352,7 @@ int mul8_24(int a, int b) {
 
 // --- Stripe width (the left-most stripe is narrower if BLK_W does not
 //     divide WIDTH) ---
-#define BLK_W 6
+#define BLK_W 5
 
 // --- Automatic computations ---
 #define CW ((2*CH*WIDTH) / (float)HEIGHT)
@@ -377,6 +377,7 @@ int mul8_24(int a, int b) {
 // Pixel color from the iteration count: SAME formula + dithering as the
 // to8-mandel.c reference (the (x^y)&1 checkerboard is part of the image).
 #define COLOR(it, d) ((it) ? (MAX_ITER - (it) + (d)) >> 1 : 0)
+// #define COLOR(it, d) ((it) ? (MAX_ITER - (it)) : 0)
 
 // ==================== MANDELBROT ====================
 
@@ -441,7 +442,7 @@ int line_uniform(int cr, int ci, int bx, int bw, int y, int *right) {
 // cr = cr of the stripe's RIGHT pixel (x = bx+bw-1) - constant for the
 // whole stripe. ci = ci of the bottom line (y = HEIGHT-1).
 void stripe(int bx, int bw, int cr, int ci) {
-    int one = 1, step_y = STEP_Y, step_x = STEP_X;
+    int one = 1, step_y = STEP_Y, step_x = STEP_X, *prev = &right[HEIGHT];
     int crL, old, yu, yf, col, v, y, x;
 
     // cr of the stripe's LEFT column x = bx (cr decreases leftwards)
@@ -452,7 +453,7 @@ void stripe(int bx, int bw, int cr, int ci) {
         // --- phase 1: plain line scan until a uniform line (or y < 0) ---
         do {
             ci += step_y; y -= one;
-            col = line_uniform(cr, ci, bx, bw, y, &right[y]);
+            col = line_uniform(cr, ci, bx, bw, y, --prev);
         } while (col<0 && y);
         if (!y) return;              // stripe finished without rectangle
         yu = y;
@@ -462,8 +463,8 @@ void stripe(int bx, int bw, int cr, int ci) {
 	    y -= one; ci += step_y;
             v = iterate(crL, ci);       // left pixel (x = bx), plotted
             plot_iter(bx, y, v);
-            old = right[y];             // column x = bx+bw, already known
-	    right[y] = old;
+	    old = *--prev;              // column x = bx+bw, already known
+	    *prev = v;
 	} while(v == col && v == old && y);
 	yf = y; int ciF = ci;           // ci(yf), to resume the scan (phase 4)
 
@@ -485,6 +486,9 @@ void stripe(int bx, int bw, int cr, int ci) {
         // --- phase 4: resume the plain scan at yf (its interior has not
         //     been computed yet; the scan recomputes the whole line) ---
 	ci = ciF; y = yf;
+	
+	// debug
+	// plot(bx, y, 15);
     }
 }
 

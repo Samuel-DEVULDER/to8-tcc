@@ -1775,7 +1775,7 @@ typedef struct to8_line {
     struct to8_line *prev, *next;
     /* --- raw inline-asm passthrough (asm("text");) --- */
     int is_raw_text;
-    char rawtext[1024];
+    char rawtext[4096];
 } to8_line;
 
 static to8_line *g_head, *g_tail;

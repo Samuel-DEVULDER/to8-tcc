@@ -52,6 +52,9 @@ R1      FDB     0,0
 go_vm   puls    u
         pulu    pc
 
+opRET   puls    d,u     ; TODO banking
+        pulu    pc
+
 * Unsigned division of R0 by integer pointed by y.
 * Remainder in R1, /Quotient in {R0, carry}
 UDIV_Y  clra           ; no ldd here in dp
@@ -432,9 +435,6 @@ opPUSHi pulu    d,x,y
 * restores it. CALLm/CALLr likewise just retarget U, then pulu pc
 * dispatches the callee's first opcode.
 *
-opRET   puls    d,u     ; TODO banking
-        pulu    pc
-
 opCALLr ldx     <R0lo
 *       ldd     <R0hi
         bra     opCALLb
@@ -1810,6 +1810,7 @@ JLE     macro
 ADD     macro
         fdb     opADD
         fcb     \0
+        endm
 *        VM_OFF
 *        ldd     2+\0,s
 *        addd    <R0lo
@@ -1819,7 +1820,6 @@ ADD     macro
 *        adca    \0,s
 *        std     <R0hi
 *        VM_ON
-        endm
 SUB     macro
         fdb     opSUB
         fcb     \0
@@ -1933,6 +1933,7 @@ ADD2    macro
 SUB2    macro
         fdb     opSUB2
         fcb     \0,\1
+        endm
 *        VM_OFF
 *        ldd     2+\0,s
 *        subd    2+\1,s
@@ -1942,16 +1943,15 @@ SUB2    macro
 *        sbca    \1,s
 *        std     <R0hi
 *        VM_ON
-        endm
 MUL2    macro
         fdb     opMUL2
         fcb     \0,\1
+        endm
 *        VM_OFF
 *        leax    \0,s
 *        leay    \1,s
 *        ldu     #*+6
 *        jmp     opMUL1
-        endm
 DIV2    macro
         fdb     opDIV2
         fcb     \0,\1
@@ -2058,10 +2058,10 @@ VM_OFF  macro
         fdb     *+2
         endm
 VM_ON   macro
-*        jsr     <go_vm
         ldu     #*+6
         fcb     $7e     ; JMP $nnnn
         endm
+*        jsr     <go_vm
 LDCLK   macro
         fdb     opLDCLK
         endm
