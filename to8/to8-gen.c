@@ -1,8 +1,27 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.29.0 (fix ARG_SYM: sym_addend dropped — global[const] addressed the base)
+ * Version : 8.30.0 (new peephole: useless JRA removed -- "JRA next" no-op)
  *
  * Changelog:
+ * - v8.30.0 new peephole to8_peephole_useless_jra(): removes a JRA whose
+ *   target is the IMMEDIATELY NEXT line -- an unconditional jump to the
+ *   fall-through address is a pure no-op transfer. Found on plot_iter():
+ *   every compiled ternary tail emits "JRA next" after its taken branch
+ *   (JEQ label; ...; JRA end; label: LDi_0; end:) and neither
+ *   to8_peephole_jump_inversion() (which removes the JRA *between* a JCC
+ *   and its merged target) nor to8_peephole_thread_jumps() (which
+ *   retargets, never detects triviality) handles the degenerate case.
+ *   Safety: JRA has no side effects (ISA), and jumping to the next line
+ *   is observationally identical to falling through -- the target line
+ *   KEEPS its is_target mark (other edges may branch to it, and the
+ *   mark correctly invalidates the R0 trackers at that point, as it
+ *   already did when the JRA was present: the fall-through path reaches
+ *   the mark with exactly the same R0 state as the removed jump did).
+ *   Runs inside the fixed-point loop (threading can create a new
+ *   "JRA next" by retargeting, and removing one can make a chain
+ *   collapse), idempotent. ~20 cycles and 5 stream bytes saved per
+ *   ternary; fires on every conditional of every program.
+ *
  * - v8.29.0 CORRECTNESS FIX: ARG_SYM rendering dropped sym_addend. The
  *   "0,_name" rendering established by v8.15/v8.16 never printed the
  *   symbol's constant offset, so any global access with a NON-ZERO
@@ -1303,7 +1322,7 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.29.0"
+#define TO8_GEN_VERSION "8.30.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -4129,6 +4148,32 @@ static int to8_peephole_thread_jumps(void)
     return changed;
 }
 
+/* v8.30.0: to8_peephole_useless_jra() -- a JRA whose target is the
+ * IMMEDIATELY NEXT line is a no-op transfer: unlink it. The target line
+ * keeps its is_target (other edges + the fall-through now reach it
+ * directly). Fires on every compiled ternary tail ("JRA next" after the
+ * taken branch). Runs inside the fixed-point loop; idempotent. */
+static int to8_peephole_useless_jra(void)
+{
+    int changed = 0;
+    to8_line *cur = g_head;
+
+    while (cur) {
+        to8_line *nxt = cur->next;
+
+        if (cur->op == OP_JRA && cur->kind == ARG_JMP &&
+            cur->jmp_target_id >= 1 && nxt &&
+            cur->jmp_target_id == nxt->id) {
+            /* target keeps is_target: fall-through now reaches it,
+             * other branches may too -- never remove the mark */
+            to8_unlink(cur);
+            changed = 1;
+        }
+        cur = nxt;
+    }
+    return changed;
+}
+
 /* Materialize the pending ADJ-chain candidate: bake the deferred sum
  * into its immediate, and MOVE the line right before `before`
  * (before==NULL: no move, see below).
@@ -4618,6 +4663,7 @@ static void to8_peephole_run(void)
         changed |= to8_peephole_op2();      /* NEW v7.26.0 */
         changed |= to8_peephole_jump_inversion();
 	changed |= to8_peephole_thread_jumps();
+	changed |= to8_peephole_useless_jra();   /* NEW v8.30.0 */
     } while (changed && ++guard < 256);
     // only once
     changed |= to8_peephole_merge_adj();
