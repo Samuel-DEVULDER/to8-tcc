@@ -327,21 +327,23 @@ unsigned sqr8_24(int a, int b) {
 int n_iter;
 
 int iterate(int cr, int ci) {
-    int zr = 0, zi = 0, iter = MAX_ITER, one = 1, thr = FIX_FOUR+1;
+    const int one = 1;
+    int zr = cr, zi = ci, iter = MAX_ITER;
+    unsigned m, zr2, zi2, w2;
 
-    n_iter++;
+    n_iter = one + n_iter;
 
     do {
-        unsigned w2  = sqr8_24(zr + zi);
-        unsigned zr2 = sqr8_24(zr);
-        unsigned zi2 = sqr8_24(zi);
-        unsigned m = zr2 + zi2;
-
+        zi2 = sqr8_24(zi);
+	zr2 = sqr8_24(zr);
+	m   = zr2 + zi2;
+	
+        w2  = sqr8_24(zr + zi);
+        zi = ci + (w2 - m);       
         zr = cr + (zr2 - zi2);
-        zi = ci + (w2 - m);
 
         iter -= one;
-    } while (iter && m < thr);
+    } while (iter && m < FIX_FOUR+1);
 
     return iter;
 }
