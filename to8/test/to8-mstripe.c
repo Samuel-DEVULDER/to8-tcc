@@ -195,136 +195,6 @@ void puti(int t) {
 #define FIX_FRAC 24
 
 #ifdef __TO8__
-extern int mul8_24(int a, int b);
-asm(
-   "_mul8_24	set *\n"
-   "	VM_OFF	;\n"
-#if 0
-   "	lda	4+1,s\n"
-   "	ldb	8+3,s\n"
-   "	mul\n"
-   "	sta	<R0lo+1\n"
-   "	lda	4+2,s\n"
-   "	ldb	8+2,s\n"
-   "	mul\n"
-   "	adda	<R0lo+1\n"
-   "	tfr	a,b\n"
-   "	lda	#0\n"
-   "	rola\n"
-   "	std	<R0lo\n"
-   "	lda	4+3,s\n"
-   "	ldb	8+1,s\n"
-   "	mul\n"
-   "	adda	<R0lo+1\n"
-   "	sta	<R0lo+1\n"
-   "	bcc	*+4\n"
-   "	inc	<R0lo\n"
-   "	ldx	#0\n"
-   "	lda	4,s\n"
-   "	ldb	8+3,s\n"
-   "	mul\n"
-   "	addd	<R0lo\n"
-   "	std	<R0lo\n"
-   "	bcc	*+4\n"
-   "	leax	1,x\n"
-#else
-   "	ldx	#0\n"
-   "	lda	4,s\n"
-   "	ldb	8+3,s\n"
-   "	mul\n"
-   "	std	<R0lo\n"
-#endif
-   
-   "	lda	4+1,s\n"
-   "	ldb	8+2,s\n"
-   "	mul\n"
-   "	addd	<R0lo\n"
-   "	std	<R0lo\n"
-   "	bcc	*+4\n"
-   "	leax	1,x\n"
-   "	lda	4+2,s\n"
-   "	ldb	8+1,s\n"
-   "	mul\n"
-   "	addd	<R0lo\n"
-   "	std	<R0lo\n"
-   "	bcc	*+4\n"
-   "	leax	1,x\n"
-   "	lda	4+3,s\n"
-   "	ldb	8+0,s\n"
-   "	mul\n"
-   "	addd	<R0lo\n"
-   "	std	<R0lo\n"
-   "	bcc	*+4\n"
-   "	leax	1,x\n"
-   "	stx	<R0hi\n"
-
-   "	lda	4,s\n"
-   "	ldb	8+2,s\n"
-   "	mul\n"
-   "	addb	<R0lo\n"
-   "	stb	<R0lo\n"
-   "	adca	<R0hi+1\n"
-   "	sta	<R0hi+1\n"
-   "	bcc	*+4\n"
-   "	inc	<R0hi\n"
-   "	lda	4+1,s\n"
-   "	ldb	8+1,s\n"
-   "	mul\n"
-   "	addb	<R0lo\n"
-   "	stb	<R0lo\n"
-   "	adca	<R0hi+1\n"
-   "	sta	<R0hi+1\n"
-   "	bcc	*+4\n"
-   "	inc	<R0hi\n"
-   "	lda	4+2,s\n"
-   "	ldb	8+0,s\n"
-   "	mul\n"
-   "	addb	<R0lo\n"
-   "	stb	<R0lo\n"
-   "	adca	<R0hi+1\n"
-   "	sta	<R0hi+1\n"
-   "	bcc	*+4\n"
-   "	inc	<R0hi\n"
-
-   "	lda	4,s\n"
-   "	ldb	8+1,s\n"
-   "	mul\n"
-   "	addd	<R0hi\n"
-   "	std	<R0hi\n"
-   "	lda	4+1,s\n"
-   "	ldb	8,s\n"
-   "	mul\n"
-   "	addd	<R0hi\n"
-   "	std	<R0hi\n"
-
-   "	lda	4,s\n"
-   "	ldb	8,s\n"
-   "	mul\n"
-   "	addb	<R0hi\n"
-   "	stb	<R0hi\n"
-
-   "	ldb	4,s\n"
-   "	bpl	_mul8_24a\n"
-   "	ldb	<R0lo\n"
-   "	subb	8+3,s\n"
-   "	stb	<R0lo\n"
-   "	ldd	<R0hi\n"
-   "	sbcb	8+2,s\n"
-   "	sbca	8+1,s\n"
-   "	std	<R0hi\n"
-   "_mul8_24a set * ;\n"
-   "	ldb	8,s\n"
-   "	bpl	_mul8_24b\n"
-   "	ldb	<R0lo\n"
-   "	subb	4+3,s\n"
-   "	stb	<R0lo\n"
-   "	ldd	<R0hi\n"
-   "	sbcb	4+2,s\n"
-   "	sbca	4+1,s\n"
-   "	std	<R0hi\n"
-   "_mul8_24b set * ;\n"
-
-   "	jmp	<opRET	;");
 extern unsigned int sqr8_24(int a);
 asm(
    "_sqr8_24	set *\n"
@@ -392,13 +262,6 @@ asm(
 
    "	jmp	<opRET	;");
 #else
-int mul8_24(int a, int b) {
-	unsigned long long m1 = (unsigned)a, m2 = (unsigned)b, m3 = m1*m2;
-	int s3 = m3>>24;
-	if (a < 0) s3 -= b<<8;
-	if (b < 0) s3 -= a<<8;
-	return s3;
-}
 unsigned sqr8_24(int a, int b) {
 	unsigned long long m1 = (unsigned)a, m2 = (unsigned)b, m3 = m1*m2;
 	unsigned int s3 = m3>>24;
@@ -464,24 +327,22 @@ unsigned sqr8_24(int a, int b) {
 int n_iter;
 
 int iterate(int cr, int ci) {
-    unsigned zr2 = 0, zi2 = 0;
-    int zr = 0, zi = 0, one = 1;
-    int iter = MAX_ITER;
+    int zr = 0, zi = 0, iter = MAX_ITER, one = 1, thr = FIX_FOUR+1;
 
     n_iter++;
 
     do {
-	zi = mul8_24(zr,zi);
-	
-	zr = cr + (zr2 - zi2);
-        zr2 = sqr8_24(zr);
-	
-	zi = ci + (zi + zi);
-        zi2 = sqr8_24(zi);
+        unsigned w2  = sqr8_24(zr + zi);
+        unsigned zr2 = sqr8_24(zr);
+        unsigned zi2 = sqr8_24(zi);
+        unsigned m = zr2 + zi2;
 
-	iter -= one;
-    } while(iter && (zr2 + zi2) < (FIX_FOUR+1));
-    
+        zr = cr + (zr2 - zi2);
+        zi = ci + (w2 - m);
+
+        iter -= one;
+    } while (iter && m < thr);
+
     return iter;
 }
 
