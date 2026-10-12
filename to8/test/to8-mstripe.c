@@ -364,16 +364,22 @@ void plot_iter(int x, int y, int iter) {
 // stripe's right column) and returns the common value if the line is
 // uniform, -1 if not.
 int line_uniform(int cr, int ci, int bx, int bw, int y, int *right) {
-    int x, v, col, one = 1;
+    int x, v, col, one = 1, step_x = STEP_X;
 
     col = v = iterate(cr, ci);
     x = bw - one;
     plot_iter(bx + x, y, col);
     while(x) {
-	x-=one; cr -= STEP_X;
-        v = iterate(cr, ci);
-        plot_iter(bx + x, y, v);
-        if (col>=0 && v != col) col= -1;
+	v = iterate(cr -= step_x, ci);
+	plot_iter(bx + (x -= one), y, v);
+        if (v-col) {
+	     while(x) {
+		v = iterate(cr -= step_x, ci);
+		plot_iter(bx + (x -= one), y, v);
+	     } 
+	     col= -1;
+	     break;
+	}
     }
     if(right) *right = v;          // v = left pixel (x = bx)
     return col;
@@ -406,12 +412,12 @@ void stripe(int bx, int bw, int cr, int ci) {
             plot_iter(bx, y, v);
 	    old = *--prev;              // column x = bx+bw, already known
 	    *prev = v;
-	} while(v == col && v == old && y);
+	} while(!(v-col) && !(v-old) && y);
 	yf = y; int ciF = ci;           // ci(yf), to resume the scan (phase 4)
 
         // --- phase 3: interior, checked from its bottom line upward ---
 	bw -= one; bx += one;
-	for(v=-1; y<yu && v!=col; ci -=step_y, y += one) {
+	for(v=-1; y<yu && (v-col); ci -=step_y, y += one) {
 	    v = line_uniform(cr, ci, bx, bw, y, (int*)0);
         }
         // rectangle [y-1..yu] confirmed: fill the lines above yc with no
