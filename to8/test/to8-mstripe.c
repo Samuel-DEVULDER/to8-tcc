@@ -192,7 +192,6 @@ void puti(int t) {
 }
 
 // ==================== CONFIG ====================
-#define MAX_ITER 32
 #define FIX_FRAC 24
 
 #ifdef __TO8__
@@ -326,6 +325,72 @@ asm(
    "_mul8_24b set * ;\n"
 
    "	jmp	<opRET	;");
+extern unsigned int sqr8_24(int a);
+asm(
+   "_sqr8_24	set *\n"
+   "	VM_OFF	;\n"
+   "	leay	4,s\n"
+   "	lda	,y\n"
+   "	bpl	*+4\n"
+   "	jsr	<NEG_Y\n"
+   "	ldx	#0\n"
+   "	lda	,y\n"
+   "	ldb	3,y\n"
+   "	mul\n"
+   "	lslb\n"
+   "	rola\n"
+   "	bcc	*+4\n"
+   "	leax	1,x\n"
+   "	std	<R0lo\n"
+   "	ldd	1,y\n"
+   "	mul\n"
+   "	lslb\n"
+   "	rola\n"
+   "	bcc	*+4\n"
+   "	leax	1,x\n"
+   "	addd	<R0lo\n"
+   "	bcc	*+4\n"
+   "	leax	1,x\n"
+   "	std	<R0lo\n"
+   "	stx	<R0hi\n"
+
+   "	lda	,y\n"
+   "	ldb	2,y\n"
+   "	mul\n"
+   "	lslb\n"
+   "	rola\n"
+   "	bcc	*+4\n"
+   "	inc	<R0hi\n"
+   "	addb	<R0lo\n"
+   "	stb	<R0lo\n"
+   "	adca	<R0hi+1\n"
+   "	sta	<R0hi+1\n"
+   "	bcc	*+4\n"
+   "	inc	<R0hi\n"
+   "	lda	1,y\n"
+   "	ldb	1,y\n"
+   "	mul\n"
+   "	addb	<R0lo\n"
+   "	stb	<R0lo\n"
+   "	adca	<R0hi+1\n"
+   "	sta	<R0hi+1\n"
+   "	bcc	*+4\n"
+   "	inc	<R0hi\n"
+
+   "	ldd	,y\n"
+   "	mul\n"
+   "	lslb\n"
+   "	rola\n"
+   "	addd	<R0hi\n"
+   "	std	<R0hi\n"
+
+   "	lda	,y\n"
+   "	ldb	,y\n"
+   "	mul\n"
+   "	addb	<R0hi\n"
+   "	stb	<R0hi\n"
+
+   "	jmp	<opRET	;");
 #else
 int mul8_24(int a, int b) {
 	unsigned long long m1 = (unsigned)a, m2 = (unsigned)b, m3 = m1*m2;
@@ -334,13 +399,27 @@ int mul8_24(int a, int b) {
 	if (b < 0) s3 -= a<<8;
 	return s3;
 }
+unsigned sqr8_24(int a, int b) {
+	unsigned long long m1 = (unsigned)a, m2 = (unsigned)b, m3 = m1*m2;
+	unsigned int s3 = m3>>24;
+	if (a < 0) s3 -= b<<9;
+	return s3;
+}
 #endif
 
 // --- 3 USER CONSTANTS (in float) ---
 // Verbatim from to8-mandel.c (the source of truth).
+#define MAX_ITER 32
 #define CH      2.20f   // Window height (CI_MAX - CI_MIN)
 #define CR_MIN -2.50f    // Left (minimum real part)
 #define CI_MIN -1.10f    // Bottom (minimum imaginary part)
+#define COLOR(it, d) ((it) ? (MAX_ITER - (it) + (d)) >> 1 : 0)
+
+// #define MAX_ITER 2048
+// #define CH      0.01f
+// #define CR_MIN	-0.7515f	
+// #define CI_MIN	0.1265f
+// #define COLOR(it, d) ((it) ? (MAX_ITER - (it) + (MAX_ITER/2)*(d))/(MAX_ITER/16) : 0)
 
 // float -> fixed-point conversion at compile time
 #define FIX_ONE (1 << FIX_FRAC)
@@ -376,7 +455,6 @@ int mul8_24(int a, int b) {
 
 // Pixel color from the iteration count: SAME formula + dithering as the
 // to8-mandel.c reference (the (x^y)&1 checkerboard is part of the image).
-#define COLOR(it, d) ((it) ? (MAX_ITER - (it) + (d)) >> 1 : 0)
 // #define COLOR(it, d) ((it) ? (MAX_ITER - (it)) : 0)
 
 // ==================== MANDELBROT ====================
@@ -396,10 +474,10 @@ int iterate(int cr, int ci) {
 	zi = mul8_24(zr,zi);
 	
 	zr = cr + (zr2 - zi2);
-        zr2 = mul8_24(zr,zr);
+        zr2 = sqr8_24(zr);
 	
 	zi = ci + (zi + zi);
-        zi2 = mul8_24(zi,zi);
+        zi2 = sqr8_24(zi);
 
 	iter -= one;
     } while(iter && (zr2 + zi2) < (FIX_FOUR+1));

@@ -92,9 +92,9 @@ NEG_    com     <R0hi
         neg     <R0lo+1
         bcc     NEG_Yx
         inc     <R0lo
-        bcc     NEG_Yx
+        bne     NEG_Yx
         inc     <R0hi+1
-        bcc     NEG_Yx
+        bne     NEG_Yx
         inc     <R0hi
         rts
 
@@ -104,9 +104,9 @@ NEG_Y   com     ,y
         neg     3,y
         bcc     NEG_Yx
         inc     2,y
-        bcc     NEG_Yx
+        bne     NEG_Yx
         inc     1,y
-        bcc     NEG_Yx
+        bne     NEG_Yx
         inc     ,y
 NEG_Yx  rts
 
