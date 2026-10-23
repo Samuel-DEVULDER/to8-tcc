@@ -88,27 +88,25 @@ UDIV_1  leax    -1,x
 * negate R0 or int at "x"
 NEG_    com     <R0hi
         com     <R0hi+1
-        com     <R0lo
-        neg     <R0lo+1
+        ldd     #0
+        subd    <R0lo
         bcc     NEG_Yx
-        inc     <R0lo
-        bne     NEG_Yx
         inc     <R0hi+1
         bne     NEG_Yx
         inc     <R0hi
+        std     <R0lo
         rts
 
 NEG_Y   com     ,y
         com     1,y
-        com     2,y
-        neg     3,y
+        ldd     #0
+        subd    2,y
         bcc     NEG_Yx
-        inc     2,y
-        bne     NEG_Yx
         inc     1,y
         bne     NEG_Yx
         inc     ,y
-NEG_Yx  rts
+NEG_Yx  std     <R0lo
+        rts
 
 * boolean
 * ========
@@ -412,9 +410,9 @@ opADJ   pulu    b,y
         jmp     ,y
 
 opPUSH  pulu    b,y
-        leax    b,s
-        ldd     ,x
-        ldx     2,x
+        ldx     b,s
+        subb    #2
+        ldd     b,s
         pshs    d,x
         jmp     ,y
 
@@ -435,17 +433,19 @@ opPUSHi pulu    d,x,y
 * restores it. CALLm/CALLr likewise just retarget U, then pulu pc
 * dispatches the callee's first opcode.
 *
-opCALLr ldx     <R0lo
-*       ldd     <R0hi
-        bra     opCALLb
 opCALL  pulu    b
-        leax    b,s
-        ldx     2,x     ; TODO banking
+        addb    #2
+        ldx     b,s     ; TODO banking
         bra     opCALLb
-opCALLm pulu    x       ; TODO load B with curr BANK
+opCALLr ldx     <R0lo
 opCALLb pshs    d,u
         leau    ,x      ; TODO banking
         pulu    pc
+opCALLm leax    2,u     ; TODO load B with curr BANK
+        pshs    d,x
+        ldu     ,u
+        pulu    pc
+
 
 * jump
 * ====
@@ -501,18 +501,6 @@ opJLE   ldd     <R0hi
 * "beq" skips the whole high add when it is a no-op (the common
 * small-constant case: high word $0000).
 
-opADD2  pulu    d
-        leax    a,s
-        leay    b,s
-        ldd     2,x
-        addd    2,y
-        std     <R0lo
-        ldd     ,x
-        adcb    1,y
-        adca    ,y
-        std     <R0hi
-        pulu    pc
-
 opADDi  leay    ,u
         leau    6,u
         ldx     -2,u
@@ -524,12 +512,22 @@ opADDa  ldd     <R0lo
         addd    2,y
         std     <R0lo
         ldd     ,y
-        bcc     opADDb
-        addd    #1
-opADDb  beq     opADDc
-        addd    <R0hi
+        adcb    <R0hi+1
+        adca    <R0hi
         std     <R0hi
 opADDc  jmp     ,x
+
+opADD2  pulu    d
+        leax    a,s
+        leay    b,s
+        ldd     2,x
+        addd    2,y
+        std     <R0lo
+        ldd     ,x
+        adcb    1,y
+        adca    ,y
+        std     <R0hi
+        pulu    pc
 
 opSUB2  pulu    d
         leax    a,s
@@ -1738,7 +1736,7 @@ ADJ     macro
         endm
 PUSH    macro
         fdb     opPUSH
-        fcb     \0
+        fcb     2+\0
         endm
 PUSHi   macro
         fdb     opPUSHi,\0,\1

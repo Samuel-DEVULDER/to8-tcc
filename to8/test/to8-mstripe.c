@@ -79,14 +79,58 @@ int GETC(void) {
 #endif
 }
 
-void plot(int x, int y, int col) {
+void xplot(int x, int y, int col) {
 #ifdef	__TO8__	
-	native("ldx	6,s\n\t"
-	       "ldy	10,s\n\t"
-	       "ldb	15,s\n\t"
-	       "stb	$6038\n\t"
-	       "jsr	$E80f");
+	native(
+	"ldd	8+2,s\n\t"
+	"cmpd	#200\n\t"
+	"bhs	xplot_done\n\t"
+	"lda	#40\n\t"
+	"mul\n\t"
+	"adda	#$40\n\t"
+	"tfr	d,x\n\t"
+	"ldd	4+2,s\n\t"
+	"cmpd	#160\n\t"
+	"bhs	xplot_done\n\t"
+	"lda	$e7c3\n\t"
+	"lsrb\n\t"
+	"rora\n\t"
+	"lsrb\n\t"
+	"abx\n\t"
+	"rola\n\t"
+	"eora	#1\n\t"
+	"sta	$e7c3\n\t"
+	"ldb	12+3,s\n\t"
+	"andb	#15\n\t"
+	"bcs	*+6\n\t"
+	"lslb\n\t"
+	"lslb\n\t"
+	"lslb\n\t"
+	"lslb\n\t"
+	"eorb	,x\n\t"
+	"stb	,x\n"
+	"xplot_done set *\n\t"
+	"puls	d,u\n\t"
+	"pulu	pc"
+	);
 #endif
+}
+
+void xbox(int x, int y, int w, int h, int col) {
+	int i, j, k, one = 1;
+	h -= one; k = y + h;
+	for(i=w;(i-=one)>=0;) {
+		j = x+i;
+		xplot(j,y, col);
+		xplot(j,k, col);
+	}
+	k = x+(w-one);
+	for(i=h;i;i-=one) {
+		j = y+i;
+		xplot(x,j, col);
+		xplot(k,j, col);
+	}
+
 }
 
 int palette(int a, int x, int y) {
@@ -278,6 +322,18 @@ unsigned sqr8_24(int a, int b) {
 #define CI_MIN -1.10f    // Bottom (minimum imaginary part)
 #define COLOR(it, d) ((it) ? (MAX_ITER - (it) + (d)) >> 1 : 0)
 
+typedef
+	unsigned
+#if MAX_ITER<256
+	char
+#elif MAX_ITER<65536
+	short
+#else
+	int
+#endif
+	iter_t;
+
+
 // #define MAX_ITER 2048
 // #define CH      0.01f
 // #define CR_MIN	-0.7515f	
@@ -324,7 +380,7 @@ unsigned sqr8_24(int a, int b) {
 
 // Number of iterate() calls = number of individually computed pixels.
 // Filled (non-computed) pixels = WIDTH*HEIGHT - n_iter, displayed at exit.
-int n_iter;
+short n_iter;
 
 int iterate(int cr, int ci) {
     const int one = 1;
@@ -351,11 +407,11 @@ int iterate(int cr, int ci) {
 // Iteration of the pixel (bx+bw, y): the column just right of the stripe
 // being processed. Filled by the init with the off-screen column x=WIDTH,
 // then rewritten column-by-column by each stripe for ALL 200 lines.
-static int right[HEIGHT];
+static iter_t right[HEIGHT];
 
 // Plot a pixel from its iteration count (reference formula + dither).
 void plot_iter(int x, int y, int iter) {
-    plot(x, y, COLOR(iter, (x ^ y) & 1));
+    xplot(x, y, COLOR(iter, (x ^ y) & 1));
 }
 
 // Compute and plot one line of the stripe, pixel by pixel, right to left.
@@ -363,7 +419,7 @@ void plot_iter(int x, int y, int iter) {
 // y = the line. Stores the LEFT pixel's value into right[y] (the next
 // stripe's right column) and returns the common value if the line is
 // uniform, -1 if not.
-int line_uniform(int cr, int ci, int bx, int bw, int y, int *right) {
+int line_uniform(int cr, int ci, int bx, int bw, int y, iter_t *right) {
     int x, v, col, one = 1, step_x = STEP_X;
 
     col = v = iterate(cr, ci);
@@ -389,7 +445,8 @@ int line_uniform(int cr, int ci, int bx, int bw, int y, int *right) {
 // cr = cr of the stripe's RIGHT pixel (x = bx+bw-1) - constant for the
 // whole stripe. ci = ci of the bottom line (y = HEIGHT-1).
 void stripe(int bx, int bw, int cr, int ci) {
-    int one = 1, step_y = STEP_Y, step_x = STEP_X, *prev = &right[HEIGHT];
+    int one = 1, step_y = STEP_Y, step_x = STEP_X;
+    iter_t *prev = &right[HEIGHT];
     int crL, old, yu, yf, col, v, y, x;
 
     // cr of the stripe's LEFT column x = bx (cr decreases leftwards)
@@ -418,7 +475,7 @@ void stripe(int bx, int bw, int cr, int ci) {
         // --- phase 3: interior, checked from its bottom line upward ---
 	bw -= one; bx += one;
 	for(v=-1; y<yu && (v-col); ci -=step_y, y += one) {
-	    v = line_uniform(cr, ci, bx, bw, y, (int*)0);
+	    v = line_uniform(cr, ci, bx, bw, y, (iter_t*)0);
         }
         // rectangle [y-1..yu] confirmed: fill the lines above yc with no
         // iterate() at all - left edge already plotted in phase 2,
