@@ -90,23 +90,23 @@ NEG_    com     <R0hi
         com     <R0hi+1
         ldd     #0
         subd    <R0lo
-        bcc     NEG_Yx
+        std     <R0lo
+        bcs     NEG_Yx
         inc     <R0hi+1
         bne     NEG_Yx
         inc     <R0hi
-        std     <R0lo
         rts
 
 NEG_Y   com     ,y
         com     1,y
         ldd     #0
         subd    2,y
-        bcc     NEG_Yx
+        std     2,y
+        bcs     NEG_Yx
         inc     1,y
         bne     NEG_Yx
         inc     ,y
-NEG_Yx  std     <R0lo
-        rts
+NEG_Yx  rts
 
 * boolean
 * ========

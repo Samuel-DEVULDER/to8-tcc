@@ -1,4 +1,4 @@
-#if 1
+#if 0
 char *f(char *s, char *d) {
 	while(*d++ = *s++);
 	return d-1;
@@ -162,3 +162,14 @@ int i = 0x01020304, *pi=&i;
 short sh = 0x0102;
 char ch =  0x01;
 #endif
+
+struct foo {
+	int a;
+	int b;
+} c;
+
+void cx_foo(void) {
+	struct foo *p=&c;
+	p->a = 0;
+	p->b = 1;
+}

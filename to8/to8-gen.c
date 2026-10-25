@@ -3238,6 +3238,26 @@ void gen_opi(int op)
         vtop->r2 = VT_CONST;
         return;
     }
+    
+    /* v8.31.0: commutative op, LEFT already in R0, RIGHT constant.
+     * R0 holds the left operand and +,*,&,|^ ignore operand order:
+     * "R0 = R0 + c0" is a single ADDi. Kills the whole
+     * pre-spill + const-load + spill-and-reload dance:
+     *   ST pre ; LDi c0 ; ST tmp ; LD pre ; ADD tmp  (5 émises, 1 morte)
+     * becomes:
+     *   ADDi c0
+     * Symétrique du fast path v7.39.0 ci-dessus, qui ne couvre que les
+     * NON-commutatifs (où R0=gauche est une obligation, pas un luxe). 
+     */
+     if (v0_is_const && v1 == TREG_R0 && to8_is_commutative(op)) {
+         to8_opcode slot_op, imm_op;
+         if (to8_get_arith_ops(op, &slot_op, &imm_op) < 0) { vpop(); vpop(); return; }
+         vpop();                 /* drop the constant right operand */
+         e_op_imm(imm_op, c0);   /* R0 += c0 — no pre-spill, no spill-and-reload */
+         vtop->r = TREG_R0;
+         vtop->r2 = VT_CONST;
+         return;
+     }
 
 #if 1
     if (v1 == TREG_R0) {
