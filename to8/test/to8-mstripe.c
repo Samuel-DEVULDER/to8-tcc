@@ -649,7 +649,7 @@ void stripe(int bx, int bw, f8p24 cr, f8p24 ci) {
 	iter_t *prev = &right[HEIGHT];
 	int old, col, v, y;
 	
-	for (/*ci -= step_y, */y = HEIGHT-1; y;) {
+	for (/*ci -= step_y,*/ y = HEIGHT; y;) {
 		// --- phase 1: plain line scan until a uniform line (or y < 0) ---
 		do {
 			ci += step_y; y -= one;
@@ -706,7 +706,7 @@ void mandelbrot(void) {
 
 	// init right[] with the off-screen column x = WIDTH (just right of the
 	// screen): computed, never plotted. ci runs bottom -> top.
-	cr = cr_base + conf.cr_dlt; ci = ci_base /* - step_y */;
+	cr = cr_base + conf.cr_dlt; ci = ci_base /*- step_y*/;
 	for(y = HEIGHT; y;) {
 		right[y -= one] = iterate(cr, ci += step_y);
 	}
