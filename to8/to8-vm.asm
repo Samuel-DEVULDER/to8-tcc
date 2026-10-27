@@ -265,16 +265,17 @@ opLDi   pulu    d,x,y
 
 opLEA   pulu    b,y
         leax    b,s
-        clrb            ;assuming  a=0
-        bra     opSTR0
+        ldd     #0
+        bra     opLDi+2
 
 opLD    pulu    b,y
-        leax    b,s
-        ldd     ,x
-        ldx     2,x
-opSTR0  std     <R0hi
+        ldx     b,s
+        stx     <R0hi
+        addb    #2
+        ldx     b,s
         stx     <R0lo
         jmp     ,y
+
 
 opMOV   pulu    d,y
         ldx     b,s
