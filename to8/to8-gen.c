@@ -2282,10 +2282,10 @@ static void slot_desc(char *out, size_t outsz, int slot)
 static const char *to8_size_name(to8_opcode op)
 {
     switch (op) {
-    case OP_LD1: case OP_ST1: return "signed char";
-    case OP_LDu1: return "unsigned char";
-    case OP_LD2: case OP_ST2: return "signed short";
-    case OP_LDu2: return "unsigned short";
+    case OP_LD1: case OP_ST1: case OP_LD1m: case OP_ST1m: return "signed char";
+    case OP_LDu1: case OP_LDu1m: return "unsigned char";
+    case OP_LD2: case OP_ST2: case OP_LD2m: case OP_ST2m: return "signed short";
+    case OP_LDu2: case OP_LDu2m: return "unsigned short";
     default: return "int";
     }
 }
