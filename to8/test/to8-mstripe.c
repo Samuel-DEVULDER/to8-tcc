@@ -605,33 +605,26 @@ void init_conf(struct config *conf, iter_t max_iter,
         // conf->cr_dlt = STEP_X;
         // conf->ci_dlt = STEP_Y;
         
-        // fill colors: cyclic palette of 60 levels, c = 2..61 = 15 hardware
-        // colors x 4 steps: solid, 75/25, 50/50, 25/75 toward the NEXT
-        // color (pair packed in one byte: low nibble = base, high nibble =
-        // next, 15 folds back to 1 so the wrap is graded too). The step is
-        // a pure function of the index - the cycle length 60 being a
-        // multiple of 4, plot_iter derives it as (max_iter - iter) & 3,
-        // no extra table. 3 graded dithers between consecutive colors
-        // instead of 1: the green->red ramp (and the 15 -> 1 wrap) become
-        // progressive.
+        // fill colors: cyclic palette of 31 levels, c = 1..31 = 15 hardware
+        // colors x (solid + 50/50 checkerboard toward the NEXT color), the
+        // 31 -> 1 wrap being graded by the same checkerboard. Stored
+        // pre-shifted by +1 so that plot_iter only does (p + ((x+y)&1))>>1.
         for(int c = one, i = max; i -= one;) {
-                col[i] = c;
+                col[i] = c + 1;
                 if(i<=max_iter && (c+=one)==32) c = one;
         }
         col[0] = 0;
 }
 
-// Plot a pixel from its iteration count. conf.col[] holds the level's
-// PAIR of hardware colors (low nibble = base, high = next; solid levels
-// repeat the base). Step inside the 60-level cycle = (max_iter-iter)&3:
-// 0 solid, 1 = 75/25, 2 = 50/50 checkerboard (x^y), 3 = 25/75. The lone pixel
-// of the weighted stipples sits on a 4-px brick lattice, (x+2*(y&1))&3,
-// so the dots do not align into columns. col[0] = 0 still gives the
-// black interior with no extra test.
+// Plot a pixel from its iteration count. conf.col[] maps the iteration to
+// the 31-level cycle, pre-shifted by +1 at fill time, so the only work is
+// (p + ((x+y)&1)) >> 1: level p becomes the 50/50 (x+y)&1 checkerboard of
+// hardware colors p..p+1, and 16 folds back to 1 (the red <-> purple wrap).
+// col[0] = 0 still gives the black interior with no extra test.
 void plot_iter(int x, int y, int iter) {
 	int p = conf.col[iter];
 	if(p) {
-		p = 1+((p+((x+y)&1)-1)>>1);
+		p = (p+((x+y)&1))>>1;
 		xplot(x, y, p==16?1:p);
 	}
 }
@@ -644,7 +637,7 @@ int iterate(f8p24 cr, f8p24 ci) {
     
     f8p24 m, zr2, zi2, w2;
 
-    conf.n_iter += one;
+    conf.n_iter = one + conf.n_iter;   /* global load on the right: LD2m + ADD direct, no spill */
 
     do {
         zi2 = fsqr(zi);
@@ -791,8 +784,8 @@ void main(int ac,  char **av) {
 
         // INIT(32, -0.74f ,0.00f, 2.20f);
         /* ── The classics ───────────────────────────────────────────── */
-        // INIT(32,  -0.740000, 0.000000, 2.2000);  /* full view (yours)          */
-        INIT(1024,  -0.744300, 0.131800, 0.0050); /* Seahorse Valley     */
+        INIT(32,  -0.740000, 0.000000, 2.2000);  /* full view (yours)          */
+        // INIT(1024,  -0.744300, 0.131800, 0.0050); /* Seahorse Valley     */
         // INIT(1024, -0.7436439, 0.1318259, 0.0025);  /* Misiurewicz point, centered */
         // INIT(1024, -0.7268953, 0.1888871, 0.0025);  /* Triple Spiral / Julia Island */
         // INIT(256, -1.764878, 0.000000, 0.0600);
