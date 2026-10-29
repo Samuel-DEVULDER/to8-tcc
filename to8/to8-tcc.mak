@@ -53,6 +53,9 @@ git-pull-all:
 	@echo "	end	init" >>$@
 	@rm '.$(shell basename "$*").o'
 
+# keep the generated .asm (not an intermediate to be auto-deleted)
+.PRECIOUS: %.asm
+
 C6809=$(TOP)/to8/c6809/c6809$(EXESUF)
 %.bin: %.asm $(C6809)
 	$(C6809) -oOP $< $@
@@ -66,7 +69,7 @@ SAPFS=$(TOP)/to8/sapfs/sapfs$(EXESUF)
 	@$(SAPFS) -a $@ AUTO.BAT
 	@BASE=$$(basename $< .bin | tr 'a-z' 'A-Z' | cut -c1-8); \
 	BIN="$$BASE.BIN"; mv $< .$$BIN; mv .$$BIN $$BIN;\
-	printf >AUTO.BAS "\\r\\n10 BANK2:CLEAR,&H71FF:LOADM\"%s\",,R" "$$BIN"; \
+	printf >AUTO.BAS "\\r\\n10 BANK2:CLEAR,&H71FF:LOADM\"%s\",,R\\r\\n" "$$BIN"; \
 	$(SAPFS) -a $@ AUTO.BAS; \
 	$(SAPFS) -a $@ $$BIN
 	$(SAPFS) -t $@
