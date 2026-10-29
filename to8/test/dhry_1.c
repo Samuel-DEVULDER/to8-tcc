@@ -49,11 +49,12 @@ _cvt(int val, char *buf, int radix, char *digits)
 static int
 _vprintf(void (*putc)(char c, void **param), void **param, const char *fmt, va_list ap)
 {
-    char buf[sizeof(long long)*8];
-    char c, sign, *cp=buf;
-    int left_prec, right_prec, zero_fill, pad, pad_on_right, 
+    char buf[sizeof(long)*4]; /* int fits: 11 digits + NUL (frame limit) */
+    int c; /* int, not char: switch/if compares on char mis-take their cases */
+    char sign, *cp=buf;
+    int left_prec, right_prec, zero_fill, pad, pad_on_right,
         i, islong, islonglong;
-    long long val = 0;
+    int val = 0; /* 32-bit only: Dhrystone values fit, avoids 64-bit args */
     int res = 0, length = 0;
 
     while ((c = *fmt++) != '\0') {
@@ -64,7 +65,7 @@ _vprintf(void (*putc)(char c, void **param), void **param, const char *fmt, va_l
             // Fetch value [numeric descriptors only]
             switch (c) {
             case 'd':
-                    val = (long long)va_arg(ap, int);
+                    val = va_arg(ap, int);
                 if ((c == 'd') || (c == 'D')) {
                     if (val < 0) {
                         sign = '-';
@@ -83,26 +84,22 @@ _vprintf(void (*putc)(char c, void **param), void **param, const char *fmt, va_l
                 break;
             }
             // Process output
-            switch (c) {
-            case 'd':
-                switch (c) {
-                case 'd':
-                    length = _cvt(val, buf, 10, "0123456789");
-                    break;
-                }
+            /* if/else chain: the second switch (c) mis-dispatches under
+             * this backend's -O and falls into default, printing "%d"
+             * literally (the first switch on the same c matches fine). */
+            if (c == 'd') {
+                length = _cvt(val, buf, 10, "0123456789");
                 cp = buf;
-                break;
-            case 's':
+            } else if (c == 's') {
                 cp = va_arg(ap, char *);
                 length = 0;
                 while (cp[length] != '\0') length++;
-                break;
-            case 'c':
+            } else if (c == 'c') {
                 c = va_arg(ap, int /*char*/);
                 (*putc)(c, param);
                 res++;
                 continue;
-            default:
+            } else {
                 (*putc)('%', param);
                 (*putc)(c, param);
                 res += 2;
@@ -190,18 +187,18 @@ extern long     time();
                 /* Measurements should last at least 2 seconds */
 #endif
 
-long long           Begin_Time,
+long                Begin_Time,
                 End_Time,
                 User_Time;
-long long            Microseconds,
+long               Microseconds,
                 Dhrystones_Per_Second,
                 Vax_Mips;
-                
+
 /* end of variables for time measurement */
 
 int             Number_Of_Runs = 50000;
 
-extern long long _readMicroseconds();
+extern long _readMicroseconds();
 
 One_Fifty       Int_1_Loc;
 One_Fifty       Int_2_Loc;
@@ -418,9 +415,10 @@ static  Rec_Type	_m1, _m2;
 #endif
 #else
     Microseconds = User_Time  / Number_Of_Runs;
-    Dhrystones_Per_Second =  ((long long)Number_Of_Runs*1000000) / User_Time;
-    Vax_Mips = (((long long)Number_Of_Runs)*1000000000) / (1757*User_Time);
-#endif 
+    /* 32-bit-safe forms: DPS = 1e6/us-per-run, Vax MIPS = DPS/1757 */
+    Dhrystones_Per_Second =  1000000 / Microseconds;
+    Vax_Mips = Dhrystones_Per_Second / 1757;
+#endif
     small_printf ("Microseconds for one run through Dhrystone: ");
     small_printf ("%d \n", (int)Microseconds);
     small_printf ("Dhrystones per Second:                      ");
