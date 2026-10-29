@@ -3537,25 +3537,44 @@ void gfunc_call(int nb_args)
 {
     int i, size;
     SValue *func = &vtop[-nb_args];
+    int arg_size = 0;
 
     for (i = 0; i < nb_args; i++) {
         SValue *sv = &vtop[-i];
         int v = sv->r & VT_VALMASK;
-        if (v == VT_CONST && !(sv->r & VT_SYM) && !(sv->r & VT_LVAL)) {
+        int is64 = ((sv->type.t & VT_BTYPE) == VT_LLONG);
+        if (is64 && v == VT_CONST && !(sv->r & VT_SYM) && !(sv->r & VT_LVAL)) {
+            /* QLONG immediate: 8 bytes, high word then low word
+             * (pushes grow down; callee sees [lo][hi] contiguous) */
+            e_push_imm((int)(sv->c.i >> 32));
+            e_push_imm((int)sv->c.i);
+            arg_size += 8;
+        } else if (is64 && v == VT_LOCAL) {
+            /* QLONG local: 8-byte value at [c.i] (lo) and [c.i+4] (hi);
+             * push hi first so it lands at the higher address, matching
+             * gfunc_prolog's 8-byte param slots */
+            e_push_slot(sv->c.i + 4);
+            e_push_slot(sv->c.i);
+            arg_size += 8;
+        } else if (v == VT_CONST && !(sv->r & VT_SYM) && !(sv->r & VT_LVAL)) {
             e_push_imm(sv->c.i);                /* immediate rvalue */
+            arg_size += 4;
         } else if ((sv->r & VT_SYM) && !(sv->r & VT_LVAL)) {
             e_push_addr(sv->sym, sv->c.i);      /* TRUE address arg: &x, array
                                                    decay, function name */
+            arg_size += 4;
         } else if (v == VT_LOCAL) {
             e_push_slot(sv->c.i);               /* local: slot holds the value */
+            arg_size += 4;
         } else {
             load(TREG_R0, sv);                  /* everything else: global lvalue
                                                    (-> LD4m), *pp (-> LDxr),
                                                    spilled VT_LLOCAL (-> LD4) */
             e_push_r0();
+            arg_size += 4;
         }
     }
-    
+
     save_regs(0);
 
     if ((func->r & VT_VALMASK) == VT_CONST && (func->r & VT_SYM)) {
@@ -3569,7 +3588,7 @@ void gfunc_call(int nb_args)
     }
 
     if (nb_args > 0) {
-        size = nb_args * PTR_SIZE;
+        size = arg_size;
         to8_adjust(size);
     }
 
