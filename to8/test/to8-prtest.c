@@ -22,8 +22,6 @@ static int _cvt(int val, char *buf, int radix, char *digits)
     char *cp = temp;
     int length = 0;
 
-    outbyte('D'); outbyte(digits[0]); outbyte(digits[1]); /* expect '0','1' */
-    outbyte('{'); outbyte(buf[0]); outbyte('}');          /* caller's buf[0] */
 
     if (val == 0) {
         *cp++ = '0';
@@ -54,12 +52,6 @@ static void _vprintf(void (*putc)(), const char *fmt, va_list ap)
             c = *fmt++;
             if (c == 'd') {
                 val = va_arg(ap, int);
-                outbyte('V');
-                outbyte('0' + (val / 10000));      /* '5' if val==50000 */
-                outbyte('A' + ((int)ap & 0xF));    /* low nibble of ap */
-                length = _cvt(val, buf, 10, "0123456789");
-                outbyte('L');
-                outbyte('0' + length);
                 cp = buf;
             } else {
                 (*putc)('%');
@@ -68,9 +60,7 @@ static void _vprintf(void (*putc)(), const char *fmt, va_list ap)
             }
             while (length-- > 0) {
                 c = *cp++;
-                outbyte('[');          /* probe: loop body reached */
-                outbyte(c);            /* DIRECT call instead of (*putc)(c) */
-                outbyte(']');
+                (*putc)(c);
             }
         } else {
             (*putc)(c);

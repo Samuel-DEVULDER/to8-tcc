@@ -96,22 +96,22 @@ _vprintf(void (*putc)(char c, void **param), void **param, const char *fmt, va_l
                 while (cp[length] != '\0') length++;
             } else if (c == 'c') {
                 c = va_arg(ap, int /*char*/);
-                outbyte(c);
+                 (*putc)(c, param);
                 res++;
                 continue;
             } else {
-                outbyte('%');
-                outbyte(c);
+                 (*putc)('%', param);
+                 (*putc)(c, param);
                 res += 2;
                 continue;
             }
             while (length-- > 0) {
                 c = *cp++;
-                outbyte(c);
+                (*putc)(c, param);
                 res++;
             }
         } else {
-            outbyte(c);
+            (*putc)(c, param);
             res++;
         }
     }
@@ -121,7 +121,7 @@ _vprintf(void (*putc)(char c, void **param), void **param, const char *fmt, va_l
 
 // Default wrapper function used by diag_printf
 static void
-_diag_write_char(char c, void **param)
+_diag_write_char(char c,  void **param)
 {
 	if (c=='\n')
 	{

@@ -298,7 +298,7 @@ void put_time(unsigned t) {
 
 // --- Stripe width (the left-most stripe is narrower if BLK_W does not
 //     divide WIDTH) ---
-#define BLK_W 5
+#define BLK_W 4
 
 typedef int f8p24;
 
@@ -551,10 +551,10 @@ void init_conf(struct config *conf, iter_t max_iter,
         // 31 -> 1 wrap being graded by the same checkerboard. Stored
         // pre-shifted by +1 so that plot_iter only does (p + ((x+y)&1))>>1.
         for(int c = one, i = max; i -= one;) {
-                col[i] = c + 1;
+                i[col] = c + 1;
                 if(i<=max_iter && (c+=one)==32) c = one;
         }
-        col[0] = 0;
+        0[col] = 0;
 }
 
 // Plot a pixel from its iteration count. conf.col[] maps the iteration to
@@ -624,7 +624,7 @@ int line_uniform(f8p24 cr, f8p24 ci, int bx, int bw, int y, iter_t *right) {
                         break;
                 }
         }
-        if(right) *right = v;          // v = left pixel (x = bx)
+        if(right) 0[right] = v;          // v = left pixel (x = bx)
         return col;
 }
 
@@ -725,11 +725,11 @@ void main(int ac,  char **av) {
 
         // INIT(32, -0.74f ,0.00f, 2.20f);
         /* ── The classics ───────────────────────────────────────────── */
-        INIT(32,  -0.740000, 0.000000, 2.2000);  /* full view (yours)          */
+        // INIT(32,  -0.740000, 0.000000, 2.2000);  /* full view (yours)          */
         // INIT(1024,  -0.744300, 0.131800, 0.0050); /* Seahorse Valley     */
         // INIT(1024, -0.7436439, 0.1318259, 0.0025);  /* Misiurewicz point, centered */
         // INIT(1024, -0.7268953, 0.1888871, 0.0025);  /* Triple Spiral / Julia Island */
-        // INIT(256, -1.764878, 0.000000, 0.0600);
+        INIT(256, -1.764878, 0.000000, 0.0600);
         // INIT(96,   0.277000, 0.004000, 0.0040);  /* Elephant Valley (trunks)         */
         // INIT(128, -0.726900, 0.188900, 0.0040);  /* Triple Spiral / "Julia Island"    */
         // INIT(96,  -0.745300, 0.112700, 0.0080);  /* double spiral ("Sandstorm")      */
