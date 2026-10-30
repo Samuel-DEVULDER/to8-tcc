@@ -1,8 +1,53 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.30.0 (new peephole: useless JRA removed -- "JRA next" no-op)
+ * Version : 8.32.0 (v8.18.0 class closed: CMP/SHL fix, shared remedy, slot-0 tripwire)
  *
  * Changelog:
+ * - v8.32.0 CORRECTNESS FIX + consolidation: the CMP and SHL branches of
+ *   gen_opi()/gen_opi_shift() still had the v8.18.0 blind spot - a GLOBAL
+ *   left operand (VT_CONST|VT_LVAL|VT_SYM, c.i = symbol addend, 0 for a
+ *   plain scalar) taken raw as a stack slot. The comparison branch then
+ *   emitted spill_and_reload(c1) = "ST temp ; LD 0", whose LD read raw
+ *   slot 0 = the RETURN BLOCK ([S0+frame_size], the D+X saved by the
+ *   caller's opCALLm): Dhrystone "while (Int_1_Loc < Int_2_Loc)" compiled
+ *   to "CMP2 24,12" (and "Enum_Loc == Func_1(...)" to "CMP2 32,12" at
+ *   push_depth 8 - same garbage word [S0+24]) - the comment renderer
+ *   labels slot 0 exactly "param[-1]" (slot/4 - 1). Every comparison of
+ *   two scoping globals thus compared Int_1_Loc's VALUE against garbage
+ *   >= 3, the while never executed, and all derived results were wrong.
+ *
+ *   1) to8_left_const_global(): the address-read remedy (v8.18.0's
+ *   "ST temp ; load(TREG_R0, vtop - 1)" pattern) had been duplicated
+ *   inline in gen_opi()'s commutative and non-commutative branches;
+ *   both now call this one helper, and the CMP/SHL fixes (2) use it
+ *   too - so the global-operand remedy exists exactly once for the
+ *   four integer branches.
+ *
+ *   2) Fix applied via the helper: the CMP branch (after its gv(RC_R0);
+ *   the true-literal fast paths at the top of the branch are untouched)
+ *   and gen_opi_shift()'s non-const-amount path, same test. The left
+ *   operand now loads through load()'s VT_SYM dispatch (LD4m 0,_sym),
+ *   and since the fused CMP2 form only covers LD+OP pairs of plain
+ *   slots, the peephole can no longer freeze a return-block operand
+ *   into the listing.
+ *
+ *   3) TRIPWIRE in slot_desc(): raw slot 0 has NO legal owner (locals/
+ *   temps <= -4, params >= +4, struct-return ptr at +4), so any operand
+ *   referencing it aborts at compile time with the plausible diagnostic
+ *   instead of generating silently wrong code. Rendered operand 0 is
+ *   still legal (first word of the locals region). Labels "param[-1]"
+ *   and "local[-1]" are now impossible by construction. Tripwire alone
+ *   verified: the 4 reference-suite listings stayed bit-identical and
+ *   Dhrystone aborted with "dhry_1.c:227 ... in main_loop" (exactly the
+ *   bug site) before the fix was applied.
+ *
+ *   Verified: with the fix, Dhrystone's two comparison sites emit
+ *   "LD4m 0,_Int_1_Loc"/"LD4m 0,_Enum_Loc" before "CMP 12"; full test
+ *   suite listings bit-identical elsewhere; on-target Dhrystone run
+ *   produces correct values. Same class as v8.18.0 (ADD/SUB/MUL/DIV/MOD)
+ *   and v8.27.0 (gfunc_call arguments) - now every integer binary-op
+ *   operand consumer routes global left operands through load().
+ *
  * - v8.30.0 new peephole to8_peephole_useless_jra(): removes a JRA whose
  *   target is the IMMEDIATELY NEXT line -- an unconditional jump to the
  *   fall-through address is a pure no-op transfer. Found on plot_iter():
@@ -1806,6 +1851,7 @@ static int g_by_id_cap;
 
 static int g_pending_target_id;
 static int g_frame_size;
+static char to8_func_name[256];
 
 static int g_count_before, g_count_after;
 static int g_banner_done;
@@ -2269,6 +2315,22 @@ static const char *to8_slot_name(int slot)
 static void slot_desc(char *out, size_t outsz, int slot)
 {
     const char *name = to8_slot_name(slot);
+
+    /* TRIPWIRE: raw slot 0 is the return block (the 4-byte save area
+     * pushed by the caller's opCALLm). No local (<= -4), no temp (<= -4)
+     * and no parameter (>= +4) ever lives there. A slot-0 operand means
+     * something was emitted with a non-slot c.i misread as a frame slot
+     * - the classic case being a global lvalue's c.i (= symbol addend,
+     * 0 for a plain scalar), formerly rendered with the misleading
+     * "param[-1]" label (CMP2 24,12 in Dhrystone's "while (Int_1_Loc <
+     * Int_2_Loc)"). Abort instead of silently generating wrong code.
+     * Note: this is about the RAW slot, not the rendered operand - a
+     * rendered "0" is perfectly legal (first word of the locals region,
+     * e.g. "ST 0 ; local[5]", raw slot = -frame_size). */
+    if (slot == 0)
+        tcc_error("TO8 internal error: operand references raw slot 0 "
+                  "(return block, previously labeled \"param[-1]\") in %s",
+                  to8_func_name);
 
     if (name) {
         snprintf(out, outsz, "%s", name);
@@ -3025,6 +3087,40 @@ static int to8_spill_and_reload(int left_slot)
     return temp;
 }
 
+/* ===================================================================
+ * to8_left_const_global - materialize a LEFT operand still in its
+ * address-encoded SValue (VT_CONST [+VT_LVAL] && VT_SYM: c.i holds the
+ * symbol ADDEND, 0 for a plain scalar - v8.18.0 documented the family,
+ * "never its runtime value"). Adding such a value to any expression
+ * would read raw slot 0 - the return block (ex-"param[-1]"), now
+ * caught by slot_desc's tripwire.
+ *
+ * Precondition: the caller has loaded the RIGHT operand into R0
+ * (its gv(RC_*) call just happened) and the LEFT boolean test
+ * ("v1 == VT_CONST && (vtop[-1].r & VT_SYM)") just selected this path.
+ * This helper spills the right operand into a fresh temp slot, then
+ * lets load() fetch the LEFT operand's real value into R0 (LD4m _sym
+ * for a global lvalue, LDi _sym for a bare symbol address - load()
+ * dispatches both correctly). Returns the temp slot now holding the
+ * right operand, ready for the caller's slot-form OP; the caller
+ * frees it right after emitting the op.
+ * Used by: gen_opi (commutative/non-commutative slots), the CMP branch,
+ * and gen_opi_shift - the remedy pattern is written exactly once here.
+ * =================================================================== */
+static int to8_left_const_global(void)
+{
+    int temp = to8_temp_alloc(4, 4);
+
+    /* Spill the right operand currently in R0 into a fresh temp. */
+    e_op_slot(OP_ST, temp);
+
+    /* Fetch the LEFT operand's real value (its address, resolved by
+     * load()'s VT_SYM dispatch) into R0. */
+    load(TREG_R0, vtop - 1);
+
+    return temp;
+}
+
 static void gen_opi_shift(int op)
 {
     to8_opcode slot_op, imm_op;
@@ -3056,6 +3152,21 @@ static void gen_opi_shift(int op)
             c1 = vtop[-1].c.i;
         }
         /* v7.28.1 fix: pass the EXACT left operand slot, handling TREG_R1 too */
+        if (v1 == VT_CONST && (vtop[-1].r & VT_SYM)) {
+            /* v-remake: identical blind spot to the CMP branch - a GLOBAL
+             * left operand (e.g. "glob << x") carries c.i = addend, not a
+             * slot; the raw spill_and_reload(c1) read the return block.
+             * Same v8.18.0 remedy: spill the right operand already in R0
+             * (gv(RC_INT) above), load the real left value, then shift
+             * against the spilled right slot. */
+            int temp = to8_left_const_global();
+            e_op_slot(slot_op, temp);
+            to8_temp_free(temp, 4, 4);
+            vtop--;
+            vtop->r = TREG_R0;
+            vtop->r2 = VT_CONST;
+            return;
+        }
         int left_slot = c1;
         temp = to8_spill_and_reload(left_slot);
         e_op_slot(slot_op, temp);
@@ -3152,6 +3263,27 @@ void gen_opi(int op)
         gv(RC_R0);
         v1 = vtop[-1].r & VT_VALMASK;
         c1 = vtop[-1].c.i;
+
+        if (v1 == VT_CONST && (vtop[-1].r & VT_SYM)) {
+            /* v-remake: the comparison branch never had the v8.18.0
+             * dispatch - a GLOBAL left operand (VT_CONST|VT_LVAL|VT_SYM,
+             * c.i = addend = 0 for a plain scalar) was taken raw as
+             * left_slot, reading raw slot 0 = the return block (ex-
+             * "param[-1]"): CMP2 24,12/CMP2 32,12 in Dhrystone's
+             * "while (Int_1_Loc < Int_2_Loc)" and "Enum_Loc == Func_1
+             * (...)", comparing against garbage every iteration. Reaching
+             * here with v1 == VT_CONST implies VT_SYM (a true literal
+             * left was vswapped above; literal right was folded above),
+             * so the test selects exactly the global class. Remedy:
+             * spill the right operand already in R0, load() the real
+             * left value, then compare against the spilled right slot. */
+            int temp = to8_left_const_global();
+            e_op_slot(is_unsigned_cmp ? OP_UCMP : OP_CMP, temp);
+            to8_temp_free(temp, 4, 4);
+            vtop--;
+            vset_VT_CMP(op);
+            return;
+        }
 
         {
             int left_slot = c1;
@@ -3314,13 +3446,11 @@ void gen_opi(int op)
             } else if (v1 == VT_CONST && (vtop[-1].r & VT_SYM)) {
                 /* Left operand is a GLOBAL SYMBOL (e.g. Int_1_Loc):
                  * c1 is its addend (0 for a plain scalar), NOT its
-                 * value. R0 currently holds the RIGHT operand (from
-                 * gv(RC_INT) earlier in gen_opi): spill it first,
-                 * then let load() fetch the LEFT operand's real
-                 * value into R0, then combine. */
-                int right_tmp = to8_temp_alloc(4, 4);
-                e_op_slot(OP_ST, right_tmp);
-                load(TREG_R0, vtop - 1);
+                 * value (v8.18.0 remedy). Factored into the shared
+                 * to8_left_const_global() helper (also used by the
+                 * CMP and SHL branches) - emitted sequence identical,
+                 * the raw e_op_slot(OP_ST/OP_LD) copy lived here. */
+                int right_tmp = to8_left_const_global();
                 e_op_slot(slot_op, right_tmp);
                 to8_temp_free(right_tmp, 4, 4);
             } else if (v1 == TREG_R0) {
@@ -3335,10 +3465,10 @@ void gen_opi(int op)
             /* Non-commutative: SUB, DIV, MOD */
             if (v1 == VT_CONST) {
                 /* Left operand is a constant OR a global symbol -
-                 * load() handles BOTH correctly. */
-                int temp = to8_temp_alloc(4, 4);
-                e_op_slot(OP_ST, temp);      /* spill current R0 (right operand) */
-                load(TREG_R0, vtop - 1);     /* R0 = left operand's real value */
+                 * load() handles BOTH correctly (v8.18.0 remedy,
+                 * factored into the shared to8_left_const_global()
+                 * helper: identical emitted sequence). */
+                int temp = to8_left_const_global();
                 e_op_slot(slot_op, temp);    /* R0 = left OP spilled_right */
                 to8_temp_free(temp, 4, 4);
             } else {
@@ -4719,7 +4849,6 @@ static void to8_peephole_run(void)
  * =================================================================== */
 
 static to8_line *to8_func_adj_line;
-static char to8_func_name[256];
 static int to8_func_no;
 
 static int to8_final_slot(int raw_slot, int push_depth)
