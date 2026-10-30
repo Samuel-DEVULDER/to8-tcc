@@ -193,6 +193,7 @@ long                Begin_Time,
 long               Microseconds,
                 Dhrystones_Per_Second,
                 Vax_Mips;
+long               User_Sec, User_Tenth;
 
 /* end of variables for time measurement */
 
@@ -390,8 +391,14 @@ static  Rec_Type	_m1, _m2;
   small_printf ("\n");
 
   User_Time = End_Time - Begin_Time;
-  small_printf ("User time: %d\n", (int)User_Time);
-  
+  /* Display units: raw count is microseconds; add the human-friendly
+   * one-decimal seconds next to it (us granularity is 0.1 s anyway,
+   * the 10 Hz CLK - so the tenth is exact, no rounding). */
+  User_Sec   = User_Time / 1000000;
+  User_Tenth = (User_Time / 100000) % 10;
+  small_printf ("User time: %d us (%d.%d s)\n", (int)User_Time,
+                (int)User_Sec, (int)User_Tenth);
+
   if (User_Time < Too_Small_Time)
   {
     small_printf ("Measured time too small to obtain meaningful results\n");
@@ -415,12 +422,15 @@ static  Rec_Type	_m1, _m2;
 #endif
 #else
     Microseconds = User_Time  / Number_Of_Runs;
-    /* 32-bit-safe forms: DPS = 1e6/us-per-run, Vax MIPS = DPS/1757 */
+    /* 32-bit-safe forms: DPS = 1e6/us-per-run, Vax MIPS = DPS/1757.
+     * Like the original 64-bit form (runs*1e9/(1757*User_Time)), keep
+     * the *1000 in the NUMERATOR before the /1757 -- DPS/1757 alone
+     * truncates to 0 for any sub-supercomputer machine (18/1757=0). */
     Dhrystones_Per_Second =  1000000 / Microseconds;
-    Vax_Mips = Dhrystones_Per_Second / 1757;
+    Vax_Mips = (Dhrystones_Per_Second * 1000) / 1757;
 #endif
     small_printf ("Microseconds for one run through Dhrystone: ");
-    small_printf ("%d \n", (int)Microseconds);
+    small_printf ("%d us \n", (int)Microseconds);
     small_printf ("Dhrystones per Second:                      ");
     small_printf ("%d \n", (int)Dhrystones_Per_Second);
     small_printf ("VAX MIPS rating * 1000 = %d \n",(int)Vax_Mips);

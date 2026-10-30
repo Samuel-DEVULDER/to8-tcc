@@ -1,8 +1,35 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.32.0 (v8.18.0 class closed: CMP/SHL fix, shared remedy, slot-0 tripwire)
+ * Version : 8.33.0 (merge_adj: no release across pending call args)
  *
  * Changelog:
+ * - v8.33.0 CORRECTNESS FIX in to8_peephole_merge_adj (v8.8.0/v8.22.0):
+ *   the deferred call-arg release could execute AFTER the pending
+ *   pushes of the NEXT call. A merged ADJ flushes at an is_target/
+ *   ARG_JMP/ARG_SLOT line; when the flush landed on the ST that the
+ *   backend spills between a call's PUSH environ and its CALL - in
+ *   Dhrystone's "Int_Comp" struct-deref printf: PUSHr; PUSHi fmt;
+ *   [ADJ 120]; ST 16; CALLm - the ADJ swept the freshly pushed
+ *   fmt/value off the stack. small_printf then read garbage args and
+ *   formatted an unrelated data constant: the totally unconnected
+ *   "Execution starts, 50000 runs through Dhrystone" line printed
+ *   MID-DUMP in the on-target run (and the few preceding
+ *   struct-member label lines vanished - their printfs had eaten
+ *   wrong strings too). Plain-scalar printf sites (no interposed
+ *   slot line) printed fine, which is why the tail of the dump was
+ *   clean.
+ *   Fix (the invariant "an ADJ release must not pass pending call
+ *   args"): OP_PUSH/PUSH/PUSHi lines now flush the chain, finalizing
+ *   the ADJ right BEFORE the first push - exactly where the unmerged
+ *   per-call ADJ executed. Merging no longer spans push sequences
+ *   (each call gets its own release: +1..3 instr in printf-heavy
+ *   functions), which is the price of a sound arg window under the
+ *   lazy-ADJ layout. Verified: to8-dhry now emits "ADJ 8" before the
+ *   Int_Comp PUSH push window; PUSH->ADJ-before-CALL pattern grep =
+ *   0 occurrences across all five test-suite listings; other four
+ *   listings show only the same benign ADJ-placement/slot-renumber
+ *   shifts.
+ *
  * - v8.32.0 CORRECTNESS FIX + consolidation: the CMP and SHL branches of
  *   gen_opi()/gen_opi_shift() still had the v8.18.0 blind spot - a GLOBAL
  *   left operand (VT_CONST|VT_LVAL|VT_SYM, c.i = symbol addend, 0 for a
@@ -4396,6 +4423,26 @@ static int to8_peephole_merge_adj(void) {
             candidate = NULL;
             defer = 0;
             continue;
+        }
+
+        /* v8.33.0 FIX (deferred release vs PENDING call args): a push
+         * line means the NEXT call's argument window is already being
+         * built. A deferred release materialized after those pushes -
+         * the pre-fix fate whenever the chain was flushed at a later
+         * ARG_SLOT line (e.g. the ST that the backend spills before a
+         * CALL) - executes between the pushes and the CALL: it sweeps
+         * the freshly pushed fmt/value off the stack, and the callee
+         * then reads garbage (Dhrystone's "Int_Comp" printf printed
+         * the totally unrelated "Execution starts, 50000 runs"
+         * constant: its pushed fmt pointer lay inside the swept
+         * window). Materialize the release HERE, right before the
+         * first push - i.e. exactly where the unmerged per-call ADJ
+         * would have executed. */
+        if (candidate && defer != 0 &&
+            (cur->op == OP_PUSH || cur->op == OP_PUSHi || cur->op == OP_PUSHr)) {
+            to8_materialize_adj(candidate, cur, defer);
+            candidate = NULL;
+            defer = 0;
         }
 
         if (cur->kind == ARG_SLOT || cur->kind == ARG_SLOT2) {
