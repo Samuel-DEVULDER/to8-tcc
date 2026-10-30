@@ -96,22 +96,22 @@ _vprintf(void (*putc)(char c, void **param), void **param, const char *fmt, va_l
                 while (cp[length] != '\0') length++;
             } else if (c == 'c') {
                 c = va_arg(ap, int /*char*/);
-                (*putc)(c, param);
+                outbyte(c);
                 res++;
                 continue;
             } else {
-                (*putc)('%', param);
-                (*putc)(c, param);
+                outbyte('%');
+                outbyte(c);
                 res += 2;
                 continue;
             }
             while (length-- > 0) {
                 c = *cp++;
-                (*putc)(c, param);
+                outbyte(c);
                 res++;
             }
         } else {
-            (*putc)(c, param);
+            outbyte(c);
             res++;
         }
     }
