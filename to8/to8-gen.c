@@ -3563,8 +3563,14 @@ void gfunc_call(int nb_args)
             e_push_addr(sv->sym, sv->c.i);      /* TRUE address arg: &x, array
                                                    decay, function name */
             arg_size += 4;
-        } else if (v == VT_LOCAL) {
+        } else if (v == VT_LOCAL && (sv->r & VT_LVAL)) {
             e_push_slot(sv->c.i);               /* local: slot holds the value */
+            arg_size += 4;
+        } else if (v == VT_LOCAL) {
+            /* local without VT_LVAL: the VALUE is the address itself
+             * (array decay, &x) - push S+c.i, not the slot content */
+            e_op_slot(OP_LEA, sv->c.i);
+            e_push_r0();
             arg_size += 4;
         } else {
             load(TREG_R0, sv);                  /* everything else: global lvalue
