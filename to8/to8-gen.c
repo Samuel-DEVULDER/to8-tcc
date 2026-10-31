@@ -1,8 +1,26 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.33.0 (merge_adj: no release across pending call args)
+ * Version : 8.33.1 (ADJ relocation re-stamps src_line at execution point)
  *
  * Changelog:
+ * - v8.33.1 COSMETIC FIX in to8_materialize_adj: src_line is stamped
+ *   only at emission and is never renewed on line moves, so the ADJ
+ *   relocated by the v8.33.0 flush rendered the debug marker of the
+ *   call it releases at its new position ("* 232: Proc_7..." printed a
+ *   second time mid-loop-body before the relocated ADJ 12, "* 237:
+ *   Proc_8..." a second time before Proc_1's first push after the
+ *   relocated ADJ 16). A debug marker must reflect where the
+ *   instruction EXECUTES: the relocated ADJ now adopts the flush
+ *   line's stamp (monotonic markers, no oscillating repeats; 345
+ *   markers in to8-dhry, down from 419 - all removals were stale
+ *   re-stamps). Cosmetic only: the instruction streams of all five
+ *   test-suite listings are bit-identical before/after. (Related -
+ *   NOT changed: a loop-bottom JRA stamped with the NEXT statement's
+ *   line, e.g. the back-edge JRA rendered under "* 237: Proc_8..." in
+ *   main_loop, is a pre-existing emission-time artifact: bf->line_num
+ *   is lookahead-based, already advanced to the next token when the
+ *   closing brace of the while is consumed. Harmless display quirk.)
+ *
  * - v8.33.0 CORRECTNESS FIX in to8_peephole_merge_adj (v8.8.0/v8.22.0):
  *   the deferred call-arg release could execute AFTER the pending
  *   pushes of the NEXT call. A merged ADJ flushes at an is_target/
@@ -4407,6 +4425,17 @@ static void to8_materialize_adj(to8_line *candidate, to8_line *before, int defer
     if (before) {
         to8_unlink(candidate);
         to8_insert_after(before->prev, candidate);
+        /* v8.33.1 re-stamp: src_line is only stamped at emission and is
+         * never renewed on line moves, so the relocated ADJ rendered the
+         * marker of the call it releases at its NEW position - e.g.
+         * "* 237: Proc_8..." printed a second time right before Proc_1's
+         * first push. A debug marker must reflect where the instruction
+         * EXECUTES, so adopt the flush line's stamp (monotonic markers,
+         * no oscillation). Cosmetic only: no instruction text changes.
+         * Other peepholes only unlink (delete) lines, never relocate
+         * surviving ones, so this is the sole re-stamp site. */
+        if (before->src_line)
+            candidate->src_line = before->src_line;
     }
     candidate->imm_val = defer;
     imm_comment(candidate->comment, sizeof candidate->comment, OP_ADJ, defer);
