@@ -1,8 +1,55 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.33.1 (ADJ relocation re-stamps src_line at execution point)
+ * Version : 8.34.0 (merge_adj rides through push windows; mid-window flushes redirect to the window start)
  *
  * Changelog:
+ * - v8.34.0 CORRECTNESS+PERF FIX in to8_peephole_merge_adj: v8.33.0's
+ *   flush-on-push restored sound arg windows but destroyed the whole
+ *   merge: a pending chain dies at EVERY push line, so no chain ever
+ *   spans a call sequence and call-heavy functions pay +1..3 instr per
+ *   call - merge_adj's entire purpose lost (to8-dhry: 141 ADJs vs the
+ *   pre-v8.33.0 listing's 69). Gating the v8.33.0 flush on "the function
+ *   contains a LEA" (attempted first) is unsound BOTH ways: the mid-window
+ *   flush trigger is NOT the LEA but Guard #1 on ANY in-window ARG_SLOT
+ *   line - ST/LD spills (the very Dhrystone "Int_Comp" site: ST 16, no
+ *   LEA in sight), PUSH of a local arg (e_push_slot), LEA - so a LEA-free
+ *   function re-opens the swept-args bug, while one LEA anywhere
+ *   re-enables the flush everywhere and keeps the regression.
+ *   Fix: a pending chain RIDES through push windows again (v8.8.0/
+ *   v8.22.0 semantics: merging spans call sequences) under a stronger
+ *   AND cheaper invariant than v8.33.0's: no flush may MATERIALIZE
+ *   between a window's first push and its CALL - the callee reads its
+ *   args at fixed offsets from its entry SP (gfunc_prolog), so an ADJ
+ *   executing there sweeps the freshly pushed args under it. The scan
+ *   tracks the window a pending chain is riding (window_start = its
+ *   first PUSH line; closed at the CALL - placed after Guard #1 so an
+ *   indirect call's own ARG_SLOT operand still redirects); every flush
+ *   that would land mid-window (Guard #1 on an in-window slot line, or
+ *   a label/branch - kept sound though structurally absent) is
+ *   REDIRECTED right before the window's first push - the last point
+ *   where releasing the accumulated windows is still valid (every window
+ *   it releases belongs to a call that has fully returned) - and the
+ *   slot lines crossed inside the window lose the "+= defer" they got on
+ *   the ride (to8_uncompensate_window: the release now executes before
+ *   them). Overflow on the window's first push itself degenerates to
+ *   v8.33.0's placement with an empty undo range. LEA-captured addresses
+ *   stay valid by construction: a LEA crossed while pending is
+ *   compensated (+defer -> true address; its target - a frame local - is
+ *   released never earlier than in unmerged code), a LEA inside a
+ *   redirected window runs with the SP the unmerged code would have.
+ *   Merged releases are only ever LATER than unmerged ones, so nothing
+ *   live before merging can die earlier.
+ *   Verified: mid-window-ADJ invariant grep = 0 occurrences across the
+ *   four test-suite listings (to8-dhry/to8-mandel/to8-mblk/to8-mstripe;
+ *   the pre-fix listing shows 2 x "ADJ 120" mid-window at the Int_Comp
+ *   sites); ADJ counts vs v8.33.1: dhry 141->68, mandel 72->40, mblk
+ *   89->47, mstripe 97->64 (below the pre-fix 69/72/89/97: riding chains
+ *   merge longer than the old mid-window flushes allowed); the Int_Comp
+ *   site now emits the accumulated "ADJ 120" right BEFORE the push
+ *   window (pre-fix: between the pushes and the ST - the bug; v8.33.x:
+ *   "ADJ 8", chain destroyed). d171f690's src_line re-stamp still applies
+ *   (the relocation survives). On-target run (dcmoto): see commit message.
+ *
  * - v8.33.1 COSMETIC FIX in to8_materialize_adj: src_line is stamped
  *   only at emission and is never renewed on line moves, so the ADJ
  *   relocated by the v8.33.0 flush rendered the debug marker of the
@@ -4441,37 +4488,72 @@ static void to8_materialize_adj(to8_line *candidate, to8_line *before, int defer
     imm_comment(candidate->comment, sizeof candidate->comment, OP_ADJ, defer);
 }
 
+/* v8.34.0: undo the optimistic "+= defer" that the scan applied to the
+ * slot lines crossed INSIDE the push window, now that the relocated ADJ
+ * executes BEFORE the window's first push: those lines run with the SP the
+ * unmerged code would have (release already done), so they must render
+ * with their own push_depth only. The compensated range is
+ * [window_start->next, end) - end (the flush line) was never compensated:
+ * its own "+= defer" runs after the flush decision, with defer already
+ * reset to 0. window_start == end (overflow on the window's first push
+ * itself) is an empty range. */
+static void to8_uncompensate_window(to8_line *window_start, to8_line *end, int defer)
+{
+    to8_line *u;
+
+    if (defer == 0 || window_start == end)
+        return;
+    for (u = window_start->next; u && u != end; u = u->next)
+        if (u->kind == ARG_SLOT || u->kind == ARG_SLOT2)
+            u->push_depth -= defer;
+}
+
 static int to8_peephole_merge_adj(void) {
     int changed = 0, defer = 0;
     to8_line *candidate = NULL;
     to8_line *cur;
+    /* v8.34.0: the arg window a pending chain is currently RIDING through
+     * (window_start = its first PUSH line), or NULL when none is open. A
+     * chain rides through push windows - that is the whole point of
+     * merging - but no flush may ever MATERIALIZE it between the window's
+     * first push and its CALL: the callee reads its args at fixed offsets
+     * from its entry SP (gfunc_prolog), so an ADJ executing there would
+     * sweep the freshly pushed args under it. Any forced mid-window flush
+     * is redirected right BEFORE the first push (see Guard #1 below). */
+    to8_line *window_start = NULL;
+    int in_window = 0;
 
     for (cur = g_head; cur; cur = cur->next) {
         if (cur->is_target || cur->kind == ARG_JMP) {
-            to8_materialize_adj(candidate, cur, defer);
+            if (in_window) {
+                /* v8.34.0: label/branch inside a push window (structurally
+                 * absent from gfunc_call's straight-line arg build, kept
+                 * sound): redirect, same as the Guard #1 case below. */
+                to8_materialize_adj(candidate, window_start, defer);
+                to8_uncompensate_window(window_start, cur, defer);
+            } else {
+                to8_materialize_adj(candidate, cur, defer);
+            }
             candidate = NULL;
             defer = 0;
+            in_window = 0;
+            window_start = NULL;
             continue;
         }
 
-        /* v8.33.0 FIX (deferred release vs PENDING call args): a push
-         * line means the NEXT call's argument window is already being
-         * built. A deferred release materialized after those pushes -
-         * the pre-fix fate whenever the chain was flushed at a later
-         * ARG_SLOT line (e.g. the ST that the backend spills before a
-         * CALL) - executes between the pushes and the CALL: it sweeps
-         * the freshly pushed fmt/value off the stack, and the callee
-         * then reads garbage (Dhrystone's "Int_Comp" printf printed
-         * the totally unrelated "Execution starts, 50000 runs"
-         * constant: its pushed fmt pointer lay inside the swept
-         * window). Materialize the release HERE, right before the
-         * first push - i.e. exactly where the unmerged per-call ADJ
-         * would have executed. */
-        if (candidate && defer != 0 &&
+        /* v8.34.0 (supersedes the v8.33.0 flush-on-push): a pending chain
+         * RIDES through the next call's push window - merging spans call
+         * sequences again (v8.8.0/v8.22.0 semantics and perf). The
+         * invariant replacing v8.33.0's flush-on-push is stronger AND
+         * cheaper: no flush may MATERIALIZE between the window's first
+         * push and its CALL. The only flush points that can fire there
+         * are Guard #1 on an in-window ARG_SLOT line (ST/LD spills, PUSH
+         * of a local arg, LEA - none of which has to be a LEA) and a
+         * label/branch; both redirect to the window start. */
+        if (candidate && defer != 0 && !in_window &&
             (cur->op == OP_PUSH || cur->op == OP_PUSHi || cur->op == OP_PUSHr)) {
-            to8_materialize_adj(candidate, cur, defer);
-            candidate = NULL;
-            defer = 0;
+            in_window = 1;
+            window_start = cur;
         }
 
         if (cur->kind == ARG_SLOT || cur->kind == ARG_SLOT2) {
@@ -4505,14 +4587,43 @@ static int to8_peephole_merge_adj(void) {
                 over = 1;
 
             if (over) {
-				to8_materialize_adj(candidate, cur, defer);
+                if (in_window) {
+                    /* v8.34.0: never materialize mid-window. The ADJ moves
+                     * right before the window's first push - the last
+                     * point where releasing the accumulated windows is
+                     * still valid (every window it releases belongs to a
+                     * call that has fully returned) - and the slot lines
+                     * crossed inside the window lose the "+= defer" they
+                     * got on the ride, since the release now executes
+                     * before them. window_start == cur (overflow on the
+                     * first push itself) degenerates to v8.33.0's
+                     * placement with an empty undo range. */
+                    to8_materialize_adj(candidate, window_start, defer);
+                    to8_uncompensate_window(window_start, cur, defer);
+                } else {
+                    to8_materialize_adj(candidate, cur, defer);
+                }
                 candidate = NULL;
                 defer = 0;
+                in_window = 0;
+                window_start = NULL;
             }
 
             cur->push_depth += defer;
         }
-        
+
+        if (cur->op == OP_CALLm || cur->op == OP_CALL || cur->op == OP_CALLr) {
+            /* v8.34.0: window over. Placed AFTER the Guard #1 block on
+             * purpose: an indirect call through a local funcptr is itself
+             * an ARG_SLOT line (e_op_slot(OP_CALL, ...)), and its own
+             * overflow must still redirect to the window start - the ADJ
+             * must not land between the pushes and HERE either. From the
+             * next line on, a flush materializes after the call (args
+             * dead) exactly like in unmerged code. */
+            in_window = 0;
+            window_start = NULL;
+        }
+
         if (cur->op == OP_ADJ && cur->imm_val > 0) {
             /* Guard #2: the ADJ's own encoded immediate ALSO goes through
                out_slot (see ARG_IMM rendering: OP_ADJ uses out_slot, not
