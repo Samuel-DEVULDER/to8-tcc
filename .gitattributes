@@ -1,0 +1,16 @@
+* text=auto eol=lf
+*.BIN -text
+*.bin -text
+*.FD -text
+*.fd -text
+*.SAP -text
+*.sap -text
+*.PNG -text
+*.png -text
+*.7z -text
+*.ROM -text
+*.rom -text
+*.exe -text
+*.o -text
+*.ZIP -text
+*.zip -text
