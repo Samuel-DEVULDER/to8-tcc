@@ -1,8 +1,16 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.34.0 (merge_adj rides through push windows; mid-window flushes redirect to the window start)
+ * Version : 8.34.1 (TO8_GEN_VERSION stamp re-synced - was stuck at 8.30.0)
  *
  * Changelog:
+ * - v8.34.1 STAMP FIX: TO8_GEN_VERSION (to8-gen.c, the string stamped by
+ *   to8_print_banner into every generated listing as "* TO8 backend X")
+ *   was last bumped at v8.30.0 (da366a64) - v8.32.0/v8.33.0/v8.33.1/
+ *   v8.34.0 all bumped ONLY the "Version :" comment above, and the
+ *   banner kept printing 8.30.0 on 8.33.x/8.34.0 output (double
+ *   maintenance, easy to forget). Re-synced to the real version; the
+ *   define now carries a keep-in-sync reminder. No codegen change.
+ *
  * - v8.34.0 CORRECTNESS+PERF FIX in to8_peephole_merge_adj: v8.33.0's
  *   flush-on-push restored sound arg windows but destroyed the whole
  *   merge: a pending chain dies at EVERY push line, so no chain ever
@@ -1459,7 +1467,10 @@ ST_FUNC void gen_be32_impl(int v);
 
 #else
 
-#define TO8_GEN_VERSION "8.30.0"
+/* v8.34.1: stamped by to8_print_banner into every generated listing -
+ * KEEP IN SYNC with the "Version :" line at the top of this file (the
+ * v8.32.0..v8.34.0 bumps forgot it; see header changelog). */
+#define TO8_GEN_VERSION "8.34.1"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
