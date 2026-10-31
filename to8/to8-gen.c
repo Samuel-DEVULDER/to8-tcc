@@ -1,8 +1,34 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.34.1 (TO8_GEN_VERSION stamp re-synced - was stuck at 8.30.0)
+ * Version : 8.35.0 (pointer initializers emitted symbolically: FCB 0,0 + FDB _sym)
  *
  * Changelog:
+ * - v8.35.0 CORRECTNESS FIX in to8_flush_pending_data: EVERY pointer
+ *   initializer was emitted as raw zeros. tccgen's init_putv
+ *   (PTR_SIZE==4 path) queues a R_DATA_PTR relocation (greloc, Elf32_Rel
+ *   in sec->reloc) and writes the 4-byte addend (0 for a plain &sym)
+ *   into the section; a real backend's linker applies the relocation at
+ *   link time, but the TO8 dump renders the section bytes as-is - so
+ *   every "const char *tab[] = {...}" came out as endless
+ *   "FCB 0,0,0,0". First exposed by the ELIZA port's pointer tables
+ *   (responses[37][9], keywords, SWAPS - 333+37+28 pointers, all 0):
+ *   responses[k][which] returned NULL, printf dereferenced $0000 and
+ *   printed the BASIC ROM banner "BASIC 512 MICROSOFT 1.0" mid-program.
+ *   Integer initializers never hit this (no relocation; the elem_size
+ *   byte-order correction already handled their little->big endian
+ *   swap). Numeric patching is impossible (final addresses belong to
+ *   c6809's layout, not this byte stream), so relocated 32-bit words
+ *   are now emitted SYMBOLICALLY: "FCB 0,0" (high half; 16-bit VM
+ *   address space) + "FDB _sym[+addend]" - FDB is big-endian and its
+ *   operand goes through c6809's full expression evaluator, resolving
+ *   at assembly time exactly like every code label. The elem_size
+ *   byte-order correction skips relocated groups; the obsolete
+ *   "pointer initializer not relocated" warning is gone (literal
+ *   integer pointers without relocation fall through to the ordinary
+ *   correction like ints). Verified: ELIZA's tables now emit
+ *   FCB 0,0/FDB _L_xxx pairs for all 398 pointers; c6809 assembles the
+ *   listing with 0 errors; on-target: see commit message.
+ *
  * - v8.34.1 STAMP FIX: TO8_GEN_VERSION (to8-gen.c, the string stamped by
  *   to8_print_banner into every generated listing as "* TO8 backend X")
  *   was last bumped at v8.30.0 (da366a64) - v8.32.0/v8.33.0/v8.33.1/
@@ -1470,7 +1496,7 @@ ST_FUNC void gen_be32_impl(int v);
 /* v8.34.1: stamped by to8_print_banner into every generated listing -
  * KEEP IN SYNC with the "Version :" line at the top of this file (the
  * v8.32.0..v8.34.0 bumps forgot it; see header changelog). */
-#define TO8_GEN_VERSION "8.34.1"
+#define TO8_GEN_VERSION "8.35.0"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -5457,28 +5483,84 @@ static int to8_byte_swap_changes_anything(Section *sec, unsigned long off,
  * natural order" (bytes, unknown type, or bss zero-fill); elem_size
  * > 1 means "reverse the byte order within each elem_size-byte group,
  * but keep group (element) order unchanged" - the actual correction.
+ *
+ * v8.35.0: pointer initializers carry a R_DATA_PTR relocation (greloc
+ * from tccgen's init_putv, PTR_SIZE==4 path: 4 raw addend bytes in the
+ * section + an Elf32_Rel entry in sec->reloc). The old dump wrote those
+ * raw addend bytes - all zeros - so EVERY pointer initializer landed in
+ * the listing as "FCB 0,0,0,0" (ELIZA's responses/keywords/SWAPS tables:
+ * printf then dereferenced address 0 and printed the BASIC ROM banner
+ * "BASIC 512 MICROSOFT 1.0" straight from $0000). A numeric patch is
+ * impossible here - final addresses belong to c6809's layout, not this
+ * byte stream - so each relocated 32-bit word is emitted SYMBOLICALLY:
+ * "FCB 0,0" (the high half; 16-bit VM address space) followed by
+ * "FDB _sym[+addend]", resolved at assembly time exactly like every
+ * code label. FDB is big-endian, matching the VM's 32-bit big-endian
+ * words; the elem_size byte-order correction must not touch this group.
  */
 static void to8_emit_fcb_bytes(Section *sec, unsigned long off,
-                                unsigned long n, int elem_size, int is_bss)
+                                unsigned long n, int elem_size, int is_bss,
+                                Section *sr, unsigned long nreloc,
+                                Section *symtab)
 {
     unsigned long k;
-        
-    for (k = 0; k < n; k++) {
-        unsigned long idx;
-        if (elem_size > 1) {
-            unsigned long group = k / elem_size;
-            unsigned long pos_in_group = k % elem_size;
-            idx = group * elem_size + (elem_size - 1 - pos_in_group);
-        } else {
-            idx = k;
+    unsigned long r = 0; /* reloc cursor; entries are offset-sorted */
+
+    for (k = 0; k < n; ) {
+        if (sr != NULL && (k % 4) == 0) {
+            ElfW_Rel *rel = NULL;
+            while (r < nreloc
+                   && ((ElfW_Rel *)sr->data + r)->r_offset < off + k)
+                r++;
+            if (r < nreloc) {
+                rel = (ElfW_Rel *)sr->data + r;
+                if (rel->r_offset != off + k)
+                    rel = NULL;
+            }
+            if (rel != NULL) {
+                int symi = ELF32_R_SYM(rel->r_info);
+                ElfSym *esym = (ElfSym *)symtab->data + symi;
+                const char *rname =
+                    (const char *)symtab->link->data + esym->st_name;
+                int addend = (int)((unsigned)sec->data[off + k]
+                                 | ((unsigned)sec->data[off + k + 1] << 8)
+                                 | ((unsigned)sec->data[off + k + 2] << 16)
+                                 | ((unsigned)sec->data[off + k + 3] << 24));
+                if (k) out_char('\n');
+                out_tab(); out_str("FCB"); out_tab(); out_str("0,0");
+                out_char('\n');
+                out_tab(); out_str("FDB"); out_tab();
+                out_char('_');
+                { const char *s = rname;
+                  while (*s) { out_char(*s == '.' ? '_' : *s); ++s; } }
+                if (addend != 0) {
+                    if (addend < 0) { out_char('-'); out_int(-addend); }
+                    else { out_char('+'); out_int(addend); }
+                }
+                out_char('\n');
+                k += 4;
+                r++;
+                continue;
+            }
         }
-        if ((k % 4) == 0) {
-            if (k) out_char('\n');
-            out_tab(); out_str("FCB"); out_tab();
-        } else {
-            out_char(',');
+        {
+            unsigned long idx;
+            if (elem_size > 1) {
+                unsigned long group = k / elem_size;
+                unsigned long pos_in_group = k % elem_size;
+                idx = group * elem_size + (elem_size - 1 - pos_in_group);
+            } else {
+                idx = k;
+            }
+            if ((k % 4) == 0) {
+                if (k) out_char('\n');
+                out_tab(); out_str("FCB"); out_tab();
+            } else {
+                out_char(',');
+            }
+            out_int(is_bss ? 0 : sec->data[off + idx]);
+            k++;
         }
-        out_int(is_bss ? 0 : sec->data[off + idx]);
     }
     out_char('\n');
 }
@@ -5510,6 +5592,8 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
         Section *sec = s1->sections[i];
         int j;
         int is_bss;
+        Section *sr;          /* v8.35.0: the section's reloc entries */
+        unsigned long nreloc;
 
         if (!sec)
             continue;
@@ -5533,7 +5617,16 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
         is_bss = (sec->sh_type == SHT_NOBITS);
         if (!is_bss && !sec->data)
             continue;
-     
+
+        /* v8.35.0: the section's queued data relocations (pointer
+           initializers, R_DATA_PTR) - applied symbolically by
+           to8_emit_fcb_bytes below. bss carries no initializers. */
+        nreloc = 0;
+        sr = NULL;
+        if (!is_bss && sec->reloc && sec->reloc->data)
+            nreloc = sec->reloc->data_offset / sizeof(ElfW_Rel);
+        sr = sec->reloc;
+
         for (j = 1; j < nb_syms; j++) {
             ElfSym *sym = (ElfSym *)symtab->data + j;
             const char *name;
@@ -5551,13 +5644,11 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
                
             if (!is_bss) {
                 Sym *gsym = to8_find_global_sym_by_name(name);
-                               
+
                 if (!gsym) {
                     if(name[0]!='L' || name[1]!='.') {
                         tcc_warning("TO8: '%s': unknown type, byte order not checked", name);
                     }
-                } else if (to8_type_is_real_pointer(&gsym->type)) {
-                    tcc_warning("TO8: '%s': pointer initializer not relocated", name);
                 } else {
                     CType *elem = to8_innermost_elem_type(&gsym->type);
                     int bt = elem->t & VT_BTYPE;
@@ -5591,7 +5682,8 @@ ST_FUNC void to8_flush_pending_data(TCCState *s1)
             out_str(is_bss ? " bytes (bss, zero-filled)" : " bytes (data)");
                         out_char('\n');
 
-            to8_emit_fcb_bytes(sec, off, n, elem_size, is_bss);
+            to8_emit_fcb_bytes(sec, off, n, elem_size, is_bss,
+                               sr, nreloc, symtab);
         }
     }
 
