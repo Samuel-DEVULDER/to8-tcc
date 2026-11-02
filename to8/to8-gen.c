@@ -1,8 +1,37 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.35.0 (pointer initializers emitted symbolically: FCB 0,0 + FDB _sym)
+ * Version : 8.35.2 (source-line markers sanitized: control bytes -> spaces)
  *
  * Changelog:
+ * - v8.35.2 HARDENING in to8_render_line: the source-line markers
+ *   ("* NNN: <text>") copy the C source line VERBATIM - a control byte
+ *   in a C comment (a stray form feed from a script-inserted marker,
+ *   as hit while adding the zoom selector) landed raw in the listing
+ *   and c6809 died with Expression Error + Bad Label. to8_read_source_line
+ *   now maps every byte < 0x20 (tab included) to a space in the marker
+ *   text. Cosmetic only.
+ *
+ * - v8.35.1 CORRECTNESS FIX in to8_render_line's ARG_SYM case: a byte/
+ *   word load or store through a CONSTANT pointer with no Sym - the
+ *   direct deref "*(unsigned char*)0x606C", as opposed to the working
+ *   two-step "unsigned char *k = (unsigned char*)0x606C; *k" - emitted
+ *   its address as a SINGLE word ("LDu1m 24684") instead of the 2-word
+ *   "0,<value>" form every other ARG_SYM rendering uses. c6809 macro
+ *   parameters are 0-based (\0 = first argument) and every address-
+ *   carrying macro body reads its operand from \1, so the "0," prefix
+ *   doubles as the dummy first argument that shifts the address into
+ *   slot 1 (v8.16.0's "generator ALWAYS renders 0,_name for ARG_SYM"
+ *   invariant only ever covered the Sym branch; the sym==NULL branch
+ *   fell through to a bare out_int). With a single argument the macro's
+ *   \1 expanded EMPTY - "fdb opLDu1m," - and c6809 died with
+ *   "(1701) Missing Operand" (to8-keycode.c was carrying a pointer-
+ *   variable workaround for exactly this). The sym==NULL branch now
+ *   renders "0," + out_int16(sym_addend): same 2-word shape as the
+ *   symbol branch, value formatted like ARG_IMM's low word. Verified:
+ *   to8-keycode.c restored to the direct deref assembles with 000000
+ *   errors ("LDu1m 0,24684"); regression to8-dhry/to8-mandel/to8-mblk/
+ *   to8-mstripe all 000000 errors.
+ *
  * - v8.35.0 CORRECTNESS FIX in to8_flush_pending_data: EVERY pointer
  *   initializer was emitted as raw zeros. tccgen's init_putv
  *   (PTR_SIZE==4 path) queues a R_DATA_PTR relocation (greloc, Elf32_Rel
@@ -1496,7 +1525,7 @@ ST_FUNC void gen_be32_impl(int v);
 /* v8.34.1: stamped by to8_print_banner into every generated listing -
  * KEEP IN SYNC with the "Version :" line at the top of this file (the
  * v8.32.0..v8.34.0 bumps forgot it; see header changelog). */
-#define TO8_GEN_VERSION "8.35.0"
+#define TO8_GEN_VERSION "8.35.2"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -2282,7 +2311,16 @@ static int to8_read_source_line(const char *filename, int line_num,
             while (*p == ' ' || *p == '\t')
                 p++;
 
-            snprintf(out, outsz, "%s", p);
+            /* v8.35.2: control bytes (a stray form feed in a C comment,
+               tab runs, ...) must not reach the listing raw - c6809 dies
+               on them. Map everything < 0x20 to a space. */
+            {
+                char *q;
+                for (q = out; *p; p++)
+                    *q++ = ((unsigned char)*p < 0x20) ? ' ' : *p;
+                *q = 0;
+            }
+            snprintf(out, outsz, "%s", out);
             fclose(f);
             return 1;
         }
@@ -5185,7 +5223,22 @@ static void to8_render_line(to8_line *ln)
                 out_int(ln->sym_addend);
             }
         } else {
-            out_int(ln->sym_addend);
+            /* v8.35.1 CORRECTNESS FIX: a pure-constant address (VT_CONST|
+             * VT_LVAL with no Sym - direct deref of a literal pointer,
+             * e.g. *(unsigned char*)0x606C) rendered as a SINGLE word.
+             * c6809 macro parameters are 0-based (\0 = first argument)
+             * and every address-carrying macro body reads its operand
+             * from \1, so the "0," prefix doubles as the dummy first
+             * argument shifting the address into slot 1 - v8.16.0's
+             * "ALWAYS 0,_name for ARG_SYM" invariant only ever covered
+             * the Sym branch, and this one fell through to a bare
+             * out_int. One argument = \1 expands empty: "LDu1m 24684"
+             * became "fdb opLDu1m," and c6809 died with "(1701) Missing
+             * Operand". Render "0,<value>" exactly like the symbol
+             * branch, the value formatted as a 16-bit word (out_int16)
+             * like ARG_IMM's low word. */
+            out_str("0,");
+            out_int16(ln->sym_addend);
         }
         break;
     case ARG_JMP:
