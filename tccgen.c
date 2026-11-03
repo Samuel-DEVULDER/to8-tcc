@@ -6939,10 +6939,35 @@ static void case_sort(struct switch_t *sw)
     }
 }
 
-static int gcase(struct case_t **base, int len, int dsym)
+/* IMPLEMENTATION CHANGE (switch dispatch): the per-case lowering was
+ * "non-destructive compare / test" - vdup of the switch value (claimed
+ * register-resident), push of the ABSOLUTE case value, gen_op(cmp op),
+ * gvtst. That relies on the ISA axiom "a compare preserves its operand
+ * register" - true on flag-based targets, FALSE on flag-less ones
+ * (to8: the compare result IS R0, destroying the compared value), so
+ * only the FIRST case of a chain ever matched there.
+ * REPLACEMENT: "destructive sub + test". Each case now emits an
+ * ARITHMETIC subtraction of the DELTA (case value - *sigma) followed
+ * by a zero/sign test against 0 and the conditional branch:
+ *   vdup, vpush64(t, v - *sigma), gen_op('-'),
+ *   vpushi(0), gen_op(TOK_EQ/GT/GE), gsym_addr(gvtst(0,0), p->ind)
+ * The sub is destructive on EVERY machine (that is the point: it
+ * carries the arithmetic); the test against 0 emits no code on targets
+ * with the const-0 suppression (to8) and the branch is a pure reader
+ * of the register/flags. *sigma = the last compared case value
+ * (telescoping: register = c - *sigma after each sub). The
+ * binary-search join gsym(e) is reached only through the pivot's
+ * "greater" edge, which left register = c - v2: restore *sigma = v2
+ * there. Deltas are int64, truncated by vpush64 - exact modulo 2^N
+ * like the subtraction on every machine. Unsigned switch values: the
+ * unsigned order is NOT the sign of the difference (UCMP path), so
+ * the caller homes the switch value (every dup reloads) and *sigma
+ * stays pinned to 0 - absolute constants, one reload per compare. */
+static int gcase(struct case_t **base, int len, int dsym, int64_t *sigma)
 {
     struct case_t *p;
     int t, l2, e;
+    int cumul = !(vtop->type.t & VT_UNSIGNED);
 
     t = vtop->type.t & VT_BTYPE;
     if (t != VT_LLONG)
@@ -6951,22 +6976,30 @@ static int gcase(struct case_t **base, int len, int dsym)
         /* binary search while len > 8, else linear */
         l2 = len > 8 ? len/2 : 0;
         p = base[l2];
-        vdup(), vpush64(t, p->v2);
+        vdup(), vpush64(t, cumul ? p->v2 - *sigma : p->v2);
+        gen_op('-'); /* register = c - V2 (chain state; sub is destructive) */
         if (l2 == 0 && p->v1 == p->v2) {
-            gen_op(TOK_EQ); /* jmp to case when equal */
+            vpushi(0), gen_op(TOK_EQ); /* test ==0: no code; branch when equal */
             gsym_addr(gvtst(0, 0), p->ind);
+            if (cumul)
+                *sigma = p->v2;
         } else {
             /* case v1 ... v2 */
-            gen_op(TOK_GT); /* jmp over when > V2 */
+            vpushi(0), gen_op(TOK_GT); /* test >0: jmp over when > V2 */
             if (len == 1) /* last case test jumps to default when false */
                 dsym = gvtst(0, dsym), e = 0;
             else
                 e = gvtst(0, 0);
-            vdup(), vpush64(t, p->v1);
-            gen_op(TOK_GE); /* jmp to case when >= V1 */
+            vdup(), vpush64(t, cumul ? p->v1 - p->v2 : p->v1);
+            gen_op('-'); /* register = c - V1 (R0 already carried c - V2) */
+            vpushi(0), gen_op(TOK_GE); /* test >=0: jmp to case when >= V1 */
             gsym_addr(gvtst(0, 0), p->ind);
-            dsym = gcase(base, l2, dsym);
+            if (cumul)
+                *sigma = p->v1;
+            dsym = gcase(base, l2, dsym, sigma);
             gsym(e);
+            if (cumul && e)
+                *sigma = p->v2; /* "greater" join carries register = c - v2 */
         }
         ++l2, base += l2, len -= l2;
     }
@@ -7394,7 +7427,19 @@ again:
         sw->bsym = NULL; /* marker for 32bit:gen_opl() */
         vpushv(&sw->sv);
         gv(RC_INT);
-        d = gcase(sw->p, sw->n, 0);
+        /* gcase() lowers the dispatch as a chain of cumulative
+         * subtractions (destructive sub + non-destructive zero/sign
+         * test - see the comment above gcase). *sigma starts at 0:
+         * the register holds c exactly. Unsigned switch values use the
+         * UCMP path (unsigned order is not the sign of the difference),
+         * so home the switch value here: every gcase dup then reloads
+         * it and gcase pins *sigma to 0 (absolute constants). */
+        {
+            int64_t sigma = 0;
+            if (sw->sv.type.t & VT_UNSIGNED)
+                save_reg(vtop->r & VT_VALMASK);
+            d = gcase(sw->p, sw->n, 0, &sigma);
+        }
         vpop();
         if (sw->def_sym)
             gsym_addr(d, sw->def_sym);
