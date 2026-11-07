@@ -1,8 +1,18 @@
 /* TO8 backend for TCC - single-register pseudo-ASM generator.
  *
- * Version : 8.35.2 (source-line markers sanitized: control bytes -> spaces)
+ * Version : 8.35.3 (gfunc_call spills register-backed args before pushes)
  *
  * Changelog:
+ * - v8.35.3 CORRECTNESS FIX in gfunc_call: arguments evaluated into a
+ *   register (e.g. "(conf.max_iter*81920)>>16" left in R0) were pushed
+ *   AFTER the next argument's LD4m/LDI had clobbered R0, so the call
+ *   received a stale value instead of the computed one. save_regs(0)
+ *   now spills every register-backed argument to a temp slot BEFORE the
+ *   push loop, so the push at each index reads the real value.
+ *   to8-mstripe's init_conf(&conf,(max_iter*81920)>>16,...) now passes
+ *   the computed max_iter instead of conf.cr, so max_iter grows by
+ *   ×1.25 per zoom instead of collapsing toward /4.
+ *
  * - v8.35.2 HARDENING in to8_render_line: the source-line markers
  *   ("* NNN: <text>") copy the C source line VERBATIM - a control byte
  *   in a C comment (a stray form feed from a script-inserted marker,
@@ -1525,7 +1535,7 @@ ST_FUNC void gen_be32_impl(int v);
 /* v8.34.1: stamped by to8_print_banner into every generated listing -
  * KEEP IN SYNC with the "Version :" line at the top of this file (the
  * v8.32.0..v8.34.0 bumps forgot it; see header changelog). */
-#define TO8_GEN_VERSION "8.35.2"
+#define TO8_GEN_VERSION "8.35.3"
 
 /* must be defined before gfunc_prolog/epilog call them */
 ST_FUNC void gen_bounds_prolog(void) {}
@@ -3835,6 +3845,13 @@ void gfunc_call(int nb_args)
     int i, size;
     SValue *func = &vtop[-nb_args];
     int arg_size = 0;
+
+    /* spill register-backed arguments BEFORE the push loop so a value
+       sitting in R0 (e.g. (conf.max_iter*81920)>>16) cannot be clobbered
+       by the LD4m/LDI of subsequent arguments.
+       vtop points at the last argument (the function is a Sym*, not on
+       the value stack), so save_regs(0) covers all arguments. */
+    save_regs(0);
 
     for (i = 0; i < nb_args; i++) {
         SValue *sv = &vtop[-i];
